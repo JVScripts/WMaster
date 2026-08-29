@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.7';
+    const WM_VERSION = '1.8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -12721,6 +12721,2504 @@
         if (existing) existing.remove();
         showOnboardingIfNeeded();
     };
+
+    /* ══════════════════════════════════════════════════════════════════════
+    v1.8 — HISTORIQUE LOCAL DES VENTES OBSERVÉES
+    ══════════════════════════════════════════════════════════════════════ */
+
+    const LOCAL_MARKET_HISTORY_KEY = 'wm_local_market_history_v1';
+    const LOCAL_MARKET_PENDING_KEY = 'wm_local_market_pending_v1';
+
+    const LOCAL_MARKET_HISTORY_WINDOW_MS =
+        30 * 24 * 60 * 60 * 1000;
+
+    const LOCAL_MARKET_HISTORY_KEEP_MS =
+        31 * 24 * 60 * 60 * 1000;
+
+    const LOCAL_MARKET_PENDING_KEEP_MS =
+        6 * 60 * 60 * 1000;
+
+    const LOCAL_MARKET_HISTORY_MAX = 12000;
+    const LOCAL_MARKET_PENDING_MAX = 5000;
+
+
+    let localMarketHistory = [];
+    let localMarketPending = {};
+
+    let localMarketHistoryIds =
+        new Set();
+
+    let localMarketByCard =
+        new Map();
+
+    let localMarketPendingSaveTimer =
+        null;
+
+    let localMarketReconcileRunning =
+        false;
+
+    let localMarketLastPrune =
+        0;
+
+
+    /*
+        * null  = API historique officielle pas encore testée
+        * true  = compte PRO / API accessible
+        * false = API refusée avec pro_required
+        */
+    let salesApiAccess = null;
+
+    let salesApiAccessLogDone =
+        false;
+
+
+
+    /* ============================================================
+        CHARGEMENT LOCALSTORAGE
+        ============================================================ */
+
+    try {
+
+        const raw =
+            JSON.parse(
+                localStorage.getItem(
+                    LOCAL_MARKET_HISTORY_KEY
+                ) || '[]'
+            );
+
+        if (Array.isArray(raw)) {
+            localMarketHistory = raw;
+        }
+
+    } catch (e) {
+
+        localMarketHistory = [];
+    }
+
+
+    try {
+
+        const raw =
+            JSON.parse(
+                localStorage.getItem(
+                    LOCAL_MARKET_PENDING_KEY
+                ) || '{}'
+            );
+
+        if (
+            raw &&
+            typeof raw === 'object' &&
+            !Array.isArray(raw)
+        ) {
+
+            localMarketPending = raw;
+        }
+
+    } catch (e) {
+
+        localMarketPending = {};
+    }
+
+
+
+    /* ============================================================
+        SAUVEGARDE
+        ============================================================ */
+
+    function saveLocalMarketHistory() {
+
+        try {
+
+            localStorage.setItem(
+                LOCAL_MARKET_HISTORY_KEY,
+                JSON.stringify(
+                    localMarketHistory
+                )
+            );
+
+        } catch (e) {
+
+            console.warn(
+                '[WikiMasters][local-history] sauvegarde impossible:',
+                e
+            );
+        }
+    }
+
+
+    function saveLocalMarketPendingNow() {
+
+        try {
+
+            localStorage.setItem(
+                LOCAL_MARKET_PENDING_KEY,
+                JSON.stringify(
+                    localMarketPending
+                )
+            );
+
+        } catch (e) {
+
+            console.warn(
+                '[WikiMasters][local-history] sauvegarde pending impossible:',
+                e
+            );
+        }
+    }
+
+
+    function queueLocalMarketPendingSave() {
+
+        if (
+            localMarketPendingSaveTimer
+        ) {
+            return;
+        }
+
+
+        localMarketPendingSaveTimer =
+            setTimeout(
+                () => {
+
+                    localMarketPendingSaveTimer =
+                        null;
+
+                    saveLocalMarketPendingNow();
+
+                },
+                400
+            );
+    }
+
+
+
+    /* ============================================================
+        INDEX HISTORIQUE PAR CARTE
+        ============================================================ */
+
+    function rebuildLocalMarketIndex() {
+
+        localMarketHistoryIds =
+            new Set();
+
+        localMarketByCard =
+            new Map();
+
+
+        const cutoff =
+            Date.now() -
+            LOCAL_MARKET_HISTORY_WINDOW_MS;
+
+
+        for (
+            const sale
+            of localMarketHistory
+        ) {
+
+            if (
+                !sale ||
+                !sale.a ||
+                !sale.c
+            ) {
+                continue;
+            }
+
+
+            const price =
+                Number(
+                    sale.p
+                );
+
+
+            const ts =
+                Number(
+                    sale.t
+                );
+
+
+            if (
+                !Number.isFinite(price) ||
+                price <= 0
+            ) {
+                continue;
+            }
+
+
+            if (
+                !Number.isFinite(ts) ||
+                ts < cutoff
+            ) {
+                continue;
+            }
+
+
+            localMarketHistoryIds.add(
+                sale.a
+            );
+
+
+            let arr =
+                localMarketByCard.get(
+                    sale.c
+                );
+
+
+            if (!arr) {
+
+                arr = [];
+
+                localMarketByCard.set(
+                    sale.c,
+                    arr
+                );
+            }
+
+
+            arr.push(
+                sale
+            );
+        }
+
+
+        for (
+            const arr
+            of localMarketByCard.values()
+        ) {
+
+            arr.sort(
+                (a, b) =>
+                    Number(b.t) -
+                    Number(a.t)
+            );
+        }
+    }
+
+
+
+    /* ============================================================
+        PURGE
+        ============================================================ */
+
+    function pruneLocalMarketHistory(
+        force = false
+    ) {
+
+        const now =
+            Date.now();
+
+
+        if (
+            !force &&
+            now -
+            localMarketLastPrune
+            <
+            60 * 60 * 1000
+        ) {
+
+            return;
+        }
+
+
+        localMarketLastPrune =
+            now;
+
+
+        const historyCutoff =
+            now -
+            LOCAL_MARKET_HISTORY_KEEP_MS;
+
+
+        const pendingCutoff =
+            now -
+            LOCAL_MARKET_PENDING_KEEP_MS;
+
+
+        const before =
+            localMarketHistory.length;
+
+
+        localMarketHistory =
+            localMarketHistory
+
+                .filter(
+                    s =>
+                        s &&
+                        Number.isFinite(
+                            Number(s.t)
+                        )
+                        &&
+                        Number(s.t)
+                        >=
+                        historyCutoff
+                )
+
+                .sort(
+                    (a, b) =>
+                        Number(a.t) -
+                        Number(b.t)
+                );
+
+
+        if (
+            localMarketHistory.length >
+            LOCAL_MARKET_HISTORY_MAX
+        ) {
+
+            localMarketHistory =
+                localMarketHistory.slice(
+                    -LOCAL_MARKET_HISTORY_MAX
+                );
+        }
+
+
+        let pendingChanged =
+            false;
+
+
+        for (
+            const [id, obs]
+            of
+            Object.entries(
+                localMarketPending
+            )
+        ) {
+
+            const endTs =
+                Number(
+                    obs?.e
+                );
+
+
+            if (
+                !Number.isFinite(endTs) ||
+                endTs <
+                pendingCutoff
+            ) {
+
+                delete localMarketPending[
+                    id
+                ];
+
+                pendingChanged =
+                    true;
+            }
+        }
+
+
+        const pendingEntries =
+            Object.entries(
+                localMarketPending
+            );
+
+
+        if (
+            pendingEntries.length >
+            LOCAL_MARKET_PENDING_MAX
+        ) {
+
+            pendingEntries
+
+                .sort(
+                    (a, b) =>
+                        Number(
+                            a[1]?.e || 0
+                        )
+                        -
+                        Number(
+                            b[1]?.e || 0
+                        )
+                )
+
+                .slice(
+                    0,
+                    pendingEntries.length -
+                    LOCAL_MARKET_PENDING_MAX
+                )
+
+                .forEach(
+                    ([id]) =>
+                        delete localMarketPending[id]
+                );
+
+
+            pendingChanged =
+                true;
+        }
+
+
+        if (
+            localMarketHistory.length
+            !==
+            before
+        ) {
+
+            saveLocalMarketHistory();
+        }
+
+
+        if (
+            pendingChanged
+        ) {
+
+            saveLocalMarketPendingNow();
+        }
+
+
+        rebuildLocalMarketIndex();
+    }
+
+
+    rebuildLocalMarketIndex();
+
+    pruneLocalMarketHistory(
+        true
+    );
+
+
+
+    /* ============================================================
+        STATISTIQUES LOCALES D'UNE CARTE
+        ============================================================ */
+
+    function getLocalMarketStats(
+        cardId
+    ) {
+
+        if (!cardId) {
+            return null;
+        }
+
+
+        const cutoff =
+            Date.now() -
+            LOCAL_MARKET_HISTORY_WINDOW_MS;
+
+
+        const sales =
+            (
+                localMarketByCard.get(
+                    cardId
+                )
+                ||
+                []
+            )
+
+                .filter(
+                    s =>
+                        Number(s.t)
+                        >=
+                        cutoff
+                );
+
+
+        const prices =
+            sales
+
+                .map(
+                    s =>
+                        Number(
+                            s.p
+                        )
+                )
+
+                .filter(
+                    p =>
+                        Number.isFinite(p)
+                        &&
+                        p > 0
+                );
+
+
+        if (
+            prices.length === 0
+        ) {
+
+            return {
+
+                median: 0,
+                count: 0,
+
+                last: null,
+                avg: null,
+                min: null,
+                max: null,
+
+                fetchedAt:
+                    Date.now(),
+
+                source:
+                    'local'
+            };
+        }
+
+
+        const recent =
+            [...sales]
+
+                .sort(
+                    (a, b) =>
+                        Number(b.t) -
+                        Number(a.t)
+                );
+
+
+        return {
+
+            median:
+                median(
+                    prices
+                ),
+
+            count:
+                prices.length,
+
+            last:
+                Number(
+                    recent[0].p
+                ),
+
+            avg:
+                Math.round(
+                    prices.reduce(
+                        (sum, p) =>
+                            sum + p,
+                        0
+                    )
+                    /
+                    prices.length
+                ),
+
+            min:
+                Math.min(
+                    ...prices
+                ),
+
+            max:
+                Math.max(
+                    ...prices
+                ),
+
+            fetchedAt:
+                Date.now(),
+
+            source:
+                'local'
+        };
+    }
+
+
+
+    /* ============================================================
+        ARCHIVE UNE VENTE CONFIRMÉE
+        ============================================================ */
+
+    function recordLocalMarketSale(
+        auctionId,
+        obs,
+        finalPrice,
+        settledAt
+    ) {
+
+        if (
+            !auctionId ||
+            !obs?.c
+        ) {
+
+            return false;
+        }
+
+
+        /*
+            * Anti-doublon absolu par ID d'enchère.
+            */
+        if (
+            localMarketHistoryIds.has(
+                auctionId
+            )
+        ) {
+
+            delete localMarketPending[
+                auctionId
+            ];
+
+            queueLocalMarketPendingSave();
+
+            return false;
+        }
+
+
+        const price =
+            Number(
+                finalPrice
+            );
+
+
+        let timestamp =
+
+            settledAt instanceof Date
+
+                ?
+
+                settledAt.getTime()
+
+                :
+
+                Number(
+                    settledAt
+                );
+
+
+        if (
+            !Number.isFinite(price) ||
+            price <= 0
+        ) {
+
+            return false;
+        }
+
+
+        if (
+            !Number.isFinite(
+                timestamp
+            )
+        ) {
+
+            timestamp =
+                Date.now();
+        }
+
+
+        /*
+            * Format compact pour limiter la taille du localStorage :
+            *
+            * a = auction ID
+            * c = card ID
+            * p = final price
+            * t = settled timestamp
+            */
+        const sale = {
+
+            a:
+                auctionId,
+
+            c:
+                obs.c,
+
+            p:
+                price,
+
+            t:
+                timestamp
+        };
+
+
+        localMarketHistory.push(
+            sale
+        );
+
+
+        localMarketHistoryIds.add(
+            auctionId
+        );
+
+
+        let arr =
+            localMarketByCard.get(
+                obs.c
+            );
+
+
+        if (!arr) {
+
+            arr = [];
+
+            localMarketByCard.set(
+                obs.c,
+                arr
+            );
+        }
+
+
+        arr.unshift(
+            sale
+        );
+
+
+        delete localMarketPending[
+            auctionId
+        ];
+
+
+        pruneLocalMarketHistory(
+            false
+        );
+
+
+        saveLocalMarketHistory();
+
+        queueLocalMarketPendingSave();
+
+
+        return true;
+    }
+
+
+
+    /* ============================================================
+        OBSERVATION D'UNE ENCHÈRE
+        ============================================================ */
+
+    function observeLocalMarketAuction(
+        auction,
+        freshSync = false
+    ) {
+
+        if (
+            !auction?.id
+        ) {
+            return;
+        }
+
+
+        const cardId =
+
+            auction.card?.id
+            ??
+            auction.card_id;
+
+
+        if (!cardId) {
+            return;
+        }
+
+
+        const endTs =
+            new Date(
+                auction.end_at
+                ||
+                NaN
+            )
+                .getTime();
+
+
+        if (
+            !Number.isFinite(
+                endTs
+            )
+        ) {
+
+            return;
+        }
+
+
+        if (
+            localMarketHistoryIds.has(
+                auction.id
+            )
+        ) {
+
+            delete localMarketPending[
+                auction.id
+            ];
+
+            return;
+        }
+
+
+        const prev =
+            localMarketPending[
+            auction.id
+            ]
+            ||
+            {};
+
+
+        const currentBid =
+            Number(
+                auction.current_bid
+            );
+
+
+        const hasCurrentBid =
+
+            auction.current_bid
+            !=
+            null
+
+            &&
+
+            Number.isFinite(
+                currentBid
+            );
+
+
+        localMarketPending[
+            auction.id
+        ] = {
+
+            c:
+                cardId,
+
+            e:
+                endTs,
+
+            /*
+                * Ce prix est seulement le dernier bid observé.
+                * Il N'EST PAS archivé comme final_price.
+                */
+            p:
+                hasCurrentBid
+
+                    ?
+
+                    currentBid
+
+                    :
+
+                    (
+                        Number.isFinite(
+                            Number(prev.p)
+                        )
+
+                            ?
+
+                            Number(prev.p)
+
+                            :
+
+                            null
+                    ),
+
+            /*
+                * timestamp du dernier état serveur frais
+                */
+            s:
+                freshSync
+
+                    ?
+
+                    Date.now()
+
+                    :
+
+                    (
+                        Number(prev.s)
+                        ||
+                        0
+                    )
+        };
+
+
+        queueLocalMarketPendingSave();
+    }
+
+
+
+    /* ============================================================
+        OBSERVE LES HITS DU MARKET WATCHER
+        ============================================================ */
+
+    function observeLocalMarketHits(
+        hits
+    ) {
+
+        if (
+            !Array.isArray(
+                hits
+            )
+        ) {
+            return;
+        }
+
+
+        for (
+            const auction
+            of hits
+        ) {
+
+            observeLocalMarketAuction(
+                auction,
+                false
+            );
+        }
+
+
+        pruneLocalMarketHistory(
+            false
+        );
+    }
+
+
+
+    /* ============================================================
+        ÉTAT FRAIS REÇU PAR LA HOT-LANE v1.7
+        ============================================================ */
+
+    function observeFreshLocalAuction(
+        fresh
+    ) {
+
+        if (
+            !fresh?.id
+        ) {
+            return;
+        }
+
+
+        const previous =
+            localMarketPending[
+            fresh.id
+            ];
+
+
+        /*
+            * On ne commence pas à surveiller arbitrairement
+            * une enchère jamais affichée dans le Market Watcher.
+            */
+        if (!previous) {
+            return;
+        }
+
+
+        const cached =
+            lastHitsCache.find(
+                h =>
+                    h
+                    &&
+                    h.id === fresh.id
+            );
+
+
+        const merged = {
+
+            ...(cached || {}),
+
+            ...fresh,
+
+            card:
+                fresh.card
+                ||
+                cached?.card
+                ||
+                null,
+
+            card_id:
+                fresh.card_id
+                ||
+                cached?.card_id
+                ||
+                previous.c
+        };
+
+
+        observeLocalMarketAuction(
+            merged,
+            true
+        );
+
+
+        /*
+            * Cas idéal :
+            * une synchro fraîche contient déjà final_price.
+            */
+        const finalPrice =
+            Number(
+                fresh.final_price
+            );
+
+
+        if (
+            Number.isFinite(
+                finalPrice
+            )
+            &&
+            finalPrice > 0
+        ) {
+
+            const settledTs =
+
+                fresh.settled_at
+
+                    ?
+
+                    new Date(
+                        fresh.settled_at
+                    )
+                        .getTime()
+
+                    :
+
+                    new Date(
+                        fresh.end_at
+                        ||
+                        NaN
+                    )
+                        .getTime();
+
+
+            if (
+                recordLocalMarketSale(
+                    fresh.id,
+                    localMarketPending[fresh.id]
+                    ||
+                    previous,
+                    finalPrice,
+                    settledTs
+                )
+            ) {
+
+                wmLog(
+                    `📚 Historique local : ` +
+                    `vente confirmée à ` +
+                    `<b>${finalPrice} 💰</b>.`
+                );
+            }
+        }
+    }
+
+
+
+    /* ============================================================
+        RÉCONCILIATION DES ENCHÈRES TERMINÉES
+        ============================================================ */
+
+    async function reconcileLocalMarketHistory(
+        allLiveAuctions
+    ) {
+
+        if (
+            localMarketReconcileRunning
+            ||
+            !Array.isArray(
+                allLiveAuctions
+            )
+        ) {
+
+            return;
+        }
+
+
+        localMarketReconcileRunning =
+            true;
+
+
+        try {
+
+            const now =
+                serverNow();
+
+
+            const liveIds =
+                new Set(
+                    allLiveAuctions
+
+                        .map(
+                            a =>
+                                a?.id
+                        )
+
+                        .filter(
+                            Boolean
+                        )
+                );
+
+
+            /*
+                * Une enchère devient candidate uniquement si :
+                *
+                * - elle avait été observée ;
+                * - elle n'est plus dans le scan complet ;
+                * - son end_at connu est dépassé.
+                */
+            const candidates =
+                Object.entries(
+                    localMarketPending
+                )
+
+                    .filter(
+                        ([id, obs]) => {
+
+                            if (
+                                liveIds.has(
+                                    id
+                                )
+                            ) {
+                                return false;
+                            }
+
+
+                            const endTs =
+                                Number(
+                                    obs?.e
+                                );
+
+
+                            return (
+
+                                Number.isFinite(
+                                    endTs
+                                )
+
+                                &&
+
+                                endTs <=
+                                now - 500
+                            );
+                        }
+                    )
+
+                    .sort(
+                        (a, b) =>
+                            Number(
+                                a[1]?.e || 0
+                            )
+                            -
+                            Number(
+                                b[1]?.e || 0
+                            )
+                    )
+
+                    .slice(
+                        0,
+                        100
+                    );
+
+
+            if (
+                candidates.length === 0
+            ) {
+
+                return;
+            }
+
+
+            const ids =
+                candidates.map(
+                    ([id]) =>
+                        id
+                );
+
+
+            /*
+                * IMPORTANT :
+                *
+                * on relit les lignes EXACTES des enchères observées.
+                *
+                * On ne fait aucune recherche historique générale.
+                */
+            const rows =
+                await fetchAuctionsByIds(
+                    ids
+                );
+
+
+            if (
+                !(rows instanceof Map)
+            ) {
+
+                return;
+            }
+
+
+            let archived =
+                0;
+
+
+            let pendingChanged =
+                false;
+
+
+            for (
+                const [auctionId, obs]
+                of candidates
+            ) {
+
+                const row =
+                    rows.get(
+                        auctionId
+                    );
+
+
+                /*
+                    * Impossible de relire la ligne :
+                    * on n'invente rien.
+                    */
+                if (!row) {
+                    continue;
+                }
+
+
+                const rowEndTs =
+                    new Date(
+                        row.end_at
+                        ||
+                        NaN
+                    )
+                        .getTime();
+
+
+
+                /* --------------------------------------------------
+                    TIMER PROLONGÉ
+                    -------------------------------------------------- */
+
+                if (
+                    isActiveSellingStatus(
+                        row.status
+                    )
+
+                    &&
+
+                    Number.isFinite(
+                        rowEndTs
+                    )
+
+                    &&
+
+                    rowEndTs >
+                    serverNow()
+                ) {
+
+                    localMarketPending[
+                        auctionId
+                    ] = {
+
+                        ...obs,
+
+                        e:
+                            rowEndTs,
+
+                        p:
+                            Number.isFinite(
+                                Number(
+                                    row.current_bid
+                                )
+                            )
+
+                                ?
+
+                                Number(
+                                    row.current_bid
+                                )
+
+                                :
+
+                                obs.p,
+
+                        s:
+                            Date.now()
+                    };
+
+
+                    pendingChanged =
+                        true;
+
+
+                    continue;
+                }
+
+
+
+                /* --------------------------------------------------
+                    VENTE CONFIRMÉE
+                    -------------------------------------------------- */
+
+                const finalPrice =
+                    Number(
+                        row.final_price
+                    );
+
+
+                /*
+                    * C'EST LA SEULE BRANCHE NORMALE
+                    * QUI CRÉE UNE VENTE LOCALE.
+                    */
+                if (
+                    Number.isFinite(
+                        finalPrice
+                    )
+
+                    &&
+
+                    finalPrice > 0
+                ) {
+
+                    const settledTs =
+
+                        row.settled_at
+
+                            ?
+
+                            new Date(
+                                row.settled_at
+                            )
+                                .getTime()
+
+                            :
+
+                            rowEndTs;
+
+
+                    if (
+                        recordLocalMarketSale(
+                            auctionId,
+                            obs,
+                            finalPrice,
+                            settledTs
+                        )
+                    ) {
+
+                        archived++;
+                    }
+
+
+                    continue;
+                }
+
+
+
+                /* --------------------------------------------------
+                    SETTLEMENT PAS ENCORE FINI
+                    -------------------------------------------------- */
+
+                if (
+                    row.winner_id
+                    !=
+                    null
+                ) {
+
+                    /*
+                        * Un gagnant existe mais final_price
+                        * n'est pas encore écrit :
+                        *
+                        * on attend le prochain scan.
+                        */
+                    continue;
+                }
+
+
+
+                /* --------------------------------------------------
+                    INVENDUE / ANNULÉE
+                    -------------------------------------------------- */
+
+                if (
+                    Number.isFinite(
+                        rowEndTs
+                    )
+
+                    &&
+
+                    rowEndTs <=
+                    serverNow() -
+                    5000
+
+                    &&
+
+                    row.winner_id
+                    ==
+                    null
+
+                    &&
+
+                    row.final_price
+                    ==
+                    null
+                ) {
+
+                    delete localMarketPending[
+                        auctionId
+                    ];
+
+
+                    pendingChanged =
+                        true;
+                }
+            }
+
+
+            if (
+                pendingChanged
+            ) {
+
+                queueLocalMarketPendingSave();
+            }
+
+
+            if (
+                archived > 0
+            ) {
+
+                wmLog(
+                    `📚 Historique local : ` +
+                    `<b>${archived}</b> ` +
+                    `nouvelle(s) vente(s) ` +
+                    `confirmée(s) par final_price.`
+                );
+            }
+
+
+        } catch (e) {
+
+            console.warn(
+                '[WikiMasters][local-history] reconcile error:',
+                e
+            );
+
+        } finally {
+
+            localMarketReconcileRunning =
+                false;
+        }
+    }
+
+
+
+    /* ============================================================
+        API HISTORIQUE OFFICIELLE / FALLBACK LOCAL
+        ============================================================ */
+
+    const getCachedSalesOfficial_v18 =
+        getCachedSales;
+
+
+    getCachedSales =
+        function (
+            cardId
+        ) {
+
+            if (!cardId) {
+                return null;
+            }
+
+
+            /*
+                * Au premier lancement :
+                * on force un vrai test de permission.
+                */
+            if (
+                salesApiAccess ===
+                null
+            ) {
+
+                return null;
+            }
+
+
+            /*
+                * Compte PRO :
+                * historique officiel.
+                */
+            if (
+                salesApiAccess ===
+                true
+            ) {
+
+                return getCachedSalesOfficial_v18(
+                    cardId
+                );
+            }
+
+
+            /*
+                * Non-PRO :
+                * historique local.
+                */
+            return getLocalMarketStats(
+                cardId
+            );
+        };
+
+
+
+    /* ============================================================
+        FETCH HISTORIQUE
+        ============================================================ */
+
+    fetchCardSales =
+        async function (
+            cardId
+        ) {
+
+            if (!cardId) {
+                return null;
+            }
+
+
+            /*
+                * On sait déjà que le compte
+                * n'a pas accès à /sales.
+                */
+            if (
+                salesApiAccess ===
+                false
+            ) {
+
+                return getLocalMarketStats(
+                    cardId
+                );
+            }
+
+
+            try {
+
+                const res =
+                    await fetch(
+                        `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
+                        {
+                            credentials:
+                                "include"
+                        }
+                    );
+
+
+
+                /* --------------------------------------------------
+                    NON PRO
+                    -------------------------------------------------- */
+
+                if (
+                    res.status ===
+                    403
+                ) {
+
+                    const body =
+                        await res
+                            .json()
+                            .catch(
+                                () => ({})
+                            );
+
+
+                    if (
+                        body?.code ===
+                        'pro_required'
+                    ) {
+
+                        salesApiAccess =
+                            false;
+
+
+                        /*
+                            * Inutile de continuer la file API.
+                            */
+                        salesFetchQueue.length =
+                            0;
+
+
+                        salesFetchQueued.clear();
+
+
+                        if (
+                            !salesApiAccessLogDone
+                        ) {
+
+                            salesApiAccessLogDone =
+                                true;
+
+
+                            wmLog(
+                                `📚 API historique officielle ` +
+                                `réservée aux comptes PRO · ` +
+                                `bascule sur ` +
+                                `<b>l’historique local v1.8</b>.`
+                            );
+                        }
+
+
+                        return getLocalMarketStats(
+                            cardId
+                        );
+                    }
+
+
+                    return null;
+                }
+
+
+
+                if (!res.ok) {
+                    return null;
+                }
+
+
+
+                /* --------------------------------------------------
+                    COMPTE PRO
+                    -------------------------------------------------- */
+
+                salesApiAccess =
+                    true;
+
+
+                const data =
+                    await res.json();
+
+
+                const cutoff =
+                    Date.now()
+                    -
+                    (
+                        30 *
+                        24 *
+                        60 *
+                        60 *
+                        1000
+                    );
+
+
+                /*
+                    * Number() permet également de gérer un éventuel
+                    * final_price renvoyé sous forme de string JSON.
+                    */
+                const sales =
+                    (
+                        data.sales
+                        ||
+                        []
+                    )
+
+                        .map(
+                            s => ({
+
+                                ...s,
+
+                                final_price:
+                                    Number(
+                                        s.final_price
+                                    )
+                            })
+                        )
+
+                        .filter(
+                            s => {
+
+                                if (
+                                    !Number.isFinite(
+                                        s.final_price
+                                    )
+                                ) {
+                                    return false;
+                                }
+
+
+                                if (
+                                    !s.settled_at
+                                ) {
+                                    return false;
+                                }
+
+
+                                const ts =
+                                    new Date(
+                                        s.settled_at
+                                    )
+                                        .getTime();
+
+
+                                return (
+
+                                    Number.isFinite(
+                                        ts
+                                    )
+
+                                    &&
+
+                                    ts >=
+                                    cutoff
+                                );
+                            }
+                        );
+
+
+                const prices =
+                    sales.map(
+                        s =>
+                            s.final_price
+                    );
+
+
+                const recent =
+                    sales
+
+                        .slice()
+
+                        .sort(
+                            (a, b) =>
+
+                                new Date(
+                                    b.settled_at
+                                )
+                                    .getTime()
+
+                                -
+
+                                new Date(
+                                    a.settled_at
+                                )
+                                    .getTime()
+                        );
+
+
+                const entry = {
+
+                    median:
+                        median(
+                            prices
+                        ),
+
+                    count:
+                        prices.length,
+
+                    last:
+                        recent.length
+
+                            ?
+
+                            recent[0]
+                                .final_price
+
+                            :
+
+                            null,
+
+                    avg:
+                        prices.length
+
+                            ?
+
+                            Math.round(
+
+                                prices.reduce(
+                                    (sum, p) =>
+                                        sum + p,
+                                    0
+                                )
+
+                                /
+
+                                prices.length
+                            )
+
+                            :
+
+                            null,
+
+                    min:
+                        prices.length
+
+                            ?
+
+                            Math.min(
+                                ...prices
+                            )
+
+                            :
+
+                            null,
+
+                    max:
+                        prices.length
+
+                            ?
+
+                            Math.max(
+                                ...prices
+                            )
+
+                            :
+
+                            null,
+
+                    fetchedAt:
+                        Date.now(),
+
+                    source:
+                        'official'
+                };
+
+
+                salesCache[
+                    cardId
+                ] =
+                    entry;
+
+
+                saveSalesCache();
+
+
+                return entry;
+
+
+            } catch (e) {
+
+                return null;
+            }
+        };
+
+
+
+    /* ============================================================
+        FILE DE CHARGEMENT HISTORIQUE
+        ============================================================ */
+
+    processSalesQueue =
+        async function (
+            onUpdate
+        ) {
+
+            if (
+                salesFetchRunning
+            ) {
+                return;
+            }
+
+
+            /*
+                * En mode local il n'y a absolument aucune
+                * requête par carte à effectuer.
+                */
+            if (
+                salesApiAccess ===
+                false
+            ) {
+
+                salesFetchQueue.length =
+                    0;
+
+
+                salesFetchQueued.clear();
+
+
+                if (onUpdate) {
+                    onUpdate();
+                }
+
+
+                return;
+            }
+
+
+            salesFetchRunning =
+                true;
+
+
+            try {
+
+                while (
+                    salesFetchQueue.length >
+                    0
+                ) {
+
+                    const cardId =
+                        salesFetchQueue.shift();
+
+
+                    salesFetchQueued.delete(
+                        cardId
+                    );
+
+
+                    if (
+                        salesApiAccess ===
+                        true
+
+                        &&
+
+                        getCachedSalesOfficial_v18(
+                            cardId
+                        )
+                    ) {
+
+                        continue;
+                    }
+
+
+                    await fetchCardSales(
+                        cardId
+                    );
+
+
+                    if (onUpdate) {
+                        onUpdate();
+                    }
+
+
+                    /*
+                        * Le premier fetch vient de découvrir
+                        * que le compte n'est pas PRO.
+                        */
+                    if (
+                        salesApiAccess ===
+                        false
+                    ) {
+
+                        salesFetchQueue.length =
+                            0;
+
+
+                        salesFetchQueued.clear();
+
+
+                        break;
+                    }
+
+
+                    await new Promise(
+                        r =>
+                            setTimeout(
+                                r,
+                                2000 +
+                                Math.random() *
+                                2000
+                            )
+                    );
+                }
+
+            } finally {
+
+                salesFetchRunning =
+                    false;
+            }
+        };
+
+
+
+    /* ============================================================
+        BADGE DE VALORISATION
+        ============================================================ */
+
+    computeValuation =
+        function (
+            currentPrice,
+            cardId
+        ) {
+
+            const entry =
+                getCachedSales(
+                    cardId
+                );
+
+
+            if (!entry) {
+                return null;
+            }
+
+
+            const isLocal =
+                entry.source ===
+                'local';
+
+
+            const sourceLabel =
+                isLocal
+
+                    ?
+
+                    'historique local observé'
+
+                    :
+
+                    'historique officiel';
+
+
+
+            if (
+                entry.count === 0
+            ) {
+
+                return {
+
+                    status:
+                        'none',
+
+                    label:
+                        isLocal
+                            ?
+                            '0 vente locale'
+                            :
+                            'aucune vente',
+
+                    color:
+                        '#555',
+
+                    median:
+                        0,
+
+                    count:
+                        0,
+
+                    tip:
+                        isLocal
+
+                            ?
+
+                            'Aucune vente locale encore observée depuis le passage en v1.8'
+
+                            :
+
+                            'Aucune vente enregistrée pour cette carte'
+                };
+            }
+
+
+
+            const fmt =
+                n =>
+                    n == null
+
+                        ?
+
+                        '?'
+
+                        :
+
+                        Number(n)
+                            .toLocaleString(
+                                'fr-FR'
+                            );
+
+
+            const tip =
+
+                `${entry.count} vente(s)` +
+
+                ` · ${sourceLabel}` +
+
+                ` · dernier ${fmt(entry.last)} 💰` +
+
+                ` · moy. ${fmt(entry.avg)} 💰` +
+
+                ` · méd. ${fmt(entry.median)} 💰` +
+
+                ` · min ${fmt(entry.min)} 💰` +
+
+                ` · max ${fmt(entry.max)} 💰`;
+
+
+
+            if (
+                entry.count < 3
+            ) {
+
+                return {
+
+                    status:
+                        'few',
+
+                    label:
+                        `~${entry.median} ` +
+                        `(${entry.count} vente` +
+                        `${entry.count > 1 ? 's' : ''})`,
+
+                    color:
+                        '#666',
+
+                    median:
+                        entry.median,
+
+                    count:
+                        entry.count,
+
+                    tip
+                };
+            }
+
+
+
+            const ratio =
+                currentPrice /
+                entry.median;
+
+
+
+            if (
+                ratio < 0.75
+            ) {
+
+                return {
+
+                    status:
+                        'under',
+
+                    label:
+                        `sous-coté · méd. ${entry.median}`,
+
+                    color:
+                        '#4ade80',
+
+                    median:
+                        entry.median,
+
+                    count:
+                        entry.count,
+
+                    tip
+                };
+            }
+
+
+
+            if (
+                ratio > 1.25
+            ) {
+
+                return {
+
+                    status:
+                        'over',
+
+                    label:
+                        `surcoté · méd. ${entry.median}`,
+
+                    color:
+                        '#ef4444',
+
+                    median:
+                        entry.median,
+
+                    count:
+                        entry.count,
+
+                    tip
+                };
+            }
+
+
+
+            return {
+
+                status:
+                    'fair',
+
+                label:
+                    `dans la moy. · méd. ${entry.median}`,
+
+                color:
+                    '#888',
+
+                median:
+                    entry.median,
+
+                count:
+                    entry.count,
+
+                tip
+            };
+        };
+
+
+
+    /* ============================================================
+        HOOK 1 :
+        LES HITS AFFICHÉS SONT OBSERVÉS
+        ============================================================ */
+
+    const renderMarketHits_v17 =
+        renderMarketHits;
+
+
+    renderMarketHits =
+        function (
+            marketAlertEl,
+            hits,
+            newHits
+        ) {
+
+            observeLocalMarketHits(
+                hits
+            );
+
+
+            return renderMarketHits_v17(
+                marketAlertEl,
+                hits,
+                newHits
+            );
+        };
+
+
+
+    /* ============================================================
+        HOOK 2 :
+        APRÈS CHAQUE SCAN COMPLET → RÉCONCILIATION
+        ============================================================ */
+
+    const fetchAllMarketAuctions_v17 =
+        fetchAllMarketAuctions;
+
+
+    fetchAllMarketAuctions =
+        async function (
+            onProgress
+        ) {
+
+            const result =
+                await fetchAllMarketAuctions_v17(
+                    onProgress
+                );
+
+
+            /*
+                * Ne bloque pas le rendu du Market Watcher.
+                */
+            reconcileLocalMarketHistory(
+                result?.auctions
+                ||
+                []
+            )
+                .catch(
+                    () => { }
+                );
+
+
+            return result;
+        };
+
+
+
+    /* ============================================================
+        HOOK 3 :
+        LES SYNCHROS TIMER v1.7 ALIMENTENT AUSSI LE LOCAL
+        ============================================================ */
+
+    const applyFreshAuctionState_v17 =
+        applyFreshAuctionState;
+
+
+    applyFreshAuctionState =
+        function (
+            fresh,
+            options
+        ) {
+
+            const merged =
+                applyFreshAuctionState_v17(
+                    fresh,
+                    options
+                );
+
+
+            observeFreshLocalAuction(
+                fresh
+            );
+
+
+            return merged;
+        };
+
+
+
+    /* ============================================================
+        OUTILS CONSOLE
+        ============================================================ */
+
+    window.wmLocalHistoryInfo =
+        function () {
+
+            const cutoff =
+                Date.now() -
+                LOCAL_MARKET_HISTORY_WINDOW_MS;
+
+
+            const valid =
+                localMarketHistory.filter(
+                    s =>
+                        Number(s.t)
+                        >=
+                        cutoff
+                );
+
+
+            const info = {
+
+                salesApiAccess,
+
+                ventesLocales30j:
+                    valid.length,
+
+                cartesDistinctes30j:
+                    new Set(
+                        valid.map(
+                            s =>
+                                s.c
+                        )
+                    ).size,
+
+                encheresEnObservation:
+                    Object.keys(
+                        localMarketPending
+                    ).length,
+
+                premiereVenteLocale:
+                    valid.length
+
+                        ?
+
+                        new Date(
+                            Math.min(
+                                ...valid.map(
+                                    s =>
+                                        Number(s.t)
+                                )
+                            )
+                        )
+                            .toLocaleString(
+                                'fr-FR'
+                            )
+
+                        :
+
+                        null,
+
+                derniereVenteLocale:
+                    valid.length
+
+                        ?
+
+                        new Date(
+                            Math.max(
+                                ...valid.map(
+                                    s =>
+                                        Number(s.t)
+                                )
+                            )
+                        )
+                            .toLocaleString(
+                                'fr-FR'
+                            )
+
+                        :
+
+                        null
+            };
+
+
+            console.table(
+                info
+            );
+
+
+            return info;
+        };
+
+
+
+    window.wmLocalHistoryFor =
+        function (
+            cardId
+        ) {
+
+            const sales =
+                (
+                    localMarketByCard.get(
+                        cardId
+                    )
+                    ||
+                    []
+                )
+
+                    .filter(
+                        s =>
+                            Number(s.t)
+                            >=
+                            Date.now() -
+                            LOCAL_MARKET_HISTORY_WINDOW_MS
+                    )
+
+                    .map(
+                        s => ({
+
+                            auctionId:
+                                s.a,
+
+                            cardId:
+                                s.c,
+
+                            finalPrice:
+                                s.p,
+
+                            settledAt:
+                                new Date(
+                                    Number(s.t)
+                                )
+                                    .toLocaleString(
+                                        'fr-FR'
+                                    )
+                        })
+                    );
+
+
+            console.table(
+                sales
+            );
+
+
+            return sales;
+        };
+
+
+
+    window.wmClearLocalHistory =
+        function () {
+
+            if (
+                !confirm(
+                    'Effacer tout l’historique local v1.8 et les enchères actuellement observées ?'
+                )
+            ) {
+
+                return false;
+            }
+
+
+            localMarketHistory =
+                [];
+
+
+            localMarketPending =
+                {};
+
+
+            localMarketHistoryIds =
+                new Set();
+
+
+            localMarketByCard =
+                new Map();
+
+
+            localStorage.removeItem(
+                LOCAL_MARKET_HISTORY_KEY
+            );
+
+
+            localStorage.removeItem(
+                LOCAL_MARKET_PENDING_KEY
+            );
+
+
+            wmLog(
+                '🗑️ Historique local v1.8 effacé.'
+            );
+
+
+            return true;
+        };
+
+
+
+    /* ============================================================
+        MESSAGE DE DÉMARRAGE
+        ============================================================ */
+
+    wmLog(
+        `📚 Historique local v1.8 prêt · ` +
+        `<b>${localMarketHistory.length}</b> ` +
+        `vente(s) conservée(s) · ` +
+        `collecte à partir des enchères observées ` +
+        `par le Market Watcher.`
+    );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
         createUI();
