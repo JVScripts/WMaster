@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.6';
+    const WM_VERSION = '1.7';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -24,6 +24,14 @@
     const MARKET_PAGE_LIMIT = 50;
     const MARKET_PAGE_CONCURRENCY = 5; // pages chargées en parallèle par lot
     const MARKET_MIN_GAP_MS = 1500;    // souffle minimal entre 2 scans
+    // Synchronisation fine des compteurs proches de la fin.
+    // Le site peut repousser end_at après un bid tardif : on relit donc l'état serveur
+    // des enchères affichées dans cette fenêtre au lieu de supposer que end_at est figé.
+    const MARKET_TIMER_SYNC_WINDOW_MS = 20_000;   // synchro serveur à partir de T-20s
+    const MARKET_TIMER_SYNC_GRACE_MS = 5_000;     // continue 5s après l'ancien zéro
+    const MARKET_TIMER_SYNC_INTERVAL_MS = 250;    // synchro serveur 4 fois/s
+    const MARKET_COUNTDOWN_TICK_MS = 100;          // affichage du compteur 10 fois/s
+
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
     function setDiscordWebhook(url) { setSetting('discordWebhook', (url || '').trim()); }
@@ -2701,6 +2709,12 @@
     let hotLaneTickCount = 0;
     let lastHotLaneInterval = null;
 
+    // Dernière synchro groupée des timers proches de la fin
+    let lastMarketTimerSyncAt = 0;
+
+    // Refresh programmé juste après NOS propres bids
+    const postBidRefreshTimers = new Map();
+
     // Expose closure vars to global scope for inline onclick handlers
     window.autoBidSet = autoBidSet;
     window.autoBidMaxMap = autoBidMaxMap;
@@ -3105,31 +3119,48 @@
 
     function startCountdownTicker(marketAlertEl) {
         if (marketCountdownInterval) clearInterval(marketCountdownInterval);
+
         marketCountdownInterval = setInterval(() => {
             if (activeHitsMap.size === 0) return;
-            // PERF : skip si onglet en arrière-plan ou overlay fermé
-            // (les éléments wm-countdown-* n'existent que dans l'overlay ouvert,
-            //  et chaque getElementById coûte cher * N enchères en parallèle)
+
+            // Le compteur n'a besoin d'être dessiné que si le panneau existe.
             if (document.hidden) return;
+
             const overlay = document.getElementById('wm-overlay');
             if (!overlay || overlay.style.display === 'none') return;
-            // Met à jour chaque countdown dans le DOM
+
             activeHitsMap.forEach((hit, id) => {
+                const endAt = hit.endAt || hit.auction?.end_at;
+
+                if (!endAt) return;
+
                 const el = document.getElementById(`wm-countdown-${id}`);
+
                 if (el) {
-                    const cd = formatCountdown(hit.endAt);
-                    const col = countdownColor(hit.endAt);
-                    el.innerText = cd;
-                    el.style.color = col;
+                    el.innerText = formatCountdown(endAt);
+                    el.style.color = countdownColor(endAt);
                 }
-                // Retire les enchères terminées depuis plus de 30s
-                if (new Date(hit.endAt).getTime() < Date.now() - 30000) {
+
+                // Toujours basé sur l'heure serveur corrigée.
+                //
+                // On ne retire pas immédiatement l'enchère lorsque son ancien end_at
+                // atteint zéro : un bid tardif peut avoir fait repousser end_at.
+                if (
+                    new Date(endAt).getTime() <
+                    serverNow() - 30_000
+                ) {
                     activeHitsMap.delete(id);
-                    const row = document.getElementById(`wm-hit-${id}`);
-                    if (row) row.style.opacity = "0.4";
+
+                    const row =
+                        document.getElementById(`wm-hit-${id}`);
+
+                    if (row) {
+                        row.style.opacity = "0.4";
+                    }
                 }
             });
-        }, 1000);
+
+        }, MARKET_COUNTDOWN_TICK_MS);
     }
 
     // Délai avant/entre les mises auto. Adapté à l'urgence : INSTANTANÉ quand
@@ -3137,33 +3168,112 @@
     // du cas "froid" est réglable via Paramètres (0 = mises instantanées partout).
     function bidDelayMs(auction) {
         const maxDelay = getSetting('humanizedBidDelayMs');
+
         if (!(maxDelay > 0)) return 0;
-        const endTs = auction && auction.end_at ? new Date(auction.end_at).getTime() : 0;
-        const remaining = endTs ? endTs - Date.now() : Infinity;
-        if (remaining < 15000) return 0;                       // snipe critique : 0 délai
-        if (remaining < 60000) return Math.min(250, maxDelay); // chaud : très court
-        return 200 + Math.random() * maxDelay;                 // froid : humanisé
+
+        const endTs =
+            auction?.end_at
+                ? new Date(auction.end_at).getTime()
+                : 0;
+
+        // IMPORTANT : même horloge que le compteur
+        const remaining =
+            endTs
+                ? endTs - serverNow()
+                : Infinity;
+
+        if (remaining < 15_000) {
+            return 0;
+        }
+
+        if (remaining < 60_000) {
+            return Math.min(250, maxDelay);
+        }
+
+        return 200 + Math.random() * maxDelay;
     }
 
     // Après une mise réussie : marque IMMÉDIATEMENT l'enchère comme menée par moi
     // (état optimiste) et re-render la ligne, sans attendre le prochain scan.
     // Le prochain tick hot-lane / scan réconcilie ensuite avec l'état serveur réel.
     function markAuctionAsMine(auctionId, bidAmount, auctionObj) {
-        if (currentUsername) leadingBidsMap.set(auctionId, currentUsername);
-        // Mémorise le montant de ma mise (signal d'identité indépendant du pseudo)
-        if (Number.isFinite(bidAmount)) myLastBidMap.set(auctionId, bidAmount);
+        if (currentUsername) {
+            leadingBidsMap.set(
+                auctionId,
+                currentUsername
+            );
+        }
+
+        if (Number.isFinite(bidAmount)) {
+            myLastBidMap.set(
+                auctionId,
+                bidAmount
+            );
+        }
+
         clearOutbid(auctionId);
         trackMyBid(auctionId);
-        // Met à jour l'objet source du rendu (celui présent dans lastHitsCache)
-        const target = lastHitsCache.find(h => h && h.id === auctionId) || auctionObj;
+
+        // Mise à jour optimiste du prix et du meneur.
+        //
+        // IMPORTANT :
+        // on ne modifie JAMAIS end_at nous-mêmes.
+        //
+        // Si le serveur ajoute du temps après notre bid,
+        // schedulePostBidAuctionRefresh() récupérera le véritable end_at.
+        const target =
+            lastHitsCache.find(
+                h => h && h.id === auctionId
+            ) || auctionObj;
+
         if (target) {
-            target.current_bidder = { ...(target.current_bidder || {}), username: currentUsername };
-            if (Number.isFinite(bidAmount)) target.current_bid = bidAmount;
-            if (target.end_at) activeHitsMap.set(auctionId, { auction: target, endAt: target.end_at });
+            target.current_bidder = {
+                ...(target.current_bidder || {}),
+                username: currentUsername
+            };
+
+            if (Number.isFinite(bidAmount)) {
+                target.current_bid = bidAmount;
+            }
+
+            if (target.end_at) {
+                activeHitsMap.set(
+                    auctionId,
+                    {
+                        auction: target,
+                        endAt: target.end_at
+                    }
+                );
+            }
         }
-        // Re-render immédiat de la liste des hits (pose le 👑 tout de suite)
-        const el = document.getElementById('wm-market-alert');
-        if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
+
+        const el =
+            document.getElementById(
+                'wm-market-alert'
+            );
+
+        if (
+            el &&
+            lastHitsCache.length > 0
+        ) {
+            renderMarketHits(
+                el,
+                lastHitsCache,
+                []
+            );
+        }
+
+        // Le POST /bid peut avoir repoussé le timer.
+        // On demande donc immédiatement le nouvel état serveur.
+        schedulePostBidAuctionRefresh(
+            auctionId
+        );
+
+        // Si la Hot Lane dormait encore plusieurs secondes,
+        // on recalcule son prochain tick immédiatement.
+        if (hotLaneActive) {
+            scheduleHotLane();
+        }
     }
 
     // Garde-fou anti-blip : une enchère absente du scan courant a peut-être juste
@@ -3171,10 +3281,23 @@
     // connu est encore dans le futur, on la considère TOUJOURS vivante → on ne prune pas
     // (évite que l'auto-bid se désactive « sans raison »).
     function auctionLikelyStillLive(id) {
-        const last = activeHitsMap.get(id);
-        if (last && last.auction && last.auction.end_at) {
-            return new Date(last.auction.end_at).getTime() > Date.now() + 5000;
+        const last =
+            activeHitsMap.get(id);
+
+        if (
+            last &&
+            last.auction &&
+            last.auction.end_at
+        ) {
+            return (
+                new Date(
+                    last.auction.end_at
+                ).getTime()
+                >
+                serverNow() + 5000
+            );
         }
+
         return false;
     }
 
@@ -3220,7 +3343,7 @@
                 // → on attend le scan suivant pour décider
                 if (last && last.auction && last.auction.end_at) {
                     const endTs = new Date(last.auction.end_at).getTime();
-                    if (endTs > Date.now() + 5000) continue; // 5s de marge pour éviter les races
+                    if (endTs > serverNow() + 5000) continue; // 5s de marge pour éviter les races
                 }
                 // Tente de récupérer le dernier état connu pour logger qui a gagné / à combien
                 if (last && last.auction) {
@@ -3730,6 +3853,12 @@
             // Notif dans le titre de l'onglet
             const hitCount = activeHitsMap.size;
             document.title = hitCount > 0 ? `(${hitCount}) WikiMasters` : 'WikiMasters';
+            // Une nouvelle enchère peut être apparue directement
+            // à quelques secondes de sa fin.
+            // On recalcule donc immédiatement la Hot Lane.
+            if (hotLaneActive) {
+                scheduleHotLane();
+            }
 
         } catch (err) {
             marketStatusEl.innerHTML =
@@ -4302,83 +4431,742 @@
         return data.auction || data;
     }
 
+    // ============================================================
+    // SYNCHRONISATION AUTORITAIRE D'UNE ENCHÈRE
+    // ============================================================
+    //
+    // end_at reçu du serveur est TOUJOURS la source de vérité.
+    // On ne fait jamais "+60 secondes" nous-mêmes.
+    //
+    function applyFreshAuctionState(
+        fresh,
+        {
+            render = false,
+            logExtension = true
+        } = {}
+    ) {
+        if (!fresh || !fresh.id) {
+            return null;
+        }
+
+        const id = fresh.id;
+
+        const prevHit =
+            activeHitsMap.get(id);
+
+        const cached =
+            lastHitsCache.find(
+                h => h && h.id === id
+            );
+
+        const previousAuction =
+            prevHit?.auction ||
+            cached ||
+            {};
+
+        const previousEndAt =
+            prevHit?.endAt ||
+            previousAuction.end_at ||
+            null;
+
+        // Le snapshot groupé ne contient pas toujours tous les champs.
+        // On conserve donc les données précédentes.
+        const merged = {
+            ...previousAuction,
+            ...fresh
+        };
+
+        // ----------------------------------------
+        // Cache principal du Market Watcher
+        // ----------------------------------------
+
+        if (cached) {
+            if ('current_bid' in fresh) {
+                cached.current_bid =
+                    fresh.current_bid;
+            }
+
+            if ('current_bidder' in fresh) {
+                cached.current_bidder =
+                    fresh.current_bidder;
+            }
+
+            if ('base_amount' in fresh) {
+                cached.base_amount =
+                    fresh.base_amount;
+            }
+
+            if ('status' in fresh) {
+                cached.status =
+                    fresh.status;
+            }
+
+            if ('final_price' in fresh) {
+                cached.final_price =
+                    fresh.final_price;
+            }
+
+            if ('settled_at' in fresh) {
+                cached.settled_at =
+                    fresh.settled_at;
+            }
+
+            if (fresh.end_at) {
+                cached.end_at =
+                    fresh.end_at;
+            }
+        }
+
+        // ----------------------------------------
+        // Timer
+        // ----------------------------------------
+
+        if (fresh.end_at) {
+
+            activeHitsMap.set(
+                id,
+                {
+                    auction: merged,
+                    endAt: fresh.end_at
+                }
+            );
+
+            // Mise à jour immédiate du compteur affiché
+            const cdEl =
+                document.getElementById(
+                    `wm-countdown-${id}`
+                );
+
+            if (cdEl) {
+                cdEl.innerText =
+                    formatCountdown(
+                        fresh.end_at
+                    );
+
+                cdEl.style.color =
+                    countdownColor(
+                        fresh.end_at
+                    );
+            }
+
+            // ----------------------------------------
+            // Détection d'une prolongation
+            // ----------------------------------------
+
+            if (
+                logExtension &&
+                previousEndAt
+            ) {
+                const oldTs =
+                    new Date(
+                        previousEndAt
+                    ).getTime();
+
+                const newTs =
+                    new Date(
+                        fresh.end_at
+                    ).getTime();
+
+                // 750 ms de tolérance :
+                // évite les faux positifs dus aux petites différences réseau.
+                if (
+                    Number.isFinite(oldTs) &&
+                    Number.isFinite(newTs) &&
+                    newTs > oldTs + 750
+                ) {
+                    const title =
+                        merged.card
+                            ?.wikipedia_title
+                        ||
+                        cached?.card
+                            ?.wikipedia_title
+                        ||
+                        '?';
+
+                    wmLog(
+                        `⏱️ Timer prolongé : ` +
+                        `<b>${title}</b> → ` +
+                        `<span style="color:#fbbf24;">` +
+                        `${formatCountdown(fresh.end_at)}` +
+                        `</span>`
+                    );
+                }
+            }
+        }
+
+        // ----------------------------------------
+        // Render complet optionnel
+        // ----------------------------------------
+
+        if (render) {
+            const el =
+                document.getElementById(
+                    'wm-market-alert'
+                );
+
+            if (
+                el &&
+                lastHitsCache.length > 0
+            ) {
+                renderMarketHits(
+                    el,
+                    lastHitsCache,
+                    []
+                );
+            }
+        }
+
+        return merged;
+    }
+
+
+    // ============================================================
+    // APRÈS NOTRE PROPRE BID
+    // ============================================================
+    //
+    // Une mise sous les dernières secondes peut repousser end_at.
+    // On relit l'enchère 100 ms après la réponse positive du serveur.
+    //
+    function schedulePostBidAuctionRefresh(
+        auctionId
+    ) {
+        if (!auctionId) return;
+
+        const old =
+            postBidRefreshTimers.get(
+                auctionId
+            );
+
+        if (old) {
+            clearTimeout(old);
+        }
+
+        const timer =
+            setTimeout(
+                async () => {
+
+                    postBidRefreshTimers.delete(
+                        auctionId
+                    );
+
+                    try {
+                        const fresh =
+                            await fetchSingleAuction(
+                                auctionId
+                            );
+
+                        if (fresh) {
+                            applyFreshAuctionState(
+                                fresh,
+                                {
+                                    render: true,
+                                    logExtension: true
+                                }
+                            );
+                        }
+
+                    } catch (e) {
+                        // La Hot Lane réessaiera.
+                        //
+                        // Surtout :
+                        // aucune estimation locale du timer.
+                    }
+
+                },
+                100
+            );
+
+        postBidRefreshTimers.set(
+            auctionId,
+            timer
+        );
+    }
+
+
+    // ============================================================
+    // ENCHÈRES AFFICHÉES QUI APPROCHENT DE LA FIN
+    // ============================================================
+    //
+    // Même si on ne mise PAS dessus, elles doivent être synchronisées.
+    // Sinon un bid adverse à T-8s peut faire remonter le site
+    // alors que notre compteur continue vers 0.
+    //
+    function getNearEndTimerSyncIds() {
+        const now =
+            serverNow();
+
+        const out = [];
+
+        activeHitsMap.forEach(
+            (hit, id) => {
+
+                const endAt =
+                    hit?.endAt ||
+                    hit?.auction?.end_at;
+
+                const endTs =
+                    new Date(
+                        endAt || NaN
+                    ).getTime();
+
+                if (
+                    !Number.isFinite(endTs)
+                ) {
+                    return;
+                }
+
+                const remaining =
+                    endTs - now;
+
+                if (
+                    remaining <=
+                    MARKET_TIMER_SYNC_WINDOW_MS
+                    &&
+                    remaining >=
+                    -MARKET_TIMER_SYNC_GRACE_MS
+                ) {
+                    out.push(id);
+                }
+            }
+        );
+
+        return out;
+    }
+
+
+    // ============================================================
+    // SYNCHRONISATION GROUPÉE DES TIMERS
+    // ============================================================
+    //
+    // fetchAuctionsByIds() existe déjà dans ton script.
+    //
+    // Plusieurs enchères sont donc récupérées dans UNE requête,
+    // au lieu de faire un GET individuel pour chaque carte.
+    //
+    async function syncNearEndTimers(ids) {
+        const list = [
+            ...new Set(
+                (ids || [])
+                    .filter(Boolean)
+            )
+        ];
+
+        if (list.length === 0) {
+            return;
+        }
+
+        // Évite les URLs gigantesques
+        const CHUNK = 40;
+
+        for (
+            let i = 0;
+            i < list.length;
+            i += CHUNK
+        ) {
+            const chunk =
+                list.slice(
+                    i,
+                    i + CHUNK
+                );
+
+            let rows = null;
+
+            try {
+                rows =
+                    await fetchAuctionsByIds(
+                        chunk
+                    );
+            } catch (e) {
+                rows = null;
+            }
+
+            // ----------------------------------------
+            // Lecture groupée OK
+            // ----------------------------------------
+
+            if (rows instanceof Map) {
+
+                rows.forEach(
+                    row => {
+                        if (
+                            row &&
+                            row.id
+                        ) {
+                            applyFreshAuctionState(
+                                row,
+                                {
+                                    render: false,
+                                    logExtension: true
+                                }
+                            );
+                        }
+                    }
+                );
+
+                continue;
+            }
+
+            // ----------------------------------------
+            // Fallback
+            // ----------------------------------------
+            //
+            // Si Supabase ne répond pas :
+            // maximum 8 GET individuels à la fois.
+            //
+            const fallback =
+                chunk.slice(0, 8);
+
+            const results =
+                await Promise.allSettled(
+                    fallback.map(
+                        id =>
+                            fetchSingleAuction(id)
+                    )
+                );
+
+            results.forEach(
+                r => {
+                    if (
+                        r.status ===
+                        'fulfilled'
+                        &&
+                        r.value
+                    ) {
+                        applyFreshAuctionState(
+                            r.value,
+                            {
+                                render: false,
+                                logExtension: true
+                            }
+                        );
+                    }
+                }
+            );
+        }
+    }
+
     // Rafraîchit à la demande le prix RÉEL d'une enchère (bouton ↻ de la vue déroulée). Le bot
     // ne poll pas toujours pile au bon instant → ça permet d'avoir le bon prix pour miser à la main.
-    window.wmRefreshAuction = async function (id, btn) {
-        if (!id) return;
-        if (btn) btn.style.animation = 'wm-spin 0.7s linear infinite'; // ↻ tourne pendant le fetch
-        try {
-            const fresh = await fetchSingleAuction(id);
-            if (fresh) {
-                // Patch le cache d'affichage + activeHitsMap avec les données fraîches
-                const cached = lastHitsCache.find(h => h && h.id === id);
-                if (cached) {
-                    if ('current_bid' in fresh) cached.current_bid = fresh.current_bid;
-                    if ('current_bidder' in fresh) cached.current_bidder = fresh.current_bidder;
-                    if ('base_amount' in fresh) cached.base_amount = fresh.base_amount;
-                    if (fresh.end_at) cached.end_at = fresh.end_at;
-                    // MàJ directe de la mise minimale (fiable même si un input est focus → pas de
-                    // re-render dans ce cas ; sinon le re-render ci-dessous recrée tout proprement).
-                    const inp = document.getElementById('wm-bidinput-' + id);
-                    if (inp) { const mn = minNextBid(cached); inp.min = String(mn); inp.value = String(mn); }
-                }
-                const prev = activeHitsMap.get(id);
-                if (fresh.end_at) activeHitsMap.set(id, { auction: { ...((prev && prev.auction) || {}), ...fresh }, endAt: fresh.end_at });
-                const el = document.getElementById('wm-market-alert');
-                if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
+    window.wmRefreshAuction =
+        async function (id, btn) {
+
+            if (!id) return;
+
+            if (btn) {
+                btn.style.animation =
+                    'wm-spin 0.7s linear infinite';
             }
-        } catch (e) {
-            // échec silencieux : on ne casse pas l'affichage, l'utilisateur peut re-cliquer
-        } finally {
-            if (btn && btn.isConnected) btn.style.animation = '';
-        }
-    };
+
+            try {
+                const fresh =
+                    await fetchSingleAuction(id);
+
+                if (fresh) {
+
+                    const merged =
+                        applyFreshAuctionState(
+                            fresh,
+                            {
+                                render: false,
+                                logExtension: true
+                            }
+                        );
+
+                    const cached =
+                        lastHitsCache.find(
+                            h =>
+                                h &&
+                                h.id === id
+                        )
+                        ||
+                        merged;
+
+                    const inp =
+                        document.getElementById(
+                            'wm-bidinput-' + id
+                        );
+
+                    if (
+                        inp &&
+                        cached
+                    ) {
+                        const mn =
+                            minNextBid(cached);
+
+                        inp.min =
+                            String(mn);
+
+                        inp.value =
+                            String(mn);
+                    }
+
+                    const el =
+                        document.getElementById(
+                            'wm-market-alert'
+                        );
+
+                    if (
+                        el &&
+                        lastHitsCache.length > 0
+                    ) {
+                        renderMarketHits(
+                            el,
+                            lastHitsCache,
+                            []
+                        );
+                    }
+                }
+
+            } catch (e) {
+
+                // silencieux
+
+            } finally {
+
+                if (
+                    btn &&
+                    btn.isConnected
+                ) {
+                    btn.style.animation = '';
+                }
+            }
+        };
 
     // Calcule l'intervalle de polling en fonction de l'enchère trackée la plus urgente.
     // Retourne null si rien d'urgent à surveiller (le main scan suffit).
     function computeHotLaneInterval() {
-        const tracked = new Set([...myBidsSet, ...autoBidSet, ...snipeSet]);
-        if (tracked.size === 0) return null;
 
-        let minMs = Infinity, minSnipeMs = Infinity;
-        tracked.forEach(id => {
-            const hit = activeHitsMap.get(id);
+        const actionTracked =
+            new Set([
+                ...myBidsSet,
+                ...autoBidSet,
+                ...snipeSet
+            ]);
+
+        const now =
+            serverNow();
+
+        let actionInterval =
+            Infinity;
+
+        let minMs =
+            Infinity;
+
+        let minSnipeMs =
+            Infinity;
+
+
+        // ----------------------------------------
+        // Enchères sur lesquelles le bot agit
+        // ----------------------------------------
+
+        actionTracked.forEach(id => {
+
+            const hit =
+                activeHitsMap.get(id);
+
             if (!hit) return;
-            const ms = new Date(hit.endAt).getTime() - Date.now();
-            if (ms > 0 && ms < minMs) minMs = ms;
-            if (snipeSet.has(id) && ms > 0 && ms < minSnipeMs) minSnipeMs = ms;
+
+            const endTs =
+                new Date(
+                    hit.endAt ||
+                    hit.auction?.end_at ||
+                    NaN
+                ).getTime();
+
+            if (
+                !Number.isFinite(endTs)
+            ) {
+                return;
+            }
+
+            const ms =
+                endTs - now;
+
+
+            if (
+                ms >
+                -MARKET_TIMER_SYNC_GRACE_MS
+                &&
+                ms < minMs
+            ) {
+                minMs = ms;
+            }
+
+
+            if (
+                snipeSet.has(id)
+                &&
+                ms >
+                -MARKET_TIMER_SYNC_GRACE_MS
+                &&
+                ms < minSnipeMs
+            ) {
+                minSnipeMs = ms;
+            }
         });
 
-        // Snipe imminent : polling très serré (~150ms) pour tirer pile au bon moment
-        // quand une enchère "Fourbe" approche de sa fenêtre de ~10s.
-        if (minSnipeMs < 20_000) return 150;
 
-        // Aucune enchère trackée connue dans activeHitsMap → on poll quand même
-        // toutes les 5s pour découvrir leur état initial.
-        if (minMs === Infinity) return 5000;
+        // Fourbe ultra rapide
+        if (
+            minSnipeMs < 20_000
+        ) {
+            actionInterval = 150;
+        }
 
-        if (minMs < 5_000) return 250;   // mort de l'enchère : 4 ticks/s
-        if (minMs < 12_000) return 500;   // snipe : 2 ticks/s
-        if (minMs < 30_000) return 1000;  // très chaud : 1s
-        if (minMs < 90_000) return 2000;  // chaud : 2s
-        if (minMs < 5 * 60_000) return 5000;  // tiède : 5s
-        return null;                            // froid : main scan suffit
+        else if (
+            minMs === Infinity
+            &&
+            actionTracked.size > 0
+        ) {
+            actionInterval = 5000;
+        }
+
+        else if (
+            minMs < 5_000
+        ) {
+            actionInterval = 250;
+        }
+
+        else if (
+            minMs < 12_000
+        ) {
+            actionInterval = 500;
+        }
+
+        else if (
+            minMs < 30_000
+        ) {
+            actionInterval = 1000;
+        }
+
+        else if (
+            minMs < 90_000
+        ) {
+            actionInterval = 2000;
+        }
+
+        else if (
+            minMs < 5 * 60_000
+        ) {
+            actionInterval = 5000;
+        }
+
+
+        // ----------------------------------------
+        // Simples timers affichés
+        // ----------------------------------------
+
+        const timerIds =
+            getNearEndTimerSyncIds();
+
+        const timerInterval =
+            timerIds.length > 0
+                ? MARKET_TIMER_SYNC_INTERVAL_MS
+                : Infinity;
+
+
+        const interval =
+            Math.min(
+                actionInterval,
+                timerInterval
+            );
+
+
+        return Number.isFinite(interval)
+            ? interval
+            : null;
     }
 
     // Un tick : fetch en parallèle toutes les enchères trackées, détecte outbid, ripote.
     async function hotLaneTick() {
-        const tracked = [...new Set([...myBidsSet, ...autoBidSet, ...snipeSet])];
-        if (tracked.length === 0) return;
 
-        // Ne pas fetch les enchères en cours de bid (lock)
-        const toFetch = tracked.filter(id => !bidLockSet.has(id));
-        if (toFetch.length === 0) return;
+        const actionTracked = [
+            ...new Set([
+                ...myBidsSet,
+                ...autoBidSet,
+                ...snipeSet
+            ])
+        ];
+
+        const nearEndIds =
+            getNearEndTimerSyncIds();
+
+
+        if (
+            actionTracked.length === 0
+            &&
+            nearEndIds.length === 0
+        ) {
+            return;
+        }
+
 
         hotLaneTickCount++;
 
-        const results = await Promise.allSettled(
-            toFetch.map(id => fetchSingleAuction(id))
-        );
+
+        // =====================================================
+        // TIMERS SIMPLEMENT AFFICHÉS
+        // =====================================================
+
+        const nowLocal =
+            Date.now();
+
+        const actionSet =
+            new Set(actionTracked);
+
+
+        const timerOnly =
+            nearEndIds.filter(
+                id =>
+                    !actionSet.has(id)
+                    &&
+                    !bidLockSet.has(id)
+            );
+
+
+        if (
+            timerOnly.length > 0
+            &&
+            nowLocal -
+            lastMarketTimerSyncAt
+            >=
+            MARKET_TIMER_SYNC_INTERVAL_MS - 25
+        ) {
+            lastMarketTimerSyncAt =
+                nowLocal;
+
+            await syncNearEndTimers(
+                timerOnly
+            );
+        }
+
+
+        // =====================================================
+        // ENCHÈRES SUR LESQUELLES LE BOT AGIT
+        // =====================================================
+
+        const toFetch =
+            actionTracked.filter(
+                id =>
+                    !bidLockSet.has(id)
+            );
+
+
+        if (
+            toFetch.length === 0
+        ) {
+            return;
+        }
+
+
+        const results =
+            await Promise.allSettled(
+                toFetch.map(
+                    id =>
+                        fetchSingleAuction(id)
+                )
+            );
 
         for (let i = 0; i < results.length; i++) {
             const r = results[i];
@@ -4386,12 +5174,23 @@
             const a = r.value;
             if (!a.id) continue;
 
-            // Si l'enchère n'existe plus côté API (terminée), on la nettoie
-            // (la fin de l'enchère sera détaillée par le main scan via le pruning)
-            const endTs = a.end_at ? new Date(a.end_at).getTime() : 0;
-            if (endTs > 0) {
-                activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
-            }
+            // État serveur autoritaire.
+            // Cela met aussi immédiatement à jour end_at si le site
+            // vient de prolonger l'enchère.
+            applyFreshAuctionState(
+                a,
+                {
+                    render: false,
+                    logExtension: true
+                }
+            );
+
+            const endTs =
+                a.end_at
+                    ? new Date(
+                        a.end_at
+                    ).getTime()
+                    : 0;
 
             // 🕵️ MODE FOURBE (snipe) : ne mise QU'UNE fois, à ~10s de la fin.
             // On tire dès que le temps restant passe sous (snipe + ~1s de marge réseau),
@@ -4559,10 +5358,38 @@
     }
 
     function stopHotLane() {
-        if (!hotLaneActive) return;
+
+        if (!hotLaneActive) {
+            return;
+        }
+
         hotLaneActive = false;
-        if (hotLaneTimeout) { clearTimeout(hotLaneTimeout); hotLaneTimeout = null; }
-        wmLog(`⏸️ Hot-lane stoppée (${hotLaneTickCount} ticks)`);
+
+        if (hotLaneTimeout) {
+            clearTimeout(
+                hotLaneTimeout
+            );
+
+            hotLaneTimeout = null;
+        }
+
+        // Annule les refresh programmés
+        // après nos propres bids.
+        for (
+            const timer
+            of postBidRefreshTimers.values()
+        ) {
+            clearTimeout(timer);
+        }
+
+        postBidRefreshTimers.clear();
+
+        lastMarketTimerSyncAt = 0;
+
+        wmLog(
+            `⏸️ Hot-lane stoppée ` +
+            `(${hotLaneTickCount} ticks)`
+        );
     }
 
     /* ===================== MARKET WATCHER LIFECYCLE ===================== */
