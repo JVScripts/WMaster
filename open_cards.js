@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.5';
+    const WM_VERSION = '1.6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -651,7 +651,7 @@
     /* ═══════ HISTORIQUE DES VENTES & VALORISATION ═══════ */
     // Cache localStorage des ventes passées par carte : card_id → { median, count, fetchedAt }
     // L'historique bouge sur des jours/semaines, donc un TTL long évite de refetcher inutilement.
-    const SALES_CACHE_KEY = 'wm_sales_cache';
+    const SALES_CACHE_KEY = 'wm_sales_cache_30d_v1';
     const SALES_CACHE_TTL = 12 * 3600 * 1000; // 12h
     let salesCache = {};
     try { salesCache = JSON.parse(localStorage.getItem(SALES_CACHE_KEY) || '{}') || {}; } catch (e) { salesCache = {}; }
@@ -829,30 +829,30 @@
             const cardId = auction.card?.id ?? auction.card_id;
             const entry = getCachedSales(cardId);
 
-            if (entry && entry.count > 0 && entry.median > 0) {
-                const ratio = getSetting('autoSnipeAdaptiveRatio');
-                const threshold = Math.floor(entry.median * ratio);
-
-                if (currentBid <= threshold) {
-                    return {
-                        snipe: true,
-                        reason: `≤ ${Math.round(ratio * 100)}% méd. (${entry.median})`,
-                        cap: threshold
-                    };
-                }
-
+            // 0, 1 ou 2 ventes = on ne mise PAS
+            if (!entry || entry.count < 3 || entry.median <= 0) {
                 return {
                     snipe: false,
-                    reason: `prix > ${Math.round(ratio * 100)}% méd. (${entry.median})`,
+                    reason: 'historique insuffisant',
+                    cap: 0
+                };
+            }
+
+            const ratio = getSetting('autoSnipeAdaptiveRatio');
+            const threshold = Math.floor(entry.median * ratio);
+
+            if (currentBid <= threshold) {
+                return {
+                    snipe: true,
+                    reason: `≤ ${Math.round(ratio * 100)}% méd. (${entry.median})`,
                     cap: threshold
                 };
             }
 
-            // IMPORTANT : pas de ventes connues = aucune mise
             return {
                 snipe: false,
-                reason: 'pas d’historique',
-                cap: 0
+                reason: `> ${Math.round(ratio * 100)}% méd. (${entry.median})`,
+                cap: threshold
             };
         }
 
