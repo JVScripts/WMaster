@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.8';
+    const WM_VERSION = '1.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4422,13 +4422,116 @@
 
     // Récupère UNE enchère par ID — endpoint dédié (rapide, single request)
     async function fetchSingleAuction(id) {
-        const t0 = Date.now();
-        const res = await fetch(`${MARKET_API_BASE}/${id}`, { credentials: "include" });
-        syncServerClockFromResponse(res, t0); // recale l'horloge serveur (critique pour le snipe)
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        // Selon la forme de la réponse de l'API : { auction: {...} } ou {...} directement
-        return data.auction || data;
+
+        if (!id) {
+            return null;
+        }
+
+        /*
+         * L'endpoint :
+         *
+         * /api/marketplace/{auctionId}
+         *
+         * renvoie 403 sur certains comptes.
+         *
+         * On utilise donc directement la table auctions,
+         * déjà accessible au script.
+         */
+
+        const rows =
+            await queryAuctions(
+                `id=eq.${id}`,
+                '',
+                1
+            );
+
+        if (
+            !Array.isArray(rows) ||
+            rows.length === 0
+        ) {
+            return null;
+        }
+
+        return rows[0];
+    }
+
+    async function fetchHotLaneAuctionsByIds(ids) {
+
+        const list = [
+            ...new Set(
+                (ids || [])
+                    .filter(Boolean)
+            )
+        ];
+
+        const result =
+            new Map();
+
+        if (
+            list.length === 0
+        ) {
+            return result;
+        }
+
+        /*
+         * On groupe jusqu'à 40 enchères
+         * dans une seule requête.
+         */
+        const CHUNK_SIZE = 40;
+
+        for (
+            let i = 0;
+            i < list.length;
+            i += CHUNK_SIZE
+        ) {
+
+            const chunk =
+                list.slice(
+                    i,
+                    i + CHUNK_SIZE
+                );
+
+            try {
+
+                const rows =
+                    await queryAuctions(
+                        `id=in.(${chunk.join(',')})`,
+                        '',
+                        chunk.length
+                    );
+
+                if (
+                    !Array.isArray(rows)
+                ) {
+                    continue;
+                }
+
+                for (
+                    const auction
+                    of rows
+                ) {
+
+                    if (
+                        auction?.id
+                    ) {
+
+                        result.set(
+                            auction.id,
+                            auction
+                        );
+                    }
+                }
+
+            } catch (e) {
+
+                console.warn(
+                    '[WikiMasters][hot-lane] lecture groupée impossible:',
+                    e
+                );
+            }
+        }
+
+        return result;
     }
 
     // ============================================================
@@ -5160,19 +5263,36 @@
         }
 
 
-        const results =
-            await Promise.allSettled(
-                toFetch.map(
-                    id =>
-                        fetchSingleAuction(id)
-                )
+        /*
+        * Une seule lecture groupée au lieu de :
+        *
+        * GET auction 1
+        * GET auction 2
+        * GET auction 3
+        * ...
+        */
+        const freshAuctions =
+            await fetchHotLaneAuctionsByIds(
+                toFetch
             );
 
-        for (let i = 0; i < results.length; i++) {
-            const r = results[i];
-            if (r.status !== 'fulfilled' || !r.value) continue;
-            const a = r.value;
-            if (!a.id) continue;
+
+        for (
+            const trackedId
+            of toFetch
+        ) {
+
+            const a =
+                freshAuctions.get(
+                    trackedId
+                );
+
+            if (
+                !a ||
+                !a.id
+            ) {
+                continue;
+            }
 
             // État serveur autoritaire.
             // Cela met aussi immédiatement à jour end_at si le site
