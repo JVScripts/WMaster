@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '1.9';
+    const WM_VERSION = '2.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -6333,7 +6333,117 @@
 
         return { ok: true, auctionId: _lastUiListingAuctionId };
     }
+    /* ══════════ ANTI-BOUCLE TRASH SELLER ══════════ */
 
+    // Une carte qui échoue n'est pas retentée immédiatement.
+    // 13 min > cache Trash de 12 min : le prochain essai se fera
+    // après un vrai rescan de la collection.
+    const TRASH_FAIL_COOLDOWN_MS = 13 * 60 * 1000;
+
+    const trashFailCooldown = new Map();
+
+    // Identifie en priorité l'EXEMPLAIRE précis.
+    // Fallback card_id pour les anciennes entrées du cache qui n'ont pas d'id.
+    function trashItemKey(item) {
+        if (!item) return null;
+
+        const userCardId =
+            item.id ||
+            item.user_card_id ||
+            null;
+
+        if (userCardId) {
+            return `u:${userCardId}`;
+        }
+
+        const cardId =
+            item.card_id ||
+            item.card?.id ||
+            null;
+
+        if (cardId) {
+            return `c:${cardId}`;
+        }
+
+        return null;
+    }
+
+    function trashItemOnCooldown(item) {
+        const key = trashItemKey(item);
+
+        if (!key) return false;
+
+        const until =
+            trashFailCooldown.get(key);
+
+        if (!until) {
+            return false;
+        }
+
+        if (Date.now() >= until) {
+            trashFailCooldown.delete(key);
+            return false;
+        }
+
+        return true;
+    }
+
+    function markTrashItemFailed(item) {
+        const key = trashItemKey(item);
+
+        if (!key) return;
+
+        trashFailCooldown.set(
+            key,
+            Date.now() + TRASH_FAIL_COOLDOWN_MS
+        );
+    }
+
+    function clearTrashItemFailure(item) {
+        const key = trashItemKey(item);
+
+        if (key) {
+            trashFailCooldown.delete(key);
+        }
+    }
+
+    /*
+     * Retire l'exemplaire précis du cache.
+     *
+     * Avant :
+     * removeFromTrashPoolCache(cardId)
+     *
+     * supprimait juste la première carte ayant ce card_id,
+     * ce qui est ambigu quand on possède plusieurs exemplaires.
+     */
+    function removeTrashItemFromPoolCache(item) {
+        if (!item || !trashPoolCacheReady) return;
+
+        const key =
+            trashItemKey(item);
+
+        if (key) {
+            const idx =
+                trashPoolCache.findIndex(
+                    c =>
+                        trashItemKey(c) === key
+                );
+
+            if (idx !== -1) {
+                trashPoolCache.splice(idx, 1);
+                return;
+            }
+        }
+
+        // Fallback ancien comportement
+        const cardId =
+            item.card_id ||
+            item.card?.id;
+
+        if (cardId) {
+            removeFromTrashPoolCache(cardId);
+        }
+    }
     async function sellBatch(cards, statusEl) {
         let sold = 0, skipped = 0, deferred = 0;
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
@@ -6406,10 +6516,29 @@
             }
 
             if (success) {
+
                 sold++;
-                incrementListedCount(cardId); // couverture équitable du pool Trash
-                removeFromTrashPoolCache(cardId); // vendue → sort du pool incrémental
-                recordSale(item, price, 'pending', result.auctionId || null);
+
+                incrementListedCount(
+                    cardId
+                );
+
+                // Retire précisément CET exemplaire du pool.
+                removeTrashItemFromPoolCache(
+                    item
+                );
+
+                // Une réussite efface un éventuel cooldown précédent.
+                clearTrashItemFailure(
+                    item
+                );
+
+                recordSale(
+                    item,
+                    price,
+                    'pending',
+                    result.auctionId || null
+                );
                 invalidateSalesDetail(); // la nouvelle vente doit apparaître sans attendre le cache
                 const rN = getRetagCount(cardId);
                 const retagTag = rN > 0 ? ` · <span style="color:#fbbf24;">🔁${rN}</span>` : '';
@@ -6430,8 +6559,25 @@
                 wmLog(`⚠️ <b>Trash Seller en pause</b> — reste sur <code>/collection</code> pour que la mise en vente automatique fonctionne (elle simule un clic sur tes cartes).`);
                 break; // toutes les cartes suivantes échoueraient pour la même raison
             } else {
+
                 skipped++;
-                wmLog(`❌ Échec mise en vente : <b>${title}</b> [${rarity}] · <span style="color:#888;font-size:9px;">${result ? result.reason : '?'}</span>`);
+
+                // IMPORTANT :
+                // ne retente pas exactement la même carte au prochain lot.
+                markTrashItemFailed(
+                    item
+                );
+
+                wmLog(
+                    `❌ Échec mise en vente : ` +
+                    `<b>${title}</b> [${rarity}] · ` +
+                    `<span style="color:#888;font-size:9px;">` +
+                    `${result ? result.reason : '?'}` +
+                    `</span>` +
+                    ` <span style="color:#fbbf24;font-size:9px;">` +
+                    `(ignorée 13 min)` +
+                    `</span>`
+                );
             }
         }
         return { sold, skipped, deferred, limitReached };
@@ -6854,11 +7000,60 @@
         // Scanne le pool Trash et retourne la liste triée selon la stratégie. showProgress=false
         // → scan silencieux (préfetch en fond, on n'écrase pas le message d'attente).
         const scanPool = async (showProgress) => {
-            const cards = await getTrashPool((page, total) => {
-                if (showProgress) statusEl.innerHTML = `<span style="color:#888;">🔍 Recherche cartes Trash… ${Math.round((page / total) * 100)}% (p.${page}/${total})</span>`;
-            });
-            if (!trashSellerRunning) return [];
-            return await selectTrashBatch(cards, cards.length); // tout le pool, trié
+
+            const cards =
+                await getTrashPool(
+                    (page, total) => {
+
+                        if (showProgress) {
+
+                            statusEl.innerHTML =
+                                `<span style="color:#888;">` +
+                                `🔍 Recherche cartes Trash… ` +
+                                `${Math.round((page / total) * 100)}% ` +
+                                `(p.${page}/${total})` +
+                                `</span>`;
+                        }
+                    }
+                );
+
+
+            if (!trashSellerRunning) {
+                return [];
+            }
+
+
+            // Une carte qui vient d'échouer est temporairement exclue.
+            // On passe donc aux suivantes au lieu de boucler dessus.
+            const eligible =
+                cards.filter(
+                    item =>
+                        !trashItemOnCooldown(item)
+                );
+
+
+            const cooling =
+                cards.length -
+                eligible.length;
+
+
+            if (
+                showProgress &&
+                cooling > 0
+            ) {
+
+                wmLog(
+                    `⏭️ Trash Seller : ` +
+                    `<b>${cooling}</b> carte(s) ` +
+                    `temporairement ignorée(s) après échec précédent.`
+                );
+            }
+
+
+            return await selectTrashBatch(
+                eligible,
+                eligible.length
+            );
         };
 
         // 🗃️ Tampon de cartes prêtes à lister. On PRÉFETCH le scan du prochain lot en tâche
@@ -6914,8 +7109,46 @@
                 const batch = buffer.slice(0, slots);
                 statusEl.innerHTML = `<span style="color:#06b6d4;">🛒 Mise en vente de ${batch.length} carte(s) (${activeCount} actives)…</span>`;
 
-                const { sold, skipped, deferred, limitReached } = await sellBatch(batch, statusEl);
-                const newActive = activeCount + sold;
+                const {
+                    sold,
+                    skipped,
+                    deferred,
+                    limitReached
+                } = await sellBatch(
+                    batch,
+                    statusEl
+                );
+
+
+                /*
+                 * Retire systématiquement les cartes qu'on vient de tenter
+                 * du tampon COURANT.
+                 *
+                 * Succès → déjà retirée du trashPoolCache.
+                 * Échec  → placée en cooldown.
+                 *
+                 * Dans les deux cas, aucune raison de conserver l'ancien
+                 * objet dans `buffer`.
+                 */
+                const attemptedKeys =
+                    new Set(
+                        batch
+                            .map(trashItemKey)
+                            .filter(Boolean)
+                    );
+
+
+                buffer =
+                    buffer.filter(
+                        item =>
+                            !attemptedKeys.has(
+                                trashItemKey(item)
+                            )
+                    );
+
+
+                const newActive =
+                    activeCount + sold;
 
                 statusEl.innerHTML =
                     `<span style="color:#4ade80;">✔ ${sold} mise(s) en vente</span>` +
