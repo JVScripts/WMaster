@@ -11,5 +11,5 @@
 // @grant        none
 // @updateURL    https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.user.js
 // @downloadURL  https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.user.js
-// @require      https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.js
+// @require      https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.js?v=1.5
 // ==/UserScript==
