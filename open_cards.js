@@ -35,12 +35,12 @@
     // Config de vente par rareté (prix + durée), modifiable dans Paramètres
     const SELL_CONFIG_KEY = 'wm_sell_config';
     const SELL_CONFIG_DEFAULT = {
-        L:  { price: 100, duration: 10 },
-        UR: { price: 50,  duration: 10 },
-        SR: { price: 25,  duration: 10 },
-        R:  { price: 20,  duration: 10 },
-        PC: { price: 15,  duration: 10 },
-        C:  { price: 10,  duration: 10 },
+        L: { price: 100, duration: 10 },
+        UR: { price: 50, duration: 10 },
+        SR: { price: 25, duration: 10 },
+        R: { price: 20, duration: 10 },
+        PC: { price: 15, duration: 10 },
+        C: { price: 10, duration: 10 },
     };
     const SELL_DURATION_CHOICES = [10, 30, 60, 180, 360, 720, 1440];
 
@@ -55,13 +55,13 @@
                 }
                 return merged;
             }
-        } catch(e) {}
+        } catch (e) { }
         return JSON.parse(JSON.stringify(SELL_CONFIG_DEFAULT));
     }
     function setSellConfig(cfg) {
-        try { localStorage.setItem(SELL_CONFIG_KEY, JSON.stringify(cfg)); } catch(e) {}
+        try { localStorage.setItem(SELL_CONFIG_KEY, JSON.stringify(cfg)); } catch (e) { }
     }
-    function getSellPrice(rarity)    { return getSellConfig()[rarity]?.price    ?? 10; }
+    function getSellPrice(rarity) { return getSellConfig()[rarity]?.price ?? 10; }
     function getSellDuration(rarity) { return getSellConfig()[rarity]?.duration ?? 10; }
 
     // Migration : si un sellDuration global existait, on l'applique à toutes les raretés
@@ -76,15 +76,15 @@
             }
             localStorage.removeItem('wm_sell_duration');
         }
-    } catch(e) {}
+    } catch (e) { }
 
     const RARITY = {
-        L:  { color: "#FFD700", bg: "rgba(255,215,0,0.15)",   label: "L"  },
-        UR: { color: "#FF8C00", bg: "rgba(255,140,0,0.15)",   label: "UR" },
+        L: { color: "#FFD700", bg: "rgba(255,215,0,0.15)", label: "L" },
+        UR: { color: "#FF8C00", bg: "rgba(255,140,0,0.15)", label: "UR" },
         SR: { color: "#FF69B4", bg: "rgba(255,105,180,0.15)", label: "SR" },
-        R:  { color: "#A855F7", bg: "rgba(168,85,247,0.15)",  label: "R"  },
-        PC: { color: "#3B82F6", bg: "rgba(59,130,246,0.15)",  label: "PC" },
-        C:  { color: "#22C55E", bg: "rgba(34,197,94,0.15)",   label: "C"  },
+        R: { color: "#A855F7", bg: "rgba(168,85,247,0.15)", label: "R" },
+        PC: { color: "#3B82F6", bg: "rgba(59,130,246,0.15)", label: "PC" },
+        C: { color: "#22C55E", bg: "rgba(34,197,94,0.15)", label: "C" },
     };
 
     /* ===================== STATE ===================== */
@@ -94,7 +94,7 @@
     let totalPacks = 0;
     let totalCards = 0;
     let cardStats = {};
-    let rarityStats = { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
+    let rarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
     let sessionStart = null;
     let timerInterval = null;
     let minimized = false;
@@ -119,7 +119,7 @@
     // historique. Persistées dans sessionStorage : un simple F5 poursuit LA MÊME session
     // (avant, chaque rechargement repartait de zéro et fragmentait/perdait le récap).
     const SESSION_METRICS_KEY = 'wm_session_metrics';
-    const emptyRarities = () => ({ L:0, UR:0, SR:0, R:0, PC:0, C:0 });
+    const emptyRarities = () => ({ L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 });
     let sessionMetrics = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         start: Date.now(),
@@ -144,16 +144,16 @@
                 rarities: { ...emptyRarities(), ...(raw.rarities || {}) }
             };
         }
-    } catch(e) {}
+    } catch (e) { }
     function saveSessionMetrics() {
-        try { sessionStorage.setItem(SESSION_METRICS_KEY, JSON.stringify(sessionMetrics)); } catch(e) {}
+        try { sessionStorage.setItem(SESSION_METRICS_KEY, JSON.stringify(sessionMetrics)); } catch (e) { }
     }
     saveSessionMetrics();
 
     // Stats du Pack Opener fusionnées PAR JOUR (persistées). Ne repartent plus de zéro
     // à chaque refresh ; reset automatique au changement de date (todayKey).
     const DAILY_STATS_KEY = 'wm_daily_pack_stats';
-    let dailyPackStats = { date: todayKey(), packs: 0, cards: 0, rarities: { L:0, UR:0, SR:0, R:0, PC:0, C:0 } };
+    let dailyPackStats = { date: todayKey(), packs: 0, cards: 0, rarities: { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 } };
     try {
         const raw = JSON.parse(localStorage.getItem(DAILY_STATS_KEY) || 'null');
         if (raw && raw.date === todayKey()) {
@@ -161,15 +161,15 @@
                 date: todayKey(),
                 packs: raw.packs || 0,
                 cards: raw.cards || 0,
-                rarities: { L:0, UR:0, SR:0, R:0, PC:0, C:0, ...(raw.rarities || {}) }
+                rarities: { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0, ...(raw.rarities || {}) }
             };
         }
-    } catch(e) {}
+    } catch (e) { }
 
     // Stats du jour pour l'affichage du Pack Opener — AMORCÉES depuis le cumul persistant.
     let sessionPacks = dailyPackStats.packs;
     let sessionCards = dailyPackStats.cards;
-    let sessionRarityStats = { L:0, UR:0, SR:0, R:0, PC:0, C:0, ...dailyPackStats.rarities };
+    let sessionRarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0, ...dailyPackStats.rarities };
     // Jour auquel appartiennent les stats ci-dessus. Sert au reset automatique à minuit même
     // si l'onglet reste ouvert (sinon les stats d'hier continuaient de s'accumuler ET étaient
     // ré-estampillées "aujourd'hui" par saveDailyPackStats → survivaient au reload).
@@ -183,7 +183,7 @@
             cards: sessionCards,
             rarities: { ...sessionRarityStats }
         };
-        try { localStorage.setItem(DAILY_STATS_KEY, JSON.stringify(dailyPackStats)); } catch(e) {}
+        try { localStorage.setItem(DAILY_STATS_KEY, JSON.stringify(dailyPackStats)); } catch (e) { }
     }
 
     // Reset auto des stats quotidiennes au changement de date (rollover minuit). Retourne true
@@ -194,14 +194,14 @@
         sessionStatsDay = tk;
         sessionPacks = 0;
         sessionCards = 0;
-        sessionRarityStats = { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
+        sessionRarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         saveDailyPackStats(); // écrase le store : { date: aujourd'hui, 0… }
         // Rafraîchit l'affichage s'il est monté
         try {
             const rEl = document.getElementById('wm-rarity'); if (rEl) renderRarityStats(rEl);
             const pEl = document.getElementById('wm-packs'); if (pEl) pEl.innerText = '0 packs';
             if (window.wmUpdateDailyPacksInfo) window.wmUpdateDailyPacksInfo();
-        } catch(e) {}
+        } catch (e) { }
         wmLog('🔄 Nouveau jour : stats quotidiennes du Pack Opener remises à zéro.');
         return true;
     }
@@ -217,11 +217,11 @@
     try {
         const raw = JSON.parse(localStorage.getItem(WON_SEEN_KEY) || '[]');
         if (Array.isArray(raw)) wonSeenIds = new Set(raw);
-    } catch(e) {}
+    } catch (e) { }
     let wonInitialized = false; // au 1er fetch, on enregistre l'existant SANS le compter
     let lastWonSync = 0;        // throttle : on ne sync les achats qu'à intervalle espacé
     function saveWonSeen() {
-        try { localStorage.setItem(WON_SEEN_KEY, JSON.stringify([...wonSeenIds].slice(-2000))); } catch(e) {}
+        try { localStorage.setItem(WON_SEEN_KEY, JSON.stringify([...wonSeenIds].slice(-2000))); } catch (e) { }
     }
 
     /* ── Archive locale des ACHATS ──
@@ -236,21 +236,21 @@
     try {
         const raw = JSON.parse(localStorage.getItem(BUY_HISTORY_KEY) || '[]');
         if (Array.isArray(raw)) buyHistory = raw;
-    } catch(e) {}
+    } catch (e) { }
     const buyHistoryIds = new Set(buyHistory.map(b => b && b.id).filter(Boolean));
     function saveBuyHistory() {
         try {
             buyHistory.sort((a, b) => (a.boughtAt || 0) - (b.boughtAt || 0));
             buyHistory = buyHistory.slice(-2000);
             localStorage.setItem(BUY_HISTORY_KEY, JSON.stringify(buyHistory));
-        } catch(e) {}
+        } catch (e) { }
     }
     // Archive un achat depuis une entrée `won` de l'API. true si c'est une nouveauté.
     function recordPurchase(w) {
         if (!w || !w.id || buyHistoryIds.has(w.id)) return false;
         const ts = w.settled_at ? new Date(w.settled_at).getTime()
-                 : w.end_at    ? new Date(w.end_at).getTime()
-                 : Date.now();
+            : w.end_at ? new Date(w.end_at).getTime()
+                : Date.now();
         buyHistoryIds.add(w.id);
         buyHistory.push({
             id: w.id,
@@ -295,7 +295,7 @@
             const res = await fetchWithTimeout(`${MARKET_API_BASE}/mine`, { credentials: 'include' });
             if (!res.ok) return null;
             return await res.json();
-        } catch(e) { return null; } // inclut l'abandon par timeout (AbortError)
+        } catch (e) { return null; } // inclut l'abandon par timeout (AbortError)
     }
 
     // Récupère les enchères gagnées et crédite les nouveaux achats à la session courante.
@@ -371,9 +371,9 @@
     // Historique des dernières sessions (persisté, max 20)
     const SESSION_HISTORY_KEY = 'wm_session_history';
     let sessionHistory = [];
-    try { sessionHistory = JSON.parse(localStorage.getItem(SESSION_HISTORY_KEY) || '[]') || []; } catch(e) {}
+    try { sessionHistory = JSON.parse(localStorage.getItem(SESSION_HISTORY_KEY) || '[]') || []; } catch (e) { }
     function saveSessionHistory() {
-        try { localStorage.setItem(SESSION_HISTORY_KEY, JSON.stringify(sessionHistory.slice(-20))); } catch(e) {}
+        try { localStorage.setItem(SESSION_HISTORY_KEY, JSON.stringify(sessionHistory.slice(-20))); } catch (e) { }
     }
     // Enregistre / met à jour la session courante dans l'historique.
     // UPSERT par id : idempotent, donc on peut l'appeler aussi souvent qu'on veut. La session
@@ -400,7 +400,7 @@
         try {
             const stored = JSON.parse(localStorage.getItem(SESSION_HISTORY_KEY) || '[]');
             if (Array.isArray(stored)) sessionHistory = stored;
-        } catch(e) {}
+        } catch (e) { }
         const idx = sessionHistory.findIndex(s => s.id === entry.id);
         if (idx >= 0) sessionHistory[idx] = entry; else sessionHistory.push(entry);
         saveSessionHistory();
@@ -412,19 +412,19 @@
     const DAILY_PACKS_KEY = 'wm_daily_packs';
     function todayKey() {
         const d = new Date();
-        return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     }
     let dailyPacks = { date: todayKey(), count: 0 };
     try {
         const raw = JSON.parse(localStorage.getItem(DAILY_PACKS_KEY) || 'null');
         if (raw && raw.date === todayKey()) dailyPacks = raw;
-    } catch(e) {}
+    } catch (e) { }
     let dailyAlertFired = false; // évite de spammer l'alerte une fois le seuil franchi
     function incrementDailyPacks() {
         const tk = todayKey();
         if (dailyPacks.date !== tk) { dailyPacks = { date: tk, count: 0 }; dailyAlertFired = false; }
         dailyPacks.count++;
-        try { localStorage.setItem(DAILY_PACKS_KEY, JSON.stringify(dailyPacks)); } catch(e) {}
+        try { localStorage.setItem(DAILY_PACKS_KEY, JSON.stringify(dailyPacks)); } catch (e) { }
         // Rafraîchit l'indicateur live dans les paramètres s'il est affiché
         if (typeof window.wmUpdateDailyPacksInfo === 'function') window.wmUpdateDailyPacksInfo();
         // Alerte si activée et seuil franchi
@@ -433,7 +433,7 @@
             if (dailyPacks.count >= limit) {
                 dailyAlertFired = true;
                 wmLog(`⚠️ <b style="color:#ef4444;">Alerte volume</b> : ${dailyPacks.count} packs ouverts aujourd'hui (seuil : ${limit}). Pense à lever le pied.`);
-                try { alert(`⚠️ WikiMasters Bot\n\nTu as ouvert ${dailyPacks.count} packs aujourd'hui, ce qui dépasse ton seuil d'alerte (${limit}).\n\nUn volume élevé peut attirer l'attention de la modération. Pense à faire une pause.`); } catch(e) {}
+                try { alert(`⚠️ WikiMasters Bot\n\nTu as ouvert ${dailyPacks.count} packs aujourd'hui, ce qui dépasse ton seuil d'alerte (${limit}).\n\nUn volume élevé peut attirer l'attention de la modération. Pense à faire une pause.`); } catch (e) { }
             }
         }
     }
@@ -443,9 +443,9 @@
     // Map persistée : card_id → { title, rarity, count }. Persiste à vie.
     const RETAG_COUNT_KEY = 'wm_retag_counts';
     let retagCounts = {};
-    try { retagCounts = JSON.parse(localStorage.getItem(RETAG_COUNT_KEY) || '{}') || {}; } catch(e) { retagCounts = {}; }
+    try { retagCounts = JSON.parse(localStorage.getItem(RETAG_COUNT_KEY) || '{}') || {}; } catch (e) { retagCounts = {}; }
     function saveRetagCounts() {
-        try { localStorage.setItem(RETAG_COUNT_KEY, JSON.stringify(retagCounts)); } catch(e) {}
+        try { localStorage.setItem(RETAG_COUNT_KEY, JSON.stringify(retagCounts)); } catch (e) { }
     }
     function incrementRetagCount(cardId, title, rarity) {
         if (!cardId) return;
@@ -470,9 +470,9 @@
     // équitable de tout le pool Trash. card_id -> count.
     const LISTED_COUNT_KEY = 'wm_listed_counts';
     let listedCounts = {};
-    try { listedCounts = JSON.parse(localStorage.getItem(LISTED_COUNT_KEY) || '{}') || {}; } catch(e) { listedCounts = {}; }
+    try { listedCounts = JSON.parse(localStorage.getItem(LISTED_COUNT_KEY) || '{}') || {}; } catch (e) { listedCounts = {}; }
     function saveListedCounts() {
-        try { localStorage.setItem(LISTED_COUNT_KEY, JSON.stringify(listedCounts)); } catch(e) {}
+        try { localStorage.setItem(LISTED_COUNT_KEY, JSON.stringify(listedCounts)); } catch (e) { }
     }
     function getListedCount(cardId) {
         return (cardId && listedCounts[cardId]) ? listedCounts[cardId] : 0;
@@ -497,9 +497,9 @@
                 byRarity: raw.byRarity || {}
             };
         }
-    } catch(e) {}
+    } catch (e) { }
     function saveLifetimeStats() {
-        try { localStorage.setItem(LIFETIME_STATS_KEY, JSON.stringify(lifetimeStats)); } catch(e) {}
+        try { localStorage.setItem(LIFETIME_STATS_KEY, JSON.stringify(lifetimeStats)); } catch (e) { }
     }
     function recordLifetimeSale(rarity, finalPrice) {
         rarity = (rarity || '').toUpperCase();
@@ -555,9 +555,9 @@
 
     // Comptage des cartes possédées par rareté : { L, UR, SR, R, PC, C }
     // Recalculé à chaque refresh complet de la collection.
-    let rarityCountMap = { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
+    let rarityCountMap = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
     function resetRarityCount() {
-        rarityCountMap = { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
+        rarityCountMap = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
     }
     function addRarityCount(item) {
         const rar = (item.card?.rarity || item.rarity || '').toUpperCase();
@@ -616,14 +616,14 @@
     // Tri du watcher market (persisté)
     const MARKET_SORT_KEY = 'wm_market_sort';
     let marketSortKey = 'time_asc';
-    try { marketSortKey = localStorage.getItem(MARKET_SORT_KEY) || 'time_asc'; } catch(e) {}
+    try { marketSortKey = localStorage.getItem(MARKET_SORT_KEY) || 'time_asc'; } catch (e) { }
 
     // Filtre de recherche live du Market Watcher (transitoire, non persisté)
     let marketSearchQuery = '';
     // Masquer les enchères dont je possède déjà la carte (persisté)
     const MARKET_HIDE_OWNED_KEY = 'wm_market_hide_owned';
     let marketHideOwned = false;
-    try { marketHideOwned = localStorage.getItem(MARKET_HIDE_OWNED_KEY) === '1'; } catch(e) {}
+    try { marketHideOwned = localStorage.getItem(MARKET_HIDE_OWNED_KEY) === '1'; } catch (e) { }
     // Vue du Market Watcher (persistée) :
     //   'detailed' — une ligne riche par annonce (tous les contrôles)
     //   'compact'  — une seule ligne condensée (nom · bid · leader · temps) → densité max
@@ -637,7 +637,7 @@
         if (MARKET_VIEWS.includes(v)) marketView = v;
         // Migration : personne ne doit perdre son réglage en passant sur cette version.
         else if (localStorage.getItem(MARKET_COMPACT_KEY) === '1') marketView = 'compact';
-    } catch(e) {}
+    } catch (e) { }
     // Enchères agrandies individuellement en mode compact (transitoire, non persisté).
     // Permet d'ouvrir une seule ligne en vue détaillée sans dérouler tout le panneau.
     let marketExpandedIds = new Set();
@@ -654,7 +654,7 @@
     const SALES_CACHE_KEY = 'wm_sales_cache';
     const SALES_CACHE_TTL = 12 * 3600 * 1000; // 12h
     let salesCache = {};
-    try { salesCache = JSON.parse(localStorage.getItem(SALES_CACHE_KEY) || '{}') || {}; } catch(e) { salesCache = {}; }
+    try { salesCache = JSON.parse(localStorage.getItem(SALES_CACHE_KEY) || '{}') || {}; } catch (e) { salesCache = {}; }
     function saveSalesCache() {
         try {
             // Purge les entrées périmées (>TTL) avant d'écrire : getCachedSales() les traite
@@ -667,7 +667,7 @@
                 if (now - (salesCache[id].fetchedAt || 0) > SALES_CACHE_TTL) delete salesCache[id];
             }
             localStorage.setItem(SALES_CACHE_KEY, JSON.stringify(salesCache));
-        } catch(e) {}
+        } catch (e) { }
     }
     // Purge immédiatement au chargement du script (pas seulement à la prochaine vente fetchée) :
     // un cache déjà gonflé par les anciennes versions doit dégonfler dès le premier chargement
@@ -698,35 +698,64 @@
         return Math.round(m);
     }
 
-    // Récupère et met en cache l'historique d'une carte (une requête)
+    // Récupère et met en cache l'historique des 30 derniers jours d'une carte
     async function fetchCardSales(cardId) {
         try {
             const res = await fetch(
                 `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
                 { credentials: "include" }
             );
+
             if (!res.ok) return null;
+
             const data = await res.json();
-            const sales = (data.sales || []).filter(s => Number.isFinite(s.final_price));
+
+            // Fenêtre glissante de 30 jours
+            const cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
+
+            // On ne garde que :
+            // - les ventes avec un prix final valide
+            // - les ventes avec une date valide
+            // - les ventes réalisées dans les 30 derniers jours
+            const sales = (data.sales || []).filter(s => {
+                if (!Number.isFinite(s.final_price)) return false;
+                if (!s.settled_at) return false;
+
+                const ts = new Date(s.settled_at).getTime();
+
+                return Number.isFinite(ts) && ts >= cutoff;
+            });
+
             const prices = sales.map(s => s.final_price);
-            // "recent" est trié du plus récent au plus ancien côté API ; sinon on trie nous-mêmes
-            const recent = (data.recent && data.recent.length ? data.recent : sales)
-                .filter(s => Number.isFinite(s.final_price))
+
+            // Plus récente en premier
+            const recent = sales
                 .slice()
-                .sort((a, b) => new Date(b.settled_at) - new Date(a.settled_at));
+                .sort((a, b) =>
+                    new Date(b.settled_at).getTime() -
+                    new Date(a.settled_at).getTime()
+                );
+
             const entry = {
                 median: median(prices),
                 count: prices.length,
                 last: recent.length ? recent[0].final_price : null,
-                avg: prices.length ? Math.round(prices.reduce((s, p) => s + p, 0) / prices.length) : null,
+                avg: prices.length
+                    ? Math.round(prices.reduce((sum, p) => sum + p, 0) / prices.length)
+                    : null,
                 min: prices.length ? Math.min(...prices) : null,
                 max: prices.length ? Math.max(...prices) : null,
                 fetchedAt: Date.now()
             };
+
             salesCache[cardId] = entry;
             saveSalesCache();
+
             return entry;
-        } catch(e) { return null; }
+
+        } catch (e) {
+            return null;
+        }
     }
 
     // Traite la file d'attente, une carte à la fois avec délai aléatoire (anti-flood)
@@ -795,32 +824,54 @@
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
         const mode = getSetting('autoSnipeMode');
+
         if (mode === 'adaptive') {
             const cardId = auction.card?.id ?? auction.card_id;
             const entry = getCachedSales(cardId);
+
             if (entry && entry.count > 0 && entry.median > 0) {
                 const ratio = getSetting('autoSnipeAdaptiveRatio');
                 const threshold = Math.floor(entry.median * ratio);
+
                 if (currentBid <= threshold) {
-                    return { snipe: true, reason: `≤ ${Math.round(ratio*100)}% méd. (${entry.median})`, cap: threshold };
+                    return {
+                        snipe: true,
+                        reason: `≤ ${Math.round(ratio * 100)}% méd. (${entry.median})`,
+                        cap: threshold
+                    };
                 }
-                return { snipe: false, cap: threshold };
+
+                return {
+                    snipe: false,
+                    reason: `prix > ${Math.round(ratio * 100)}% méd. (${entry.median})`,
+                    cap: threshold
+                };
             }
-            // Pas d'historique : garde-fou sur le seuil fixe
-            const fixed = getSetting('autoSnipePrice');
-            return { snipe: currentBid <= fixed, reason: currentBid <= fixed ? `≤ ${fixed} (pas d'historique)` : '', cap: fixed };
+
+            // IMPORTANT : pas de ventes connues = aucune mise
+            return {
+                snipe: false,
+                reason: 'pas d’historique',
+                cap: 0
+            };
         }
+
         // Mode fixe
         const fixed = getSetting('autoSnipePrice');
-        return { snipe: currentBid <= fixed, reason: currentBid <= fixed ? `≤ ${fixed}` : '', cap: fixed };
+
+        return {
+            snipe: currentBid <= fixed,
+            reason: currentBid <= fixed ? `≤ ${fixed}` : '',
+            cap: fixed
+        };
     }
 
     // Historique des cartes ouvertes via pack opener qui matchent un mot-clé (persisté)
     const PACK_KW_HITS_KEY = 'wm_pack_kw_hits';
     let packKwHits = []; // [{ title, rarity, keyword, ts }] — max 100
-    try { packKwHits = JSON.parse(localStorage.getItem(PACK_KW_HITS_KEY) || '[]'); } catch(e) {}
+    try { packKwHits = JSON.parse(localStorage.getItem(PACK_KW_HITS_KEY) || '[]'); } catch (e) { }
     function savePackKwHits() {
-        try { localStorage.setItem(PACK_KW_HITS_KEY, JSON.stringify(packKwHits.slice(-100))); } catch(e) {}
+        try { localStorage.setItem(PACK_KW_HITS_KEY, JSON.stringify(packKwHits.slice(-100))); } catch (e) { }
     }
     function renderPackKwHits() {
         const el = document.getElementById('wm-pack-kw-hits');
@@ -841,7 +892,7 @@
             const sameDay = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}` === todayKey;
             const label = sameDay
                 ? time
-                : `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')} ${time}`;
+                : `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${time}`;
             return `<div style="
                 display:flex;align-items:center;gap:5px;padding:3px 5px;margin-bottom:2px;
                 border-radius:4px;background:linear-gradient(to right, rgba(255,255,255,0.03) 0%, rgba(255,255,255,0.03) 60%, ${r.color}66 100%);
@@ -861,110 +912,110 @@
     /* ===================== SETTINGS (localStorage) ===================== */
 
     const SETTINGS_KEYS = {
-        discordWebhook:        'wm_discord_webhook',
-        discordEnabled:        'wm_discord_enabled',
-        logCollection:         'wm_log_collection',
-        logMarket:             'wm_log_market',
-        logTrash:              'wm_log_trash',
-        logAutobid:            'wm_log_autobid',
-        autoSnipePrice:        'wm_autosnipe_price',
-        autoSnipeMode:         'wm_autosnipe_mode',
-        autoSnipeAdaptiveRatio:'wm_autosnipe_adaptive_ratio',
+        discordWebhook: 'wm_discord_webhook',
+        discordEnabled: 'wm_discord_enabled',
+        logCollection: 'wm_log_collection',
+        logMarket: 'wm_log_market',
+        logTrash: 'wm_log_trash',
+        logAutobid: 'wm_log_autobid',
+        autoSnipePrice: 'wm_autosnipe_price',
+        autoSnipeMode: 'wm_autosnipe_mode',
+        autoSnipeAdaptiveRatio: 'wm_autosnipe_adaptive_ratio',
         minBalanceForAutoSnipe: 'wm_autosnipe_min_balance',
-        autoRetagEnabled:      'wm_autoretag_enabled',
-        sellTagName:           'wm_sell_tag_name',
-        packCooldown:          'wm_pack_cooldown',
-        maxActiveSales:        'wm_max_active_sales',
-        soundsEnabled:         'wm_sounds_enabled',
-        soundNewHit:           'wm_sound_new_hit',
-        soundOutbid:           'wm_sound_outbid',
-        soundPackOpen:         'wm_sound_pack_open',
-        soundLegendary:        'wm_sound_legendary',
-        soundWon:              'wm_sound_won',
-        wishlistToKeyword:     'wm_wishlist_to_keyword',
-        notificationsEnabled:  'wm_notifications_enabled',
-        dailyPackAlert:        'wm_daily_pack_alert',
-        dailyPackLimit:        'wm_daily_pack_limit',
-        humanizedBidDelayMs:   'wm_humanized_bid_delay_ms',
-        usernameOverride:      'wm_username_override',
-        autoBackupOnStop:      'wm_autobackup_on_stop',
-        periodicBackupMin:     'wm_periodic_backup_min',
-        scheduleEnabled:       'wm_schedule_enabled',
-        scheduleStart:         'wm_schedule_start',
-        scheduleEnd:           'wm_schedule_end',
+        autoRetagEnabled: 'wm_autoretag_enabled',
+        sellTagName: 'wm_sell_tag_name',
+        packCooldown: 'wm_pack_cooldown',
+        maxActiveSales: 'wm_max_active_sales',
+        soundsEnabled: 'wm_sounds_enabled',
+        soundNewHit: 'wm_sound_new_hit',
+        soundOutbid: 'wm_sound_outbid',
+        soundPackOpen: 'wm_sound_pack_open',
+        soundLegendary: 'wm_sound_legendary',
+        soundWon: 'wm_sound_won',
+        wishlistToKeyword: 'wm_wishlist_to_keyword',
+        notificationsEnabled: 'wm_notifications_enabled',
+        dailyPackAlert: 'wm_daily_pack_alert',
+        dailyPackLimit: 'wm_daily_pack_limit',
+        humanizedBidDelayMs: 'wm_humanized_bid_delay_ms',
+        usernameOverride: 'wm_username_override',
+        autoBackupOnStop: 'wm_autobackup_on_stop',
+        periodicBackupMin: 'wm_periodic_backup_min',
+        scheduleEnabled: 'wm_schedule_enabled',
+        scheduleStart: 'wm_schedule_start',
+        scheduleEnd: 'wm_schedule_end',
         // Horaires par module (splittés) : Pack Opener / Market Watcher / Trash Seller
-        schedulePackEnabled:   'wm_schedule_pack_enabled',
-        schedulePackStart:     'wm_schedule_pack_start',
-        schedulePackEnd:       'wm_schedule_pack_end',
+        schedulePackEnabled: 'wm_schedule_pack_enabled',
+        schedulePackStart: 'wm_schedule_pack_start',
+        schedulePackEnd: 'wm_schedule_pack_end',
         scheduleMarketEnabled: 'wm_schedule_market_enabled',
-        scheduleMarketStart:   'wm_schedule_market_start',
-        scheduleMarketEnd:     'wm_schedule_market_end',
-        scheduleTrashEnabled:  'wm_schedule_trash_enabled',
-        scheduleTrashStart:    'wm_schedule_trash_start',
-        scheduleTrashEnd:      'wm_schedule_trash_end',
-        sellUseMarketPrice:    'wm_sell_use_market_price',
-        sellMarketPricePct:    'wm_sell_market_pct',
-        sellMarketFloor:       'wm_sell_market_floor',
-        sellOnlyIfSoleTag:     'wm_sell_only_if_sole_tag',
-        sellDegressive:        'wm_sell_degressive',
-        sellUndercutMarket:    'wm_sell_undercut_market',
+        scheduleMarketStart: 'wm_schedule_market_start',
+        scheduleMarketEnd: 'wm_schedule_market_end',
+        scheduleTrashEnabled: 'wm_schedule_trash_enabled',
+        scheduleTrashStart: 'wm_schedule_trash_start',
+        scheduleTrashEnd: 'wm_schedule_trash_end',
+        sellUseMarketPrice: 'wm_sell_use_market_price',
+        sellMarketPricePct: 'wm_sell_market_pct',
+        sellMarketFloor: 'wm_sell_market_floor',
+        sellOnlyIfSoleTag: 'wm_sell_only_if_sole_tag',
+        sellDegressive: 'wm_sell_degressive',
+        sellUndercutMarket: 'wm_sell_undercut_market',
         autoTagPacksFromPresets: 'wm_autotag_packs_presets',
-        autoTagSkipLegendary:  'wm_autotag_skip_legendary',
-        snipeSecondsBefore:    'wm_snipe_seconds',
-        trashSellStrategy:     'wm_trash_sell_strategy',
+        autoTagSkipLegendary: 'wm_autotag_skip_legendary',
+        snipeSecondsBefore: 'wm_snipe_seconds',
+        trashSellStrategy: 'wm_trash_sell_strategy',
     };
 
     const SETTINGS_DEFAULTS = {
-        discordWebhook:        '',
-        discordEnabled:        true,
-        logCollection:         true,
-        logMarket:             true,
-        logTrash:              true,
-        logAutobid:            true,
-        autoSnipePrice:        100,
-        autoSnipeMode:         'fixed',   // 'fixed' = seuil fixe · 'adaptive' = sous la médiane marché
+        discordWebhook: '',
+        discordEnabled: true,
+        logCollection: true,
+        logMarket: true,
+        logTrash: true,
+        logAutobid: true,
+        autoSnipePrice: 100,
+        autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = sous la médiane marché
         autoSnipeAdaptiveRatio: 0.85,     // en mode adaptatif : snipe si prix <= ratio × médiane
         minBalanceForAutoSnipe: 2000,
-        autoRetagEnabled:      true,
-        sellTagName:           'Trash',
-        packCooldown:          180,
-        maxActiveSales:        5,
-        soundsEnabled:         true,     // (déprécié — conservé pour migration) master historique
-        soundNewHit:           true,     // son à l'apparition d'une enchère qui match
-        soundOutbid:           true,     // son à la perte du lead (surenchéri)
-        soundPackOpen:         false,    // son à chaque ouverture de pack (off par défaut : peut spammer)
-        soundLegendary:        true,     // son quand une Légendaire est pack
-        soundWon:              true,     // son quand une enchère est gagnée
-        wishlistToKeyword:     true,     // ajout wishlist sur le site → ajoute la carte aux mots-clés
-        notificationsEnabled:  true,
-        dailyPackAlert:        false,
-        dailyPackLimit:        300,
-        humanizedBidDelayMs:   2000,      // plafond du délai "humanisé" avant une mise (0 = instantané partout)
-        usernameOverride:      '',        // pseudo forcé (après changement de pseudo sur le site ; vide = auto)
-        autoBackupOnStop:      true,      // envoie le backup sur Discord lors d'un "Tout arrêter"
-        periodicBackupMin:     0,         // backup auto léger sur Discord toutes les N min (0 = off)
-        scheduleEnabled:       false,     // (hérité) ancien horaire global — migré vers les 3 ci-dessous
-        scheduleStart:         '09:00',   // heure de démarrage (HH:MM, heure locale)
-        scheduleEnd:           '23:00',   // heure d'arrêt (HH:MM, heure locale)
-        schedulePackEnabled:   false,     // horaire propre au Pack Opener
-        schedulePackStart:     '09:00',
-        schedulePackEnd:       '23:00',
+        autoRetagEnabled: true,
+        sellTagName: 'Trash',
+        packCooldown: 180,
+        maxActiveSales: 5,
+        soundsEnabled: true,     // (déprécié — conservé pour migration) master historique
+        soundNewHit: true,     // son à l'apparition d'une enchère qui match
+        soundOutbid: true,     // son à la perte du lead (surenchéri)
+        soundPackOpen: false,    // son à chaque ouverture de pack (off par défaut : peut spammer)
+        soundLegendary: true,     // son quand une Légendaire est pack
+        soundWon: true,     // son quand une enchère est gagnée
+        wishlistToKeyword: true,     // ajout wishlist sur le site → ajoute la carte aux mots-clés
+        notificationsEnabled: true,
+        dailyPackAlert: false,
+        dailyPackLimit: 300,
+        humanizedBidDelayMs: 2000,      // plafond du délai "humanisé" avant une mise (0 = instantané partout)
+        usernameOverride: '',        // pseudo forcé (après changement de pseudo sur le site ; vide = auto)
+        autoBackupOnStop: true,      // envoie le backup sur Discord lors d'un "Tout arrêter"
+        periodicBackupMin: 0,         // backup auto léger sur Discord toutes les N min (0 = off)
+        scheduleEnabled: false,     // (hérité) ancien horaire global — migré vers les 3 ci-dessous
+        scheduleStart: '09:00',   // heure de démarrage (HH:MM, heure locale)
+        scheduleEnd: '23:00',   // heure d'arrêt (HH:MM, heure locale)
+        schedulePackEnabled: false,     // horaire propre au Pack Opener
+        schedulePackStart: '09:00',
+        schedulePackEnd: '23:00',
         scheduleMarketEnabled: false,     // horaire propre au Market Watcher
-        scheduleMarketStart:   '09:00',
-        scheduleMarketEnd:     '23:00',
-        scheduleTrashEnabled:  false,     // horaire propre au Trash Seller
-        scheduleTrashStart:    '09:00',
-        scheduleTrashEnd:      '23:00',
-        sellUseMarketPrice:    false,     // Trash Seller : prix = moyenne des ventes × % (repli tableau)
-        sellMarketPricePct:    100,       // % appliqué au prix moyen du marché
-        sellMarketFloor:       true,      // prix marché : jamais sous le prix du tableau (plancher)
-        sellOnlyIfSoleTag:     true,      // filet de sécurité : ne vendre que si le tag de vente est le SEUL tag
-        sellDegressive:        true,      // Trash Seller : -15% de prix par tranche de 10 remises en vente (invendus)
-        sellUndercutMarket:    true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
+        scheduleMarketStart: '09:00',
+        scheduleMarketEnd: '23:00',
+        scheduleTrashEnabled: false,     // horaire propre au Trash Seller
+        scheduleTrashStart: '09:00',
+        scheduleTrashEnd: '23:00',
+        sellUseMarketPrice: false,     // Trash Seller : prix = moyenne des ventes × % (repli tableau)
+        sellMarketPricePct: 100,       // % appliqué au prix moyen du marché
+        sellMarketFloor: true,      // prix marché : jamais sous le prix du tableau (plancher)
+        sellOnlyIfSoleTag: true,      // filet de sécurité : ne vendre que si le tag de vente est le SEUL tag
+        sellDegressive: true,      // Trash Seller : -15% de prix par tranche de 10 remises en vente (invendus)
+        sellUndercutMarket: true,      // Trash Seller : se placer juste sous la plus basse annonce active existante
         autoTagPacksFromPresets: false,   // étiquette auto les cartes packées selon les recherches enregistrées
-        autoTagSkipLegendary:  true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
-        snipeSecondsBefore:    10,        // mode Fourbe : secondes restantes visées pour le snipe
-        trashSellStrategy:     'coverage',// pool de vente : coverage | value | rarity | random
+        autoTagSkipLegendary: true,      // n'auto-étiquette PAS les Légendaires (on veut souvent les garder)
+        snipeSecondsBefore: 10,        // mode Fourbe : secondes restantes visées pour le snipe
+        trashSellStrategy: 'coverage',// pool de vente : coverage | value | rarity | random
     };
 
     function getSetting(key) {
@@ -993,7 +1044,7 @@
     try {
         localStorage.removeItem('wm_pack_zero_ts');
         localStorage.removeItem('wm_observed_pack_cooldown_ms');
-    } catch(e) {}
+    } catch (e) { }
 
     // Migration : l'ancien réglage unique "Sons d'alerte" est éclaté en 2 (apparition /
     // perte du lead). On reprend l'état on/off historique pour les 2 nouveaux réglages.
@@ -1003,7 +1054,7 @@
             if (localStorage.getItem('wm_sound_new_hit') === null) localStorage.setItem('wm_sound_new_hit', oldSounds);
             if (localStorage.getItem('wm_sound_outbid') === null) localStorage.setItem('wm_sound_outbid', oldSounds);
         }
-    } catch(e) {}
+    } catch (e) { }
 
     // Migration : l'ancien horaire GLOBAL (3 modules ensemble) est splitté en 3 horaires
     // par module. Si l'ancien était activé, on recopie sa plage sur les 3 modules pour ne
@@ -1012,14 +1063,14 @@
         if (!localStorage.getItem('wm_schedule_split_v1')) {
             if (getSetting('scheduleEnabled')) {
                 const s = getSetting('scheduleStart'), e = getSetting('scheduleEnd');
-                [['schedulePackEnabled','schedulePackStart','schedulePackEnd'],
-                 ['scheduleMarketEnabled','scheduleMarketStart','scheduleMarketEnd'],
-                 ['scheduleTrashEnabled','scheduleTrashStart','scheduleTrashEnd']]
-                .forEach(([ena, st, en]) => { setSetting(ena, true); setSetting(st, s); setSetting(en, e); });
+                [['schedulePackEnabled', 'schedulePackStart', 'schedulePackEnd'],
+                ['scheduleMarketEnabled', 'scheduleMarketStart', 'scheduleMarketEnd'],
+                ['scheduleTrashEnabled', 'scheduleTrashStart', 'scheduleTrashEnd']]
+                    .forEach(([ena, st, en]) => { setSetting(ena, true); setSetting(st, s); setSetting(en, e); });
             }
             localStorage.setItem('wm_schedule_split_v1', '1');
         }
-    } catch(e) {}
+    } catch (e) { }
 
     /* ===================== LOG ===================== */
 
@@ -1045,9 +1096,9 @@
 
     const CATEGORY_TO_SETTING = {
         collection: 'logCollection',
-        market:     'logMarket',
-        trash:      'logTrash',
-        autobid:    'logAutobid',
+        market: 'logMarket',
+        trash: 'logTrash',
+        autobid: 'logAutobid',
     };
 
     function isLogCategoryEnabled(category) {
@@ -1059,11 +1110,11 @@
         const category = detectLogCategory(msg);
         if (!isLogCategoryEnabled(category)) return;
         const t = new Date();
-        const ts = [t.getHours(),t.getMinutes(),t.getSeconds()].map(n=>String(n).padStart(2,'0')).join(':');
-        logEntries.push({ts, msg});
+        const ts = [t.getHours(), t.getMinutes(), t.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
+        logEntries.push({ ts, msg });
         if (logEntries.length > 9000000) logEntries.shift();
         const el = document.getElementById('wm-log');
-        if (el) el.innerHTML = [...logEntries].reverse().map(e=>`<div class="wm-log-e"><span style="color:#333">${e.ts}</span> ${e.msg}</div>`).join('');
+        if (el) el.innerHTML = [...logEntries].reverse().map(e => `<div class="wm-log-e"><span style="color:#333">${e.ts}</span> ${e.msg}</div>`).join('');
     }
 
     // Exporte le log en .txt (HTML strippé, 1 ligne par entry).
@@ -1074,7 +1125,7 @@
         }
         const now = new Date();
         const pad = n => String(n).padStart(2, '0');
-        const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}`;
+        const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
         const timeStr = `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
         const filename = `wm-logs-${dateStr}_${timeStr}.txt`;
 
@@ -1095,7 +1146,7 @@
         a.click();
         document.body.removeChild(a);
         setTimeout(() => URL.revokeObjectURL(url), 1000);
-        wmLog(`💾 Log exporté : <b>${filename}</b> (${logEntries.length} ligne${logEntries.length>1?'s':''})`);
+        wmLog(`💾 Log exporté : <b>${filename}</b> (${logEntries.length} ligne${logEntries.length > 1 ? 's' : ''})`);
     }
 
     function sortHits(hits) {
@@ -1119,17 +1170,17 @@
                     return endOf(a) - endOf(b);
                 });
                 break;
-            case 'time_desc':   arr.sort((a,b) => endOf(b) - endOf(a)); break;
-            case 'price_asc':   arr.sort((a,b) => bidOf(a) - bidOf(b)); break;
-            case 'price_desc':  arr.sort((a,b) => bidOf(b) - bidOf(a)); break;
-            case 'rarity_desc': arr.sort((a,b) => rarOf(b) - rarOf(a)); break;
-            case 'rarity_asc':  arr.sort((a,b) => rarOf(a) - rarOf(b)); break;
-            case 'title_asc':   arr.sort((a,b) => titleOf(a).localeCompare(titleOf(b))); break;
-            case 'recent':      arr.sort((a,b) => seenOf(b) - seenOf(a)); break;
-            case 'owned_asc':   arr.sort((a,b) => ownedOf(a) - ownedOf(b) || endOf(a) - endOf(b)); break;
-            case 'owned_desc':  arr.sort((a,b) => ownedOf(b) - ownedOf(a) || endOf(a) - endOf(b)); break;
+            case 'time_desc': arr.sort((a, b) => endOf(b) - endOf(a)); break;
+            case 'price_asc': arr.sort((a, b) => bidOf(a) - bidOf(b)); break;
+            case 'price_desc': arr.sort((a, b) => bidOf(b) - bidOf(a)); break;
+            case 'rarity_desc': arr.sort((a, b) => rarOf(b) - rarOf(a)); break;
+            case 'rarity_asc': arr.sort((a, b) => rarOf(a) - rarOf(b)); break;
+            case 'title_asc': arr.sort((a, b) => titleOf(a).localeCompare(titleOf(b))); break;
+            case 'recent': arr.sort((a, b) => seenOf(b) - seenOf(a)); break;
+            case 'owned_asc': arr.sort((a, b) => ownedOf(a) - ownedOf(b) || endOf(a) - endOf(b)); break;
+            case 'owned_desc': arr.sort((a, b) => ownedOf(b) - ownedOf(a) || endOf(a) - endOf(b)); break;
             case 'time_asc':
-            default:            arr.sort((a,b) => endOf(a) - endOf(b)); break;
+            default: arr.sort((a, b) => endOf(a) - endOf(b)); break;
         }
         return arr;
     }
@@ -1140,19 +1191,19 @@
         try {
             const raw = localStorage.getItem(KEYWORDS_STORAGE_KEY);
             if (raw) KEYWORDS_ALERT = JSON.parse(raw);
-        } catch(e) {}
+        } catch (e) { }
         try {
             const rawP = localStorage.getItem(KEYWORDS_PRIORITY_KEY);
             if (rawP) KEYWORDS_PRIORITY = JSON.parse(rawP);
-        } catch(e) {}
+        } catch (e) { }
         try {
             const rawF = localStorage.getItem(KEYWORDS_FOURBE_KEY);
             if (rawF) KEYWORDS_FOURBE = JSON.parse(rawF);
-        } catch(e) {}
+        } catch (e) { }
         try {
             const rawE = localStorage.getItem(KEYWORDS_EXCLUDE_KEY);
             if (rawE) KEYWORDS_EXCLUDE = JSON.parse(rawE);
-        } catch(e) {}
+        } catch (e) { }
         try {
             const rawH = localStorage.getItem(KEYWORDS_HUNTER_KEY);
             if (rawH) {
@@ -1178,20 +1229,20 @@
                         .filter(h => h.text && Number.isFinite(h.cap) && h.cap > 0);
                 }
             }
-        } catch(e) {}
+        } catch (e) { }
     }
 
     function saveKeywords() {
-        try { localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(KEYWORDS_ALERT)); } catch(e) {}
+        try { localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(KEYWORDS_ALERT)); } catch (e) { }
     }
     function savePriorityKeywords() {
-        try { localStorage.setItem(KEYWORDS_PRIORITY_KEY, JSON.stringify(KEYWORDS_PRIORITY)); } catch(e) {}
+        try { localStorage.setItem(KEYWORDS_PRIORITY_KEY, JSON.stringify(KEYWORDS_PRIORITY)); } catch (e) { }
     }
     function saveFourbeKeywords() {
-        try { localStorage.setItem(KEYWORDS_FOURBE_KEY, JSON.stringify(KEYWORDS_FOURBE)); } catch(e) {}
+        try { localStorage.setItem(KEYWORDS_FOURBE_KEY, JSON.stringify(KEYWORDS_FOURBE)); } catch (e) { }
     }
     function saveExcludeKeywords() {
-        try { localStorage.setItem(KEYWORDS_EXCLUDE_KEY, JSON.stringify(KEYWORDS_EXCLUDE)); } catch(e) {}
+        try { localStorage.setItem(KEYWORDS_EXCLUDE_KEY, JSON.stringify(KEYWORDS_EXCLUDE)); } catch (e) { }
     }
     function saveHunterKeywords() {
         // Diagnostic temporaire : une entrée ajoutée n'atteignait pas le localStorage (visible
@@ -1201,7 +1252,7 @@
         // QuotaExceededError, si le compte a un gros historique) permettra de confirmer la
         // cause au lieu de continuer à deviner.
         try { localStorage.setItem(KEYWORDS_HUNTER_KEY, JSON.stringify(KEYWORDS_HUNTER)); }
-        catch(e) { wmLog(`⚠️ Sauvegarde Chasseur ciblé ÉCHOUÉE : <b>${e.name || 'Erreur'}</b> — ${e.message || 'inconnue'}. L'entrée reste affichée mais N'A PAS été enregistrée.`); }
+        catch (e) { wmLog(`⚠️ Sauvegarde Chasseur ciblé ÉCHOUÉE : <b>${e.name || 'Erreur'}</b> — ${e.message || 'inconnue'}. L'entrée reste affichée mais N'A PAS été enregistrée.`); }
     }
 
     // Exclusion STRICTE : la carte est exclue si un mot exclu apparaît en SOUS-CHAÎNE
@@ -1261,10 +1312,10 @@
 
         const renderTag = (kw, i, type) => {
             const isP = type === 'priority', isE = type === 'exclude', isF = type === 'fourbe';
-            const color  = isE ? '#ef4444' : isP ? '#fbbf24' : isF ? '#c084fc' : '#06b6d4';
-            const bg     = isE ? 'rgba(239,68,68,0.08)' : isP ? 'rgba(251,191,36,0.07)' : isF ? 'rgba(192,132,252,0.08)' : 'rgba(0,255,255,0.07)';
+            const color = isE ? '#ef4444' : isP ? '#fbbf24' : isF ? '#c084fc' : '#06b6d4';
+            const bg = isE ? 'rgba(239,68,68,0.08)' : isP ? 'rgba(251,191,36,0.07)' : isF ? 'rgba(192,132,252,0.08)' : 'rgba(0,255,255,0.07)';
             const border = isE ? 'rgba(239,68,68,0.4)' : isP ? 'rgba(251,191,36,0.35)' : isF ? 'rgba(192,132,252,0.4)' : 'rgba(0,255,255,0.18)';
-            const fn     = isE ? 'wmRemoveExcludeKeyword' : isP ? 'wmRemovePriorityKeyword' : isF ? 'wmRemoveFourbeKeyword' : 'wmRemoveKeyword';
+            const fn = isE ? 'wmRemoveExcludeKeyword' : isP ? 'wmRemovePriorityKeyword' : isF ? 'wmRemoveFourbeKeyword' : 'wmRemoveKeyword';
             return `<span style="display:inline-flex;align-items:center;gap:3px;padding:2px 6px;border-radius:4px;
                 background:${bg};border:1px solid ${border};
                 font-size:10px;color:${color};margin:2px 2px 0 0;">
@@ -1276,15 +1327,15 @@
         };
 
         const priorityTags = KEYWORDS_PRIORITY.map((kw, i) => renderTag(kw, i, 'priority')).join('');
-        const fourbeTags   = KEYWORDS_FOURBE.map((kw, i)   => renderTag(kw, i, 'fourbe')).join('');
-        const normalTags   = KEYWORDS_ALERT.map((kw, i)   => renderTag(kw, i, 'normal')).join('');
-        const excludeTags  = KEYWORDS_EXCLUDE.map((kw, i)  => renderTag(kw, i, 'exclude')).join('');
+        const fourbeTags = KEYWORDS_FOURBE.map((kw, i) => renderTag(kw, i, 'fourbe')).join('');
+        const normalTags = KEYWORDS_ALERT.map((kw, i) => renderTag(kw, i, 'normal')).join('');
+        const excludeTags = KEYWORDS_EXCLUDE.map((kw, i) => renderTag(kw, i, 'exclude')).join('');
 
         // Chasseur ciblé : chaque tag affiche le mot-clé + son mode + son plafond + sa
         // rareté requise (si définie) + un indicateur d'auto-pause (si activée). Une chasse
         // en pause est grisée pour être identifiable d'un coup d'œil, sans devoir lire le
         // texte du bouton — cohérent avec le reste des indicateurs d'état du bot.
-        const escH = (s) => String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;');
+        const escH = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
         const hunterTags = KEYWORDS_HUNTER.map((h, i) => {
             const enabled = h.enabled !== false;
             const modeStr = h.mode === 'fourbe' ? '🕵️ fourbe' : '🤖 auto-bid';
@@ -1444,7 +1495,7 @@
             for (const k of CARD_IMAGE_KEYS) {
                 const v = o[k];
                 const url = (typeof v === 'string') ? v
-                          : (v && typeof v === 'object') ? (v.url || v.source || v.href) : null;
+                    : (v && typeof v === 'object') ? (v.url || v.source || v.href) : null;
                 if (typeof url !== 'string' || !url) continue;
                 // Protocol-relative (//upload.wikimedia.org/…) : on complète en https.
                 if (/^\/\//.test(url)) return 'https:' + url;
@@ -1500,8 +1551,8 @@
         const h = Math.floor(s / 3600);
         const m = Math.floor((s % 3600) / 60);
         const sec = s % 60;
-        if (h > 0) return `${h}h ${String(m).padStart(2,"0")}m ${String(sec).padStart(2,"0")}s`;
-        return `${String(m).padStart(2,"0")}m ${String(sec).padStart(2,"0")}s`;
+        if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
+        return `${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
     }
 
     /* ═══════ SYNCHRO HORLOGE SERVEUR ═══════
@@ -1537,7 +1588,7 @@
                     wmLog(`🕒 Horloge : décalage PC↔serveur de <b>${(off / 1000).toFixed(1)}s</b> détecté et corrigé pour les compte à rebours.`);
                 }
             }
-        } catch(e) {}
+        } catch (e) { }
     }
     // Heure "serveur" estimée (corrige le décalage d'horloge du PC).
     function serverNow() { return Date.now() + serverClockOffset; }
@@ -1549,24 +1600,24 @@
         const s = Math.floor(ms / 1000);
         const m = Math.floor(s / 60);
         const h = Math.floor(m / 60);
-        if (h > 0) return `${h}h ${String(m % 60).padStart(2,"0")}m`;
-        if (m > 0) return `${m}m ${String(s % 60).padStart(2,"0")}s`;
+        if (h > 0) return `${h}h ${String(m % 60).padStart(2, "0")}m`;
+        if (m > 0) return `${m}m ${String(s % 60).padStart(2, "0")}s`;
         return `${s}s`;
     }
 
     const STATS_STORAGE_KEY = 'wm_pack_stats';
 
     function loadSellHistory() {
-        try { sellHistory = JSON.parse(localStorage.getItem(SELL_HISTORY_KEY) || '[]'); } catch(e) { sellHistory = []; }
+        try { sellHistory = JSON.parse(localStorage.getItem(SELL_HISTORY_KEY) || '[]'); } catch (e) { sellHistory = []; }
     }
     function saveSellHistory() {
-        try { localStorage.setItem(SELL_HISTORY_KEY, JSON.stringify(sellHistory.slice(-500))); } catch(e) {} // garde max 500
+        try { localStorage.setItem(SELL_HISTORY_KEY, JSON.stringify(sellHistory.slice(-500))); } catch (e) { } // garde max 500
     }
     function loadMyBids() {
-        try { myBidsSet = new Set(JSON.parse(localStorage.getItem(MY_BIDS_KEY) || '[]')); } catch(e) { myBidsSet = new Set(); }
+        try { myBidsSet = new Set(JSON.parse(localStorage.getItem(MY_BIDS_KEY) || '[]')); } catch (e) { myBidsSet = new Set(); }
     }
     function saveMyBids() {
-        try { localStorage.setItem(MY_BIDS_KEY, JSON.stringify([...myBidsSet])); } catch(e) {}
+        try { localStorage.setItem(MY_BIDS_KEY, JSON.stringify([...myBidsSet])); } catch (e) { }
     }
     function trackMyBid(auctionId) {
         if (!auctionId || myBidsSet.has(auctionId)) return;
@@ -1585,7 +1636,7 @@
                 totalPacks, totalCards, rarityStats,
                 sessionTotal: Date.now() // temps cumulé total, pas sessionStart
             }));
-        } catch(e) {}
+        } catch (e) { }
     }
 
     function loadStats() {
@@ -1593,15 +1644,15 @@
             const raw = localStorage.getItem(STATS_STORAGE_KEY);
             if (!raw) return;
             const s = JSON.parse(raw);
-            totalPacks  = s.totalPacks  || 0;
-            totalCards  = s.totalCards  || 0;
-            cardStats   = s.cardStats   || {};
-            rarityStats = s.rarityStats || { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
-        } catch(e) {}
+            totalPacks = s.totalPacks || 0;
+            totalCards = s.totalCards || 0;
+            cardStats = s.cardStats || {};
+            rarityStats = s.rarityStats || { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+        } catch (e) { }
     }
 
     function resetStats() {
-        totalPacks = 0; totalCards = 0; cardStats = {}; rarityStats = { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
+        totalPacks = 0; totalCards = 0; cardStats = {}; rarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         localStorage.removeItem(STATS_STORAGE_KEY);
     }
 
@@ -1609,7 +1660,7 @@
     function resetSessionStats() {
         sessionPacks = 0;
         sessionCards = 0;
-        sessionRarityStats = { L:0, UR:0, SR:0, R:0, PC:0, C:0 };
+        sessionRarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         saveDailyPackStats(); // remet aussi à zéro le cumul du jour persistant
     }
 
@@ -1639,7 +1690,7 @@
 
     function countdownColor(endAtStr) {
         const ms = new Date(endAtStr).getTime() - serverNow();
-        if (ms < 5  * 60000) return "#EF4444"; // < 5min  : rouge
+        if (ms < 5 * 60000) return "#EF4444"; // < 5min  : rouge
         if (ms < 10 * 60000) return "#FF8C00"; // < 10min : orange
         if (ms < 30 * 60000) return "#FFD700"; // < 30min : jaune
         if (ms < 60 * 60000) return "#00ff15"; // < 60min : vert
@@ -1714,7 +1765,7 @@
                 el.style.color = wikibidousBalance <= getSetting('minBalanceForAutoSnipe') ? "#EF4444" : "#FFD700";
             }
             updateBidsSumDisplay(); // rafraîchit le prévisionnel (dépend du solde)
-        } catch(e) {}
+        } catch (e) { }
     }
 
     // Met à jour les 2 segments à côté du solde dans le header :
@@ -1776,11 +1827,11 @@
 
     // Chaque type de son a son propre réglage d'activation (extensible pour de futurs sons).
     function isSoundEnabled(type) {
-        if (type === 'keyword')   return getSetting('soundNewHit');
-        if (type === 'outbid')    return getSetting('soundOutbid');
-        if (type === 'pack')      return getSetting('soundPackOpen');
+        if (type === 'keyword') return getSetting('soundNewHit');
+        if (type === 'outbid') return getSetting('soundOutbid');
+        if (type === 'pack') return getSetting('soundPackOpen');
         if (type === 'legendary') return getSetting('soundLegendary');
-        if (type === 'won')       return getSetting('soundWon');
+        if (type === 'won') return getSetting('soundWon');
         // Son générique : joué si au moins un des sons est activé
         return getSetting('soundNewHit') || getSetting('soundOutbid');
     }
@@ -1875,40 +1926,40 @@
                     osc.stop(ctx.currentTime + i * 0.12 + 0.2);
                 });
             }
-        } catch(e) {}
+        } catch (e) { }
     }
 
     function playAlertSound() { playSound("default"); }
 
-let lastWebhook = 0;
+    let lastWebhook = 0;
 
-function sendToDiscord(text, color = 5814783, category = 'general') {
+    function sendToDiscord(text, color = 5814783, category = 'general') {
 
-    // Skip si désactivé dans Paramètres
-    if (!getSetting('discordEnabled')) return;
+        // Skip si désactivé dans Paramètres
+        if (!getSetting('discordEnabled')) return;
 
-    // Skip silencieux si pas de webhook configuré
-    const webhook = getDiscordWebhook();
-    if (!webhook) return;
+        // Skip silencieux si pas de webhook configuré
+        const webhook = getDiscordWebhook();
+        if (!webhook) return;
 
-    // anti-spam (important)
-    if (Date.now() - lastWebhook < 3000) return;
-    lastWebhook = Date.now();
+        // anti-spam (important)
+        if (Date.now() - lastWebhook < 3000) return;
+        lastWebhook = Date.now();
 
-    fetch(webhook, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-            embeds: [{
-                description: text,
-                color: color,
-                timestamp: new Date().toISOString()
-            }]
-        })
-    }).catch(() => {});
-}
+        fetch(webhook, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                embeds: [{
+                    description: text,
+                    color: color,
+                    timestamp: new Date().toISOString()
+                }]
+            })
+        }).catch(() => { });
+    }
 
     /* ===================== RÉVÉLATION ===================== */
 
@@ -1984,7 +2035,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
             const padded = payload + '='.repeat((4 - payload.length % 4) % 4);
             return JSON.parse(atob(padded));
-        } catch(e) { return null; }
+        } catch (e) { return null; }
     }
 
     // Détecte l'utilisateur connecté de manière dynamique.
@@ -2014,7 +2065,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 currentUsernameSource = cached.source;
                 return cached.username;
             }
-        } catch(e) {}
+        } catch (e) { }
 
         const { token } = (typeof getSupabaseAccessToken === 'function')
             ? getSupabaseAccessToken()
@@ -2061,7 +2112,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             username = pickUsername(row);
                             if (username) { source = `Supabase.${table}`; break; }
                         }
-                    } catch(e) {}
+                    } catch (e) { }
                 }
             }
 
@@ -2080,16 +2131,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 localStorage.setItem(CURRENT_USER_CACHE_KEY, JSON.stringify({
                     username, source: currentUsernameSource, ts: Date.now()
                 }));
-            } catch(e) {}
+            } catch (e) { }
             return username;
         }
 
         return null;
     }
 
-    const COLLECTION_CACHE_KEY  = 'wm_collection_cache';
-    const COLLECTION_TS_KEY     = 'wm_collection_ts';
-    const COLLECTION_TOTAL_KEY  = 'wm_collection_total';
+    const COLLECTION_CACHE_KEY = 'wm_collection_cache';
+    const COLLECTION_TS_KEY = 'wm_collection_ts';
+    const COLLECTION_TOTAL_KEY = 'wm_collection_total';
     const COLLECTION_RARITY_KEY = 'wm_collection_rarity';
     const COLLECTION_RARITY_SET_KEY = 'wm_collection_rarity_set'; // card_id → raretés possédées
 
@@ -2102,7 +2153,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             localStorage.setItem(COLLECTION_RARITY_SET_KEY,
                 JSON.stringify([...collectionRarityMap.entries()].map(([id, set]) => [id, [...set]])));
             if (total != null) localStorage.setItem(COLLECTION_TOTAL_KEY, String(total));
-        } catch(e) {}
+        } catch (e) { }
     }
 
     // Charge le cache localStorage dans collectionMap
@@ -2146,7 +2197,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         if (id && Array.isArray(rs)) collectionRarityMap.set(id, new Set(rs.map(x => String(x).toUpperCase())));
                     });
                 }
-            } catch(e) {}
+            } catch (e) { }
 
             // Restaure aussi le comptage par rareté s'il est en cache
             try {
@@ -2158,18 +2209,18 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         if (Number.isFinite(parsed[k])) rarityCountMap[k] = parsed[k];
                     }
                 }
-            } catch(e) {}
+            } catch (e) { }
 
             return collectionMap.size > 0;
-        } catch(e) { return false; }
+        } catch (e) { return false; }
     }
 
     function getCacheLastObtained() {
-        try { return localStorage.getItem(COLLECTION_TS_KEY) || null; } catch(e) { return null; }
+        try { return localStorage.getItem(COLLECTION_TS_KEY) || null; } catch (e) { return null; }
     }
 
     function getCacheTotal() {
-        try { const v = localStorage.getItem(COLLECTION_TOTAL_KEY); return v ? parseInt(v) : null; } catch(e) { return null; }
+        try { const v = localStorage.getItem(COLLECTION_TOTAL_KEY); return v ? parseInt(v) : null; } catch (e) { return null; }
     }
 
     // Charge uniquement les pages triées par obtained_at DESC jusqu'à trouver
@@ -2314,7 +2365,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         if (!res.ok) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
                         const data = await res.json();
                         return data.collection || [];
-                    } catch(e) {
+                    } catch (e) {
                         await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
                     }
                 }
@@ -2362,7 +2413,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 wmLog(`✅ Collection chargée en mode dégradé : <b>${collectionMap.size.toLocaleString('fr-FR')}</b> cartes`);
                 apiHealth.lastCollectionTs = Date.now();
             }
-        } catch(e) {
+        } catch (e) {
             console.warn("[WikiMasters] fetchCollection error:", e);
         } finally {
             _fetchCollectionInFlight = false;
@@ -2473,9 +2524,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Enchères avec auto-bid activé : Set<auctionId> — persisté en localStorage
     const AUTOBID_SET_KEY = 'wm_autobid_set';
     let autoBidSet = new Set();
-    try { autoBidSet = new Set(JSON.parse(localStorage.getItem(AUTOBID_SET_KEY) || '[]')); } catch(e) {}
+    try { autoBidSet = new Set(JSON.parse(localStorage.getItem(AUTOBID_SET_KEY) || '[]')); } catch (e) { }
     function saveAutoBidSet() {
-        try { localStorage.setItem(AUTOBID_SET_KEY, JSON.stringify([...autoBidSet])); } catch(e) {}
+        try { localStorage.setItem(AUTOBID_SET_KEY, JSON.stringify([...autoBidSet])); } catch (e) { }
     }
 
     // Mode "Fourbe" (snipe) : Set<auctionId> — au lieu de riposter à chaque contre-offre
@@ -2484,9 +2535,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // laisser un minimum de temps de réaction à l'adversaire. Persisté.
     const SNIPE_SET_KEY = 'wm_snipe_set';
     let snipeSet = new Set();
-    try { snipeSet = new Set(JSON.parse(localStorage.getItem(SNIPE_SET_KEY) || '[]')); } catch(e) {}
+    try { snipeSet = new Set(JSON.parse(localStorage.getItem(SNIPE_SET_KEY) || '[]')); } catch (e) { }
     function saveSnipeSet() {
-        try { localStorage.setItem(SNIPE_SET_KEY, JSON.stringify([...snipeSet])); } catch(e) {}
+        try { localStorage.setItem(SNIPE_SET_KEY, JSON.stringify([...snipeSet])); } catch (e) { }
     }
 
     // Plafond d'auto-bid par enchère : Map<auctionId, maxAmount>
@@ -2496,9 +2547,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     try {
         const raw = JSON.parse(localStorage.getItem(AUTOBID_MAX_KEY) || '[]');
         if (Array.isArray(raw)) autoBidMaxMap = new Map(raw);
-    } catch(e) {}
+    } catch (e) { }
     function saveAutoBidMax() {
-        try { localStorage.setItem(AUTOBID_MAX_KEY, JSON.stringify([...autoBidMaxMap.entries()])); } catch(e) {}
+        try { localStorage.setItem(AUTOBID_MAX_KEY, JSON.stringify([...autoBidMaxMap.entries()])); } catch (e) { }
     }
     function getAutoBidMax(id) {
         const v = autoBidMaxMap.get(id);
@@ -2521,9 +2572,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     try {
         const raw = JSON.parse(localStorage.getItem(HUNTER_AUTODISABLE_MAP_KEY) || '[]');
         if (Array.isArray(raw)) hunterAutoDisableMap = new Map(raw);
-    } catch(e) {}
+    } catch (e) { }
     function saveHunterAutoDisableMap() {
-        try { localStorage.setItem(HUNTER_AUTODISABLE_MAP_KEY, JSON.stringify([...hunterAutoDisableMap.entries()])); } catch(e) {}
+        try { localStorage.setItem(HUNTER_AUTODISABLE_MAP_KEY, JSON.stringify([...hunterAutoDisableMap.entries()])); } catch (e) { }
     }
     // Vérifie si une mise prévue respecte le plafond auto-bid.
     // Si elle le dépasse : désactive l'auto-bid pour cette enchère et retourne false.
@@ -2556,15 +2607,15 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     try {
         const raw = JSON.parse(localStorage.getItem(HUNTER_FOURBE_KEY) || '[]');
         if (Array.isArray(raw)) hunterFourbeMap = new Map(raw);
-    } catch(e) {}
+    } catch (e) { }
     function saveHunterFourbe() {
-        try { localStorage.setItem(HUNTER_FOURBE_KEY, JSON.stringify([...hunterFourbeMap.entries()])); } catch(e) {}
+        try { localStorage.setItem(HUNTER_FOURBE_KEY, JSON.stringify([...hunterFourbeMap.entries()])); } catch (e) { }
     }
     // Persisté (contrairement au toggle Hunter) : sinon un F5 laisserait des enchères armées
     // par un mode que le bouton affiche « OFF ».
     const HUNTER_AGGRO_KEY = 'wm_hunter_aggressive';
     let hunterAggressive = false;
-    try { hunterAggressive = localStorage.getItem(HUNTER_AGGRO_KEY) === '1'; } catch(e) {}
+    try { hunterAggressive = localStorage.getItem(HUNTER_AGGRO_KEY) === '1'; } catch (e) { }
 
     // Arme le Fourbe sur une enchère au nom du Hunter agressif. false si on n'y touche pas.
     function armHunterFourbe(auction, cap) {
@@ -2598,7 +2649,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
     // Appelé quand l'utilisateur reprend la main sur une enchère (bouton Fourbe OFF, ou
     // passage en auto-bid) : le Hunter agressif lâche prise proprement, plafond restauré.
-    window.wmForgetHunterFourbe = function(id) {
+    window.wmForgetHunterFourbe = function (id) {
         if (disarmHunterFourbe(id)) { saveHunterFourbe(); return true; }
         return false;
     };
@@ -2657,7 +2708,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     window.wmGetAutoBidMax = getAutoBidMax;
     // Saisie du plafond auto-bid : enregistrement EN DIRECT (à chaque frappe, sans attendre
     // le blur). doLog=true (sur onchange/blur) → une seule ligne de log récapitulative.
-    window.wmOnAutoBidMax = function(id, rawValue, doLog) {
+    window.wmOnAutoBidMax = function (id, rawValue, doLog) {
         const v = parseInt(rawValue, 10);
         const val = Number.isFinite(v) && v > 0 ? v : null;
         setAutoBidMax(id, val); // persiste immédiatement
@@ -2679,7 +2730,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     window.wmSaveSnipeSet = saveSnipeSet;
 
     // Agrandit/réduit une ligne d'enchère en mode compact (vue détaillée pour une seule).
-    window.wmToggleRowExpand = function(id) {
+    window.wmToggleRowExpand = function (id) {
         if (marketExpandedIds.has(id)) marketExpandedIds.delete(id);
         else marketExpandedIds.add(id);
         const el = document.getElementById('wm-market-alert');
@@ -2700,11 +2751,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return 'manual';
     }
     const BID_MODE_UI = {
-        manual:  { label: '⚪ Manuel',   color: '#555',    border: 'rgba(255,255,255,0.12)', bg: 'none' },
-        autobid: { label: '🤖 Auto-bid', color: '#4ade80', border: 'rgba(74,222,128,0.45)',  bg: 'rgba(74,222,128,0.07)' },
-        fourbe:  { label: '🕵️ Fourbe',   color: '#c084fc', border: 'rgba(192,132,252,0.5)',  bg: 'rgba(192,132,252,0.07)' }
+        manual: { label: '⚪ Manuel', color: '#555', border: 'rgba(255,255,255,0.12)', bg: 'none' },
+        autobid: { label: '🤖 Auto-bid', color: '#4ade80', border: 'rgba(74,222,128,0.45)', bg: 'rgba(74,222,128,0.07)' },
+        fourbe: { label: '🕵️ Fourbe', color: '#c084fc', border: 'rgba(192,132,252,0.5)', bg: 'rgba(192,132,252,0.07)' }
     };
-    window.wmCycleBidMode = function(id) {
+    window.wmCycleBidMode = function (id) {
         const title = activeHitsMap.get(id)?.auction?.card?.wikipedia_title || '?';
         const mode = bidModeOf(id);
         if (mode === 'manual') {
@@ -2727,7 +2778,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Ajoute un ou plusieurs mots-clés. Plusieurs termes possibles en les séparant par « ; »
     // (le titre à virgule reste entier, ex. « Star Wars, épisode I »).
-    window.wmAddKeyword = function(input) {
+    window.wmAddKeyword = function (input) {
         const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
         let added = 0, last = '';
         for (const kw of terms) {
@@ -2740,14 +2791,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (added > 1) wmLog(`➕ <b>${added}</b> mots-clés ajoutés`);
     };
 
-    window.wmRemoveKeyword = function(idx) {
+    window.wmRemoveKeyword = function (idx) {
         if (idx < 0 || idx >= KEYWORDS_ALERT.length) return;
         KEYWORDS_ALERT.splice(idx, 1);
         saveKeywords();
         renderKeywordsPanel();
     };
 
-    window.wmAddPriorityKeyword = function(input) {
+    window.wmAddPriorityKeyword = function (input) {
         const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
         let added = 0, last = '';
         for (const kw of terms) {
@@ -2762,7 +2813,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             : `⭐ <b>${added}</b> mots-clés prioritaires ajoutés`);
     };
 
-    window.wmRemovePriorityKeyword = function(idx) {
+    window.wmRemovePriorityKeyword = function (idx) {
         if (idx < 0 || idx >= KEYWORDS_PRIORITY.length) return;
         const removed = KEYWORDS_PRIORITY.splice(idx, 1)[0];
         savePriorityKeywords();
@@ -2770,7 +2821,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (removed) wmLog(`⭐ Mot-clé prioritaire retiré : <b style="color:#fbbf24;">${removed}</b>`);
     };
 
-    window.wmAddFourbeKeyword = function(input) {
+    window.wmAddFourbeKeyword = function (input) {
         const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
         let added = 0, last = '';
         for (const kw of terms) {
@@ -2785,7 +2836,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             : `🕵️ <b>${added}</b> mots-clés fourbe ajoutés`);
     };
 
-    window.wmRemoveFourbeKeyword = function(idx) {
+    window.wmRemoveFourbeKeyword = function (idx) {
         if (idx < 0 || idx >= KEYWORDS_FOURBE.length) return;
         const removed = KEYWORDS_FOURBE.splice(idx, 1)[0];
         saveFourbeKeywords();
@@ -2813,7 +2864,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // remporte une enchère — pratique pour ne vouloir qu'UN exemplaire. Faux par défaut (une
     // nouvelle chasse reste active tant qu'on ne la coupe pas soi-même), pour ceux qui
     // collectionnent plusieurs fois la même carte.
-    window.wmAddHunterKeyword = function(text, cap, mode, rarity, autoDisable) {
+    window.wmAddHunterKeyword = function (text, cap, mode, rarity, autoDisable) {
         const t = String(text || '').trim();
         const c = Number(cap);
         const m = (mode === 'fourbe') ? 'fourbe' : 'autobid';
@@ -2837,7 +2888,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Bascule pause/active d'une chasse SANS la supprimer — pour la garder configurée
     // (mot-clé, plafond, mode, rareté) et la réactiver d'un clic plus tard.
-    window.wmToggleHunterEnabled = function(idx) {
+    window.wmToggleHunterEnabled = function (idx) {
         const h = KEYWORDS_HUNTER[idx];
         if (!h) return;
         const wasEnabled = h.enabled !== false;
@@ -2849,7 +2900,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             : `🎯 Chasseur mis en pause : <b style="color:#5dade2;">${h.text}</b>`);
     };
 
-    window.wmRemoveHunterKeyword = function(idx) {
+    window.wmRemoveHunterKeyword = function (idx) {
         if (idx < 0 || idx >= KEYWORDS_HUNTER.length) return;
         const removed = KEYWORDS_HUNTER.splice(idx, 1)[0];
         saveHunterKeywords();
@@ -2857,7 +2908,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (removed) wmLog(`🎯 Chasseur retiré : <b style="color:#5dade2;">${removed.text}</b>`);
     };
 
-    window.wmAddExcludeKeyword = function(input) {
+    window.wmAddExcludeKeyword = function (input) {
         const terms = String(input || '').split(';').map(s => s.trim()).filter(Boolean);
         let added = 0, last = '';
         for (const kw of terms) {
@@ -2875,7 +2926,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
     };
 
-    window.wmRemoveExcludeKeyword = function(idx) {
+    window.wmRemoveExcludeKeyword = function (idx) {
         if (idx < 0 || idx >= KEYWORDS_EXCLUDE.length) return;
         const removed = KEYWORDS_EXCLUDE.splice(idx, 1)[0];
         saveExcludeKeywords();
@@ -2924,9 +2975,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             try {
                 const res = await fetch(
                     `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                    { method: "POST", credentials: "include",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ amount: bidAmount }) }
+                    {
+                        method: "POST", credentials: "include",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ amount: bidAmount })
+                    }
                 );
                 const data = await res.json().catch(() => ({}));
                 const title = a.card?.wikipedia_title || "?";
@@ -2941,7 +2994,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
                     sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + (data?.error || "erreur inconnue"), 15548997, 'market');
                 }
-            } catch(e) {} finally { bidLockSet.delete(a.id); }
+            } catch (e) { } finally { bidLockSet.delete(a.id); }
             await new Promise(r => setTimeout(r, bidDelayMs(a)));
         }
         return placed;
@@ -2996,9 +3049,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (btn) btn.innerText = autoSnipeLabel(autoSnipeEnabled);
     }
 
-    window.wmToggleHunterAggressive = function() {
+    window.wmToggleHunterAggressive = function () {
         hunterAggressive = !hunterAggressive;
-        try { localStorage.setItem(HUNTER_AGGRO_KEY, hunterAggressive ? '1' : '0'); } catch(e) {}
+        try { localStorage.setItem(HUNTER_AGGRO_KEY, hunterAggressive ? '1' : '0'); } catch (e) { }
         paintHunterAggro();
         if (hunterAggressive) {
             wmLog(`🕵️ <b style="color:#c084fc;">Hunter agressif ON</b> — plus de mise immédiate : les cartes qui matchent sont snipées en fin d'enchère, plafonnées au seuil du Hunter.`);
@@ -3019,7 +3072,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
     };
 
-    window.wmToggleAutoSnipe = function(btn) {
+    window.wmToggleAutoSnipe = function (btn) {
         autoSnipeEnabled = !autoSnipeEnabled;
         if (autoSnipeEnabled) {
             btn.style.color = '#4ade80';
@@ -3034,7 +3087,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 runHunterAutoBidPass([...lastHitsCache]).then(n => {
                     if (n > 0 && !hunterAggressive) wmLog(`⚡ Hunter : <b>${n}</b> mise(s) placée(s) sur des enchères déjà présentes.`);
                     // En mode fourbe, runHunterFourbePass loggue déjà chaque armement.
-                }).catch(() => {});
+                }).catch(() => { });
             }
         } else {
             btn.style.color = '#555';
@@ -3146,7 +3199,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
 
             const now = new Date().toLocaleTimeString("fr-FR",
-                { hour:"2-digit", minute:"2-digit", second:"2-digit" });
+                { hour: "2-digit", minute: "2-digit", second: "2-digit" });
             marketStatusEl.innerHTML =
                 `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
             apiHealth.lastMarketScanTs = Date.now(); // santé : dernier scan marché réussi
@@ -3187,7 +3240,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         wmLog(`📭 Enchère terminée sans vente : <b>${t}</b> [${r}]`);
                     }
                 } else {
-                    wmLog(`📭 Enchère ${id.slice(0,8)}… terminée`);
+                    wmLog(`📭 Enchère ${id.slice(0, 8)}… terminée`);
                 }
                 myBidsSet.delete(id);
                 prunedAny = true;
@@ -3202,7 +3255,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (liveIds.has(id)) continue;
                 if (auctionLikelyStillLive(id)) continue; // blip de scan : on garde l'auto-bid
                 const last = activeHitsMap.get(id);
-                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
+                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0, 8)}…`;
                 autoBidSet.delete(id);
                 autoBidPruned = true;
                 wmLog(`🤖 Auto-bid retiré (enchère terminée) : <b>${t}</b>`);
@@ -3215,7 +3268,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (liveIds.has(id)) continue;
                 if (auctionLikelyStillLive(id)) continue;
                 const last = activeHitsMap.get(id);
-                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0,8)}…`;
+                const t = last?.auction?.card?.wikipedia_title || `${id.slice(0, 8)}…`;
                 snipeSet.delete(id);
                 snipePruned = true;
                 wmLog(`🕵️ Fourbe retiré (enchère terminée) : <b>${t}</b>`);
@@ -3283,11 +3336,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                une fois par mot-clé testé contre elle). Comportement de matching identique
                (sous-chaîne, insensible à la casse, titre + catégorie) — seul le nombre de
                recalculs change. */
-            const alertLC    = KEYWORDS_ALERT.map(k => (k || '').toLowerCase());
+            const alertLC = KEYWORDS_ALERT.map(k => (k || '').toLowerCase());
             const priorityLC = KEYWORDS_PRIORITY.map(k => (k || '').toLowerCase());
-            const fourbeLC   = KEYWORDS_FOURBE.map(k => (k || '').toLowerCase());
-            const excludeLC  = KEYWORDS_EXCLUDE.map(k => (k || '').toLowerCase());
-            const hunterLC   = KEYWORDS_HUNTER.map(h => ({ h, textLC: (h.text || '').toLowerCase() }));
+            const fourbeLC = KEYWORDS_FOURBE.map(k => (k || '').toLowerCase());
+            const excludeLC = KEYWORDS_EXCLUDE.map(k => (k || '').toLowerCase());
+            const hunterLC = KEYWORDS_HUNTER.map(h => ({ h, textLC: (h.text || '').toLowerCase() }));
             function classifyAuctionKeywords(card) {
                 const titleLC = (card?.wikipedia_title || '').toLowerCase();
                 const categoryLC = (card?.category || '').toLowerCase();
@@ -3462,9 +3515,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     try {
                         const res = await fetch(
                             `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                            { method: "POST", credentials: "include",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ amount: bidAmount }) }
+                            {
+                                method: "POST", credentials: "include",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ amount: bidAmount })
+                            }
                         );
                         const data = await res.json().catch(() => ({}));
                         if (res.ok) {
@@ -3474,7 +3529,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         } else {
                             wmLog(`⚠️ Chasseur échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
                         }
-                    } catch(e) {} finally { bidLockSet.delete(a.id); }
+                    } catch (e) { } finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
                 }
 
@@ -3498,9 +3553,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     try {
                         const res = await fetch(
                             `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                            { method: "POST", credentials: "include",
-                              headers: { "Content-Type": "application/json" },
-                              body: JSON.stringify({ amount: bidAmount }) }
+                            {
+                                method: "POST", credentials: "include",
+                                headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ amount: bidAmount })
+                            }
                         );
                         const data = await res.json().catch(() => ({}));
                         const title = a.card?.wikipedia_title || "?";
@@ -3515,7 +3572,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         } else {
                             wmLog(`⚠️ Bid prioritaire échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
                         }
-                    } catch(e) {} finally { bidLockSet.delete(a.id); }
+                    } catch (e) { } finally { bidLockSet.delete(a.id); }
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
                 }
 
@@ -3625,9 +3682,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 try {
                     const res = await fetch(
                         "https://www.wiki-masters.com/api/marketplace/" + a.id + "/bid",
-                        { method: "POST", credentials: "include",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({ amount: bidAmount }) }
+                        {
+                            method: "POST", credentials: "include",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ amount: bidAmount })
+                        }
                     );
                     if (res.ok) {
                         markAuctionAsMine(a.id, bidAmount, a);
@@ -3644,7 +3703,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const errData = await res.json().catch(() => ({}));
                         wmLog(`⚠️ Auto-bid (riposte) échoué : <b>${a.card?.wikipedia_title || '?'}</b> · ${errData?.error || 'erreur'}`);
                     }
-                } catch(e) {} finally { bidLockSet.delete(a.id); }
+                } catch (e) { } finally { bidLockSet.delete(a.id); }
             }
 
             // Re-render la liste complète des hits actifs
@@ -3659,6 +3718,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (salesFetchQueue.length > 0 && !salesFetchRunning) {
                 processSalesQueue(() => {
                     renderMarketHits(marketAlertEl, lastHitsCache, []);
+
+                    // L'historique vient peut-être d'être chargé :
+                    // on redonne les enchères au Hunter dynamique.
+                    if (autoSnipeEnabled && Array.isArray(lastHitsCache) && lastHitsCache.length > 0) {
+                        runHunterAutoBidPass([...lastHitsCache]).catch(() => { });
+                    }
                 });
             }
 
@@ -3666,7 +3731,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const hitCount = activeHitsMap.size;
             document.title = hitCount > 0 ? `(${hitCount}) WikiMasters` : 'WikiMasters';
 
-        } catch(err) {
+        } catch (err) {
             marketStatusEl.innerHTML =
                 `<span style="color:#EF4444;font-size:10px;">⚠️ ${err.message}</span>`;
         }
@@ -3708,9 +3773,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // SR mais listée en UR (revalorisée par le site) n'est PAS un doublon → visible.
                 if (marketHideOwned && isOwnedDuplicate(a.card?.id ?? a.card_id, a.card?.rarity)) return false;
                 if (sq) {
-                    const t   = marketSearchNorm(a.card?.wikipedia_title || '');
+                    const t = marketSearchNorm(a.card?.wikipedia_title || '');
                     const cat = marketSearchNorm(a.card?.category || '');
-                    const kw  = marketSearchNorm(matchedKeyword(a.card) || '');
+                    const kw = marketSearchNorm(matchedKeyword(a.card) || '');
                     if (!(t.includes(sq) || cat.includes(sq) || kw.includes(sq))) return false;
                 }
                 return true;
@@ -3722,17 +3787,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (filterActive) {
             header = `<div style="font-size:10px;color:#06b6d4;letter-spacing:1px;
                 text-transform:uppercase;margin-bottom:6px;">
-                🔎 ${hits.length} / ${totalBeforeFilter} annonce${totalBeforeFilter>1?"s":""}
+                🔎 ${hits.length} / ${totalBeforeFilter} annonce${totalBeforeFilter > 1 ? "s" : ""}
                </div>`;
         } else if (newCount > 0) {
             header = `<div style="font-size:10px;color:#00FFFF;font-weight:700;letter-spacing:1px;
                 text-transform:uppercase;margin-bottom:6px;">
-                🛒 ${newCount} nouvelle${newCount>1?"s":""} annonce${newCount>1?"s":""}
+                🛒 ${newCount} nouvelle${newCount > 1 ? "s" : ""} annonce${newCount > 1 ? "s" : ""}
                </div>`;
         } else {
             header = `<div style="font-size:10px;color:#555;letter-spacing:1px;
                 text-transform:uppercase;margin-bottom:6px;">
-                🛒 ${hits.length} annonce${hits.length>1?"s":""} trouvée${hits.length>1?"s":""}
+                🛒 ${hits.length} annonce${hits.length > 1 ? "s" : ""} trouvée${hits.length > 1 ? "s" : ""}
                </div>`;
         }
 
@@ -3834,16 +3899,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Couleur de la rareté en hex (#RRGGBB) pour la bande de droite
             const rarHex = r.color || '#888';
             // Couleur d'état (mise/lead) pour les 60% de gauche
-            const stateColor = isOutbid  ? 'rgba(239,68,68,0.22)'   // rouge : surenchéri
-                             : isLeading ? 'rgba(168,85,247,0.20)'  // violet : je suis meneur
-                             : isNew     ? 'rgba(255,215,0,0.18)'   // or : nouvelle annonce
-                             :             'rgba(255,255,255,0.04)'; // neutre : juste un hit
+            const stateColor = isOutbid ? 'rgba(239,68,68,0.22)'   // rouge : surenchéri
+                : isLeading ? 'rgba(168,85,247,0.20)'  // violet : je suis meneur
+                    : isNew ? 'rgba(255,215,0,0.18)'   // or : nouvelle annonce
+                        : 'rgba(255,255,255,0.04)'; // neutre : juste un hit
             // 60% solide état à gauche, puis fondu progressif sur les 40% restants vers la rareté
             const rowBg = `linear-gradient(to right, ${stateColor} 0%, ${stateColor} 60%, ${rarHex}80 100%, ${rarHex}80 100%)`;
-            const rowBorder = isOutbid  ? 'rgba(239,68,68,0.7)'
-                            : isLeading ? 'rgba(168,85,247,0.5)'
-                            : isNew     ? 'rgba(255,215,0,0.4)'
-                            :             `${rarHex}55`;
+            const rowBorder = isOutbid ? 'rgba(239,68,68,0.7)'
+                : isLeading ? 'rgba(168,85,247,0.5)'
+                    : isNew ? 'rgba(255,215,0,0.4)'
+                        : `${rarHex}55`;
 
             // Vue compacte : une seule ligne (nom · bid actuel · leader · temps restant)
             // pour afficher beaucoup plus d'enchères. On garde les id wm-hit / wm-countdown
@@ -3863,10 +3928,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const bidMode = bidModeOf(a.id);
                 const modeUi = BID_MODE_UI[bidMode];
                 const capVal = getAutoBidMax(a.id);
-                const tileBorder = isOutbid  ? 'rgba(239,68,68,0.7)'
-                                 : isLeading ? 'rgba(168,85,247,0.6)'
-                                 : isNew     ? 'rgba(255,215,0,0.5)'
-                                 :             'rgba(255,255,255,0.07)';
+                const tileBorder = isOutbid ? 'rgba(239,68,68,0.7)'
+                    : isLeading ? 'rgba(168,85,247,0.6)'
+                        : isNew ? 'rgba(255,215,0,0.5)'
+                            : 'rgba(255,255,255,0.07)';
                 // Placeholder toujours présent dans le DOM : il prend le relais si l'URL est
                 // absente OU si le chargement échoue (onerror), sans re-render.
                 const placeholder = `<div class="wm-card-ph" style="display:${imgUrl ? 'none' : 'flex'};
@@ -4030,22 +4095,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     ${badge(rarity)}
                     ${ownedBadge}
                     ${kw
-                        ? `<span style="color:#00FFFF;font-size:9px;opacity:0.7;
+                    ? `<span style="color:#00FFFF;font-size:9px;opacity:0.7;
                             background:rgba(0,255,255,0.1);padding:1px 4px;border-radius:3px;
                             box-sizing:border-box;width:82px;text-align:center;
                             display:inline-block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
                             vertical-align:middle;" title="${kw}">${kw}</span>`
-                        : `<span style="box-sizing:border-box;width:82px;display:inline-block;"></span>`
-                    }
+                    : `<span style="box-sizing:border-box;width:82px;display:inline-block;"></span>`
+                }
                 </div>
                 <!-- Enchère + temps + liens -->
                 <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                     <span style="font-size:11px;">
                         ${hasBid
-                            ? `<span style="color:#FFD700;font-weight:700;">💰 ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>
+                    ? `<span style="color:#FFD700;font-weight:700;">💰 ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>
                                <span style="color:#888;font-size:10px;"> par ${bidder || "?"}</span>`
-                            : `<span style="color:#888;font-size:11px;">Base : ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>`
-                        }
+                    : `<span style="color:#888;font-size:11px;">Base : ${(Number(bid) || 0).toLocaleString('fr-FR')} 💰</span>`
+                }
                     </span>
                     ${valBadge}
                     <button title="Vérifier si la rareté de cette carte est sur le point de changer : compare les vues Wikipédia RÉELLES du dernier mois complet au cache de WikiMasters (qui met du temps à se mettre à jour). Ne mise rien, juste un indice."
@@ -4057,9 +4122,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             font-size:11px;font-weight:700;font-family:monospace;color:${cdColor};
                         ">⏱ ${cd}</span>
                         ${(() => {
-                            const seller = a.seller?.username || a.owner?.username || a.user?.username || a.lister?.username || a.created_by?.username || null;
-                            return seller ? `<span style="color:#555;font-size:9px;margin-top:-1px;">vendu par <b style="color:#777;">${seller}</b></span>` : '';
-                        })()}
+                    const seller = a.seller?.username || a.owner?.username || a.user?.username || a.lister?.username || a.created_by?.username || null;
+                    return seller ? `<span style="color:#555;font-size:9px;margin-top:-1px;">vendu par <b style="color:#777;">${seller}</b></span>` : '';
+                })()}
                     </div>
                 </div>
                 <!-- Liens -->
@@ -4070,9 +4135,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     <button title="Rafraîchir le prix réel de cette enchère (mise à jour du prix et de la mise minimale)"
                         onclick="if(window.wmRefreshAuction)window.wmRefreshAuction('${a.id}', this);"
                         style="height:24px;box-sizing:border-box;padding:0 7px;border:1px solid rgba(6,182,212,0.3);border-radius:3px;background:none;color:#06b6d4;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;line-height:1;">↻</button>
-                    <button data-excl="${String(title).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')}"
+                    <button data-excl="${String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')}"
                         onclick="if(window.wmAddExcludeKeyword)window.wmAddExcludeKeyword(this.dataset.excl);"
-                        title="Exclure strictement « ${String(title).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;')} » des recherches"
+                        title="Exclure strictement « ${String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;')} » des recherches"
                         style="height:24px;box-sizing:border-box;padding:0 7px;border:1px solid rgba(239,68,68,0.3);border-radius:3px;background:none;color:#ef4444;font-size:11px;cursor:pointer;display:inline-flex;align-items:center;">🚫</button>
                     <button data-jumped="${priceJumped ? 1 : 0}"
                         title="Miser.${priceJumped ? ' ⚠ Le prix a bondi de +10% depuis ta dernière mise — double-clic requis pour confirmer.' : ''}"
@@ -4149,16 +4214,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         🤖 Auto-bid ${autoBidSet.has(a.id) ? 'ON' : 'OFF'}
                     </button>
                     <input id="wm-autobidmax-${a.id}" type="number" min="0" placeholder="${(() => {
-                        const cid = a.card?.id ?? a.card_id;
-                        const e = getCachedSales(cid);
-                        return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max';
-                    })()}"
+                    const cid = a.card?.id ?? a.card_id;
+                    const e = getCachedSales(cid);
+                    return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max';
+                })()}"
                         value="${getAutoBidMax(a.id) ?? ''}"
                         title="Plafond auto-bid : au-delà de ce montant, l'auto-bid se coupe pour cette enchère. Laisse vide pour ne PAS plafonner (auto-bid illimité).${(() => {
-                            const cid = a.card?.id ?? a.card_id;
-                            const e = getCachedSales(cid);
-                            return (e && e.count > 0) ? ' Médiane marché indicative : ' + e.median + ' 💰' : '';
-                        })()}"
+                    const cid = a.card?.id ?? a.card_id;
+                    const e = getCachedSales(cid);
+                    return (e && e.count > 0) ? ' Médiane marché indicative : ' + e.median + ' 💰' : '';
+                })()}"
                         oninput="window.wmOnAutoBidMax('${a.id}', this.value, false)"
                         onchange="window.wmOnAutoBidMax('${a.id}', this.value, true)"
                         style="width:82px;height:24px;box-sizing:border-box;padding:0 3px;border-radius:3px;border:1px solid rgba(251,191,36,0.4);
@@ -4239,7 +4304,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Rafraîchit à la demande le prix RÉEL d'une enchère (bouton ↻ de la vue déroulée). Le bot
     // ne poll pas toujours pile au bon instant → ça permet d'avoir le bon prix pour miser à la main.
-    window.wmRefreshAuction = async function(id, btn) {
+    window.wmRefreshAuction = async function (id, btn) {
         if (!id) return;
         if (btn) btn.style.animation = 'wm-spin 0.7s linear infinite'; // ↻ tourne pendant le fetch
         try {
@@ -4248,10 +4313,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // Patch le cache d'affichage + activeHitsMap avec les données fraîches
                 const cached = lastHitsCache.find(h => h && h.id === id);
                 if (cached) {
-                    if ('current_bid' in fresh)     cached.current_bid = fresh.current_bid;
-                    if ('current_bidder' in fresh)  cached.current_bidder = fresh.current_bidder;
-                    if ('base_amount' in fresh)     cached.base_amount = fresh.base_amount;
-                    if (fresh.end_at)               cached.end_at = fresh.end_at;
+                    if ('current_bid' in fresh) cached.current_bid = fresh.current_bid;
+                    if ('current_bidder' in fresh) cached.current_bidder = fresh.current_bidder;
+                    if ('base_amount' in fresh) cached.base_amount = fresh.base_amount;
+                    if (fresh.end_at) cached.end_at = fresh.end_at;
                     // MàJ directe de la mise minimale (fiable même si un input est focus → pas de
                     // re-render dans ce cas ; sinon le re-render ci-dessous recrée tout proprement).
                     const inp = document.getElementById('wm-bidinput-' + id);
@@ -4262,7 +4327,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const el = document.getElementById('wm-market-alert');
                 if (el && lastHitsCache.length > 0) renderMarketHits(el, lastHitsCache, []);
             }
-        } catch(e) {
+        } catch (e) {
             // échec silencieux : on ne casse pas l'affichage, l'utilisateur peut re-cliquer
         } finally {
             if (btn && btn.isConnected) btn.style.animation = '';
@@ -4292,11 +4357,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // toutes les 5s pour découvrir leur état initial.
         if (minMs === Infinity) return 5000;
 
-        if (minMs < 5_000)       return 250;   // mort de l'enchère : 4 ticks/s
-        if (minMs < 12_000)      return 500;   // snipe : 2 ticks/s
-        if (minMs < 30_000)      return 1000;  // très chaud : 1s
-        if (minMs < 90_000)      return 2000;  // chaud : 2s
-        if (minMs < 5 * 60_000)  return 5000;  // tiède : 5s
+        if (minMs < 5_000) return 250;   // mort de l'enchère : 4 ticks/s
+        if (minMs < 12_000) return 500;   // snipe : 2 ticks/s
+        if (minMs < 30_000) return 1000;  // très chaud : 1s
+        if (minMs < 90_000) return 2000;  // chaud : 2s
+        if (minMs < 5 * 60_000) return 5000;  // tiède : 5s
         return null;                            // froid : main scan suffit
     }
 
@@ -4350,21 +4415,23 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         try {
                             const res = await fetch(
                                 `${MARKET_API_BASE}/${a.id}/bid`,
-                                { method: "POST", credentials: "include",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount: bidAmount }) }
+                                {
+                                    method: "POST", credentials: "include",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ amount: bidAmount })
+                                }
                             );
                             if (res.ok) {
                                 markAuctionAsMine(a.id, bidAmount, a);
                                 const secLeft = Math.round(remaining / 1000);
                                 wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${titleSn}</b> [${rarSn}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
-                                fetchBalance().catch(() => {});
+                                fetchBalance().catch(() => { });
                                 sendToDiscord("🕵️ Snipe fourbe : **" + titleSn + "** → **" + bidAmount + " 💰**", 10181046, 'market');
                             } else {
                                 const errData = await res.json().catch(() => ({}));
                                 wmLog(`⚠️ Fourbe échoué : <b>${titleSn}</b> [${rarSn}] · ${errData?.error || 'erreur'}`);
                             }
-                        } catch(e) {
+                        } catch (e) {
                             wmLog(`⚠️ Fourbe exception : <b>${titleSn}</b> · ${e.message}`);
                         } finally {
                             bidLockSet.delete(a.id);
@@ -4424,15 +4491,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                             // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane)
                             const res = await fetch(
                                 `${MARKET_API_BASE}/${a.id}/bid`,
-                                { method: "POST", credentials: "include",
-                                  headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify({ amount: bidAmount }) }
+                                {
+                                    method: "POST", credentials: "include",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ amount: bidAmount })
+                                }
                             );
                             if (res.ok) {
                                 markAuctionAsMine(a.id, bidAmount, a);
                                 wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                                 // Refresh balance en arrière-plan, sans bloquer le tick
-                                fetchBalance().catch(() => {});
+                                fetchBalance().catch(() => { });
                                 sendToDiscord(
                                     "⚡ Hot-lane bid : **" + titleOb + "** → **" + bidAmount + " 💰**",
                                     5763719,
@@ -4442,7 +4511,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 const errData = await res.json().catch(() => ({}));
                                 wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errData?.error || 'erreur'}`);
                             }
-                        } catch(e) {
+                        } catch (e) {
                             wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
                         } finally {
                             bidLockSet.delete(a.id);
@@ -4476,7 +4545,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         hotLaneTimeout = setTimeout(async () => {
             try { await hotLaneTick(); }
-            catch(e) { console.warn('[WikiMasters][hot-lane] tick error:', e); }
+            catch (e) { console.warn('[WikiMasters][hot-lane] tick error:', e); }
             scheduleHotLane();
         }, nextMs);
     }
@@ -4566,8 +4635,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             sessionStorage.removeItem('wm_watcher_active');
             sessionStorage.removeItem('wm_hits_cache');
         }
-        if (marketWatcherInterval)   { clearInterval(marketWatcherInterval);   marketWatcherInterval = null; }
-        if (marketWatcherTimeout)    { clearTimeout(marketWatcherTimeout);     marketWatcherTimeout = null; }
+        if (marketWatcherInterval) { clearInterval(marketWatcherInterval); marketWatcherInterval = null; }
+        if (marketWatcherTimeout) { clearTimeout(marketWatcherTimeout); marketWatcherTimeout = null; }
         if (marketCountdownInterval) { clearInterval(marketCountdownInterval); marketCountdownInterval = null; }
         stopHotLane();
         marketWatcherActive = false;
@@ -4661,7 +4730,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     if (!res.ok) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); continue; }
                     const data = await res.json();
                     return data.collection || [];
-                } catch(e) {
+                } catch (e) {
                     await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
                 }
             }
@@ -4899,7 +4968,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const end = new Date(a.end_at || a.ends_at || NaN).getTime();
                 if (Number.isFinite(end) && end <= now) continue; // terminée
                 out.push(a);
-            } catch(e) { /* enchère disparue ou endpoint en erreur → on passe */ }
+            } catch (e) { /* enchère disparue ou endpoint en erreur → on passe */ }
             await new Promise(r => setTimeout(r, 200)); // on ne martèle pas le serveur
         }
         _rebuiltSales = out;
@@ -4927,7 +4996,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Aperçu brut tronqué : c'est lui qui révèle la structure réelle quand aucun nom de
         // champ connu ne correspond (imbrication, enveloppe, pagination…).
         let raw = '';
-        try { raw = JSON.stringify(data).slice(0, 500); } catch(e) { raw = '(non sérialisable)'; }
+        try { raw = JSON.stringify(data).slice(0, 500); } catch (e) { raw = '(non sérialisable)'; }
         wmLog(`🔬 <b>/mine</b> : 0 vente active retenue. Champs racine : <span style="color:#fbbf24;">${describe(data)}</span>`);
         wmLog(`🔬 Tableau retenu : <b>${key || 'AUCUN'}</b> (${(list || []).length} entrée(s)) · statuts vus : <b>${statuses}</b>`);
         if (list && list[0]) wmLog(`🔬 Champs d'une entrée : <span style="color:#888;">${describe(list[0])}</span>`);
@@ -4936,7 +5005,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Rejoue le diagnostic à la demande, avec une requête fraîche. Utilisable depuis la console
     // du navigateur : wmDumpMine()
-    window.wmDumpMine = async function() {
+    window.wmDumpMine = async function () {
         const data = await fetchMine();
         if (!data) { wmLog(`🔬 <b>/mine</b> : requête échouée (hors ligne, 429 ou 5xx).`); return; }
         const { key, list } = pickSellingArray(data);
@@ -5009,16 +5078,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     renderSellHistory();
                 }
                 // Refresh balance (au cas où il y aurait un remboursement) + ventes actives
-                fetchBalance().catch(() => {});
+                fetchBalance().catch(() => { });
                 try {
                     const st = await fetchSellingState();
                     if (st) renderActiveSales(st.list, st);
-                } catch(e) {}
+                } catch (e) { }
             } else {
                 const body = await res.text().catch(() => '');
                 wmLog(`❌ Annulation impossible : <b>${label}</b> · HTTP ${res.status}${body ? ' · ' + body.slice(0, 80) : ''}`);
             }
-        } catch(e) {
+        } catch (e) {
             wmLog(`❌ Annulation exception : <b>${label}</b> · ${e.message}`);
         }
     }
@@ -5179,7 +5248,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (Number.isFinite(p)) { matched++; if (p < min) min = p; }
             }
             return (matched > 0 && Number.isFinite(min)) ? min : null;
-        } catch(e) { return null; }
+        } catch (e) { return null; }
     }
 
     /* ══════════ MISE EN VENTE VIA L'INTERFACE (clic simulé) ══════════
@@ -5235,7 +5304,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) return { ok: false };
             const data = await res.json().catch(() => ({}));
             return { ok: true, auctionId: data.auction_id || null };
-        } catch(e) {
+        } catch (e) {
             return { ok: false };
         }
     }
@@ -5293,7 +5362,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const durLabel = DURATION_BUTTON_LABELS[duration];
         const durBtn = durLabel && findButtonByText(durLabel);
         if (durBtn) durBtn.click(); // pas de retour en échec si absent : mieux vaut lister à la
-                                     // durée par défaut du site que ne pas lister du tout
+        // durée par défaut du site que ne pas lister du tout
         await new Promise(r => setTimeout(r, 200));
 
         const launchBtn = findButtonByText("Lancer l'enchère");
@@ -5383,7 +5452,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     result = await sellCardViaUI(cardId, title, rarity, price, duration);
                     if (result.ok) { success = true; break; }
                     if (result.reason === 'wrong_page' || attempt === MAX_ATTEMPTS) break;
-                    wmLog(`⚠️ Mise en vente <b>${title}</b> échouée (${result.reason}), retry ${attempt}/${MAX_ATTEMPTS-1}…`);
+                    wmLog(`⚠️ Mise en vente <b>${title}</b> échouée (${result.reason}), retry ${attempt}/${MAX_ATTEMPTS - 1}…`);
                     await new Promise(r => setTimeout(r, 1500));
                     attempt++;
                 }
@@ -5439,7 +5508,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        automatique tant que le résultat n'est pas confirmé. Coût réel : UNE enchère créée
        (annulée automatiquement si le mauvais exemplaire a été consommé — aucune mise n'a pu
        être placée en quelques secondes). Console : wmTestInstanceTargeting() */
-    window.wmTestInstanceTargeting = async function() {
+    window.wmTestInstanceTargeting = async function () {
         const uid = currentUserId();
         if (!uid) { wmLog(`🧪 Test ciblage : aucun id utilisateur (JWT absent — connecté au site ?)`); return; }
         if (!TRASH_TAG_ID) { wmLog(`🧪 Test ciblage : tag Trash pas encore découvert, lance d'abord un scan (Trash Seller ou ▶ START).`); return; }
@@ -5489,7 +5558,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             wmLog(`🧪 Test ciblage : aucun cas trouvé (il faut un exemplaire taggué Trash avec un doublon plus ancien non-taggué du même card_id). Rien tenté, aucun risque.`);
             return;
         }
-        wmLog(`🧪 Cas trouvé : <b>${candidate.title}</b> — exemplaire taggué ${candidate.taggedId.slice(0,8)}… (${candidate.taggedCreated}) vs plus ancien ${candidate.oldId.slice(0,8)}… (${candidate.oldCreated}).`);
+        wmLog(`🧪 Cas trouvé : <b>${candidate.title}</b> — exemplaire taggué ${candidate.taggedId.slice(0, 8)}… (${candidate.taggedCreated}) vs plus ancien ${candidate.oldId.slice(0, 8)}… (${candidate.oldCreated}).`);
 
         // 3) Snapshot AVANT : mes exemplaires de ce card_id encore possédés.
         const before = await supabaseSelect(`user_cards?card_id=eq.${candidate.cardId}&user_id=eq.${uid}&select=id`);
@@ -5515,8 +5584,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 return;
             }
             auctionId = data.auction_id || null;
-            wmLog(`🧪 Vente créée${auctionId ? ' (' + auctionId.slice(0,8) + '…)' : ''} — vérification en base dans 3s…`);
-        } catch(e) {
+            wmLog(`🧪 Vente créée${auctionId ? ' (' + auctionId.slice(0, 8) + '…)' : ''} — vérification en base dans 3s…`);
+        } catch (e) {
             wmLog(`🧪 Test ciblage : exception réseau à la mise en vente — ${e.message}. Aucune vente créée.`);
             return;
         }
@@ -5525,14 +5594,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         await new Promise(r => setTimeout(r, 3000));
         const after = await supabaseSelect(`user_cards?card_id=eq.${candidate.cardId}&user_id=eq.${uid}&select=id`);
         if (!Array.isArray(after)) {
-            wmLog(`🧪 Test ciblage : snapshot « après » impossible. La vente ${auctionId ? auctionId.slice(0,8) + '… ' : ''}est créée mais le résultat du test est INDÉTERMINÉ — vérifie ta collection manuellement.`);
+            wmLog(`🧪 Test ciblage : snapshot « après » impossible. La vente ${auctionId ? auctionId.slice(0, 8) + '… ' : ''}est créée mais le résultat du test est INDÉTERMINÉ — vérifie ta collection manuellement.`);
             return;
         }
         const afterIds = new Set(after.map(r => r.id));
         const consumed = [...beforeIds].filter(id => !afterIds.has(id));
 
         if (consumed.length !== 1) {
-            wmLog(`🧪 Test ciblage : résultat ambigu (${consumed.length} exemplaire(s) disparu(s) au lieu d'1). Vérifie manuellement — vente ${auctionId ? auctionId.slice(0,8) + '…' : '?'} non annulée par précaution.`);
+            wmLog(`🧪 Test ciblage : résultat ambigu (${consumed.length} exemplaire(s) disparu(s) au lieu d'1). Vérifie manuellement — vente ${auctionId ? auctionId.slice(0, 8) + '…' : '?'} non annulée par précaution.`);
             return;
         }
         const gotTagged = consumed[0] === candidate.taggedId;
@@ -5569,14 +5638,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             const bodyText = await res.text();
             let data = null;
-            try { data = JSON.parse(bodyText); } catch(e) {}
+            try { data = JSON.parse(bodyText); } catch (e) { }
             return { ok: res.ok, status: res.status, body: bodyText, data };
-        } catch(e) {
+        } catch (e) {
             return { ok: false, status: 0, body: `exception réseau : ${e.message}` };
         }
     }
 
-    window.wmDebugCardId = async function(title, staleCardId) {
+    window.wmDebugCardId = async function (title, staleCardId) {
         if (!title) { wmLog(`🧪 Usage : wmDebugCardId("Titre exact de la carte"[, "ancien card_id à vérifier"])`); return; }
         const uid = currentUserId();
         if (!uid) { wmLog(`🧪 Debug card_id : aucun id utilisateur (JWT absent — connecté au site ?)`); return; }
@@ -5614,7 +5683,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     // Console : wmCardTitle("dcb86746-9bdd-429a-b1c0-757153f4cb74") → retrouve le titre/la
     // rareté d'un card_id vu dans une requête réseau, sans avoir à fouiller le pool Trash.
-    window.wmCardTitle = async function(cardId) {
+    window.wmCardTitle = async function (cardId) {
         if (!cardId) { wmLog(`🧪 Usage : wmCardTitle("card_id")`); return; }
         const r = await supabaseSelectDebug(`cards?id=eq.${cardId}&select=wikipedia_title,rarity`);
         if (!r.ok) { wmLog(`🧪 wmCardTitle : <b style="color:#ef4444;">HTTP ${r.status}</b> — ${r.body}`); return; }
@@ -5634,7 +5703,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        donc natif au site) juste avant le POST. Hypothèse : ce GET « prépare » quelque chose
        côté serveur (cache, session) que le POST exige ensuite. Ce test rejoue les deux à la
        suite pour vérifier si ça change le résultat. Console : wmTestSellWithPrecursor(cardId) */
-    window.wmTestSellWithPrecursor = async function(cardId, price, duration) {
+    window.wmTestSellWithPrecursor = async function (cardId, price, duration) {
         if (!cardId) { wmLog(`🧪 Usage : wmTestSellWithPrecursor("card_id"[, prix, durée_minutes])`); return; }
         price = price || 50; duration = duration || 60;
 
@@ -5651,7 +5720,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             const body = await res.text();
             wmLog(`🧪 POST marketplace après précurseur : ${res.ok ? `<b style="color:#4ade80;">${res.status} — ${body}</b>` : `<b style="color:#ef4444;">${res.status} — ${body}</b>`}`);
-        } catch(e) {
+        } catch (e) {
             wmLog(`🧪 POST marketplace : exception — ${e.message}`);
         }
     };
@@ -5737,7 +5806,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
             }
             return true;
-        } catch(e) {
+        } catch (e) {
             wmLog(`❌ Annulation (refresh) exception : <b>${a.card?.wikipedia_title || '?'}</b> · ${e.message}`);
             return false;
         }
@@ -5812,7 +5881,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 (deferred ? ` <span style="color:#fbbf24;">· ${deferred} reportée(s) (échange)</span>` : '') +
                 (skipped ? ` <span style="color:#888;">· ${skipped} ignorée(s)</span>` : '');
             wmLog(`🔄 Refresh ventes : ${cancelled} annulée(s), ${sold} remise(s) en vente${keptWithBids ? `, ${keptWithBids} gardée(s) (avec mise)` : ''}`);
-        } catch(e) {
+        } catch (e) {
             if (statusEl) statusEl.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
         } finally {
             refreshSalesRunning = false;
@@ -5938,7 +6007,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     statusEl.innerHTML = `<span style="color:#888;">⏳ ${cur.count}/${mx} ventes actives — attente…</span>`;
                 }
             }
-        } catch(e) {
+        } catch (e) {
             statusEl.innerHTML = '<span style="color:#ef4444;">Erreur : ' + e.message + '</span>';
         }
 
@@ -5972,7 +6041,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
             marketPriceCache[cardId] = avg;
             return avg;
-        } catch(e) { return null; }
+        } catch (e) { return null; }
     }
 
     async function estimateSessionValue(cards) {
@@ -6005,9 +6074,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         renderSellHistory();
     }
 
-    const SUPABASE_REF   = "cyrxjeppjqsxxjayfrur";
-    const SUPABASE_URL   = `https://${SUPABASE_REF}.supabase.co/rest/v1`;
-    const SUPABASE_KEY   = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN5cnhqZXBwanFzeHhqYXlmcnVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4ODAzMzksImV4cCI6MjA4OTQ1NjMzOX0.BZluyXygNxuQGDPxFX1zG5i-cqp10CVK-8GGtuak4Rg";
+    const SUPABASE_REF = "cyrxjeppjqsxxjayfrur";
+    const SUPABASE_URL = `https://${SUPABASE_REF}.supabase.co/rest/v1`;
+    const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN5cnhqZXBwanFzeHhqYXlmcnVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4ODAzMzksImV4cCI6MjA4OTQ1NjMzOX0.BZluyXygNxuQGDPxFX1zG5i-cqp10CVK-8GGtuak4Rg";
     // Tag Trash : découvert dynamiquement par compte (par-utilisateur sur wiki-masters)
     const TRASH_TAG_CACHE_KEY = 'wm_trash_tag_id';
     let TRASH_TAG_ID = localStorage.getItem(TRASH_TAG_CACHE_KEY) || null;
@@ -6039,12 +6108,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const data = await res.json();
                 if (data[0]?.id) {
                     TRASH_TAG_ID = data[0].id;
-                    try { localStorage.setItem(TRASH_TAG_CACHE_KEY, TRASH_TAG_ID); } catch(e) {}
-                    wmLog(`🏷️ Tag Trash découvert : <span style="color:#888;font-size:9px;">${TRASH_TAG_ID.slice(0,8)}…</span>`);
+                    try { localStorage.setItem(TRASH_TAG_CACHE_KEY, TRASH_TAG_ID); } catch (e) { }
+                    wmLog(`🏷️ Tag Trash découvert : <span style="color:#888;font-size:9px;">${TRASH_TAG_ID.slice(0, 8)}…</span>`);
                     return TRASH_TAG_ID;
                 }
             }
-        } catch(e) {}
+        } catch (e) { }
 
         // Essai 2 : tags globaux (sans filtre user_id) — au cas où le schéma diffère
         try {
@@ -6063,12 +6132,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const data = await res.json();
                 if (data[0]?.id) {
                     TRASH_TAG_ID = data[0].id;
-                    try { localStorage.setItem(TRASH_TAG_CACHE_KEY, TRASH_TAG_ID); } catch(e) {}
-                    wmLog(`🏷️ Tag Trash découvert (global) : <span style="color:#888;font-size:9px;">${TRASH_TAG_ID.slice(0,8)}…</span>`);
+                    try { localStorage.setItem(TRASH_TAG_CACHE_KEY, TRASH_TAG_ID); } catch (e) { }
+                    wmLog(`🏷️ Tag Trash découvert (global) : <span style="color:#888;font-size:9px;">${TRASH_TAG_ID.slice(0, 8)}…</span>`);
                     return TRASH_TAG_ID;
                 }
             }
-        } catch(e) {}
+        } catch (e) { }
 
         wmLog(`⚠️ Tag "<b>${getSellTagName()}</b>" introuvable sur ton compte — crée-le sur wiki-masters pour activer le retag auto`);
         return null;
@@ -6094,7 +6163,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) return [];
             const data = await res.json();
             return Array.isArray(data) ? data.filter(t => t && t.id && t.name) : [];
-        } catch(e) { return []; }
+        } catch (e) { return []; }
     }
 
     // Crée un tag sur le compte de l'utilisateur via Supabase REST (POST /tags).
@@ -6130,7 +6199,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     return { ok: true, id: existing[0].id, alreadyExists: true };
                 }
             }
-        } catch(e) {}
+        } catch (e) { }
 
         // Création : POST { user_id, name } — avec Prefer pour récupérer l'objet créé
         try {
@@ -6148,11 +6217,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             if (res.status === 201 || res.ok) {
                 let id = null;
-                try { const data = await res.json(); id = data?.[0]?.id || data?.id || null; } catch(e) {}
+                try { const data = await res.json(); id = data?.[0]?.id || data?.id || null; } catch (e) { }
                 return { ok: true, id, alreadyExists: false };
             }
             return { ok: false, error: `HTTP ${res.status}` };
-        } catch(e) {
+        } catch (e) {
             return { ok: false, error: e.message };
         }
     }
@@ -6177,7 +6246,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     if (!res.ok) { await new Promise(r => setTimeout(r, 400 * (attempt + 1))); continue; }
                     const data = await res.json();
                     return data.collection || [];
-                } catch(e) {
+                } catch (e) {
                     await new Promise(r => setTimeout(r, 400 * (attempt + 1)));
                 }
             }
@@ -6265,9 +6334,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Échec définitif → on extrait un message lisible du corps de la réponse.
             const body = await res.text().catch(() => '');
             let error = (body || '').slice(0, 200);
-            try { const j = JSON.parse(body); error = j.message || j.error || j.detail || j.hint || error; } catch(e) {}
+            try { const j = JSON.parse(body); error = j.message || j.error || j.detail || j.hint || error; } catch (e) { }
             return { ok: false, status: res.status, error: error || `HTTP ${res.status}` };
-        } catch(e) {
+        } catch (e) {
             if (attempt < MAX_ATTEMPTS) {
                 await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt - 1), 6000)));
                 return addTagToUserCard(userCardId, tagId, attempt + 1);
@@ -6317,8 +6386,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         );
                         const found = untagged?.id || items[0]?.id;
                         if (found) {
-                            const retryNote = attempt > 0 ? ` <span style="color:#888;font-size:9px;">(tentative ${attempt+1}/${MAX_ATTEMPTS})</span>` : '';
-                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${cardTitle || cardId.slice(0,8)}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0,8)}…${retryNote}`);
+                            const retryNote = attempt > 0 ? ` <span style="color:#888;font-size:9px;">(tentative ${attempt + 1}/${MAX_ATTEMPTS})</span>` : '';
+                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${cardTitle || cardId.slice(0, 8)}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0, 8)}…${retryNote}`);
                             return found;
                         }
                     }
@@ -6328,7 +6397,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     wmLog(`⚠️ findUserCardId Supabase HTTP ${res.status} · ${body.slice(0, 100)}`);
                     // Erreur réseau/auth : on continue les retries
                 }
-            } catch(e) {
+            } catch (e) {
                 wmLog(`⚠️ findUserCardId Supabase exception : ${e.message}`);
             }
         }
@@ -6350,9 +6419,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (matches[0]?.id) return matches[0].id;
                 if (items.length < 50) break;
             }
-        } catch(e) {}
+        } catch (e) { }
 
-        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${cardTitle || cardId.slice(0,8)}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
+        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${cardTitle || cardId.slice(0, 8)}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
         return null;
     }
 
@@ -6369,7 +6438,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (obj?.access_token) return { token: obj.access_token, source: 'localStorage' };
                 if (Array.isArray(obj) && obj[0]) return { token: obj[0], source: 'localStorage[0]' };
             }
-        } catch(e) {}
+        } catch (e) { }
 
         // 2) Cookies (supabase-ssr) — éventuellement chunkés en .0 .1 .2…
         try {
@@ -6387,7 +6456,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             }
             let raw = single;
             if (!raw && Object.keys(chunks).length > 0) {
-                raw = Object.keys(chunks).sort((a,b) => a-b).map(k => chunks[k]).join('');
+                raw = Object.keys(chunks).sort((a, b) => a - b).map(k => chunks[k]).join('');
             }
             if (raw) {
                 raw = decodeURIComponent(raw);
@@ -6396,7 +6465,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (obj?.access_token) return { token: obj.access_token, source: 'cookie' };
                 if (Array.isArray(obj) && obj[0]) return { token: obj[0], source: 'cookie[0]' };
             }
-        } catch(e) {}
+        } catch (e) { }
 
         return { token: null, source: null };
     }
@@ -6408,7 +6477,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        listant TOUTES les tables exposées et leurs colonnes : une seule requête donne la réponse
        exacte, au lieu de bombarder le serveur de noms de tables inventés.
        Console : wmDiscoverTables()  — ou wmDiscoverTables('auction') pour filtrer. */
-    window.wmDiscoverTables = async function(filter) {
+    window.wmDiscoverTables = async function (filter) {
         const { token } = getSupabaseAccessToken();
         let spec;
         try {
@@ -6422,7 +6491,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             if (!res.ok) { wmLog(`🔬 Introspection Supabase : <b>HTTP ${res.status}</b>${token ? '' : ' (aucun token utilisateur trouvé — es-tu connecté au site ?)'}`); return null; }
             spec = await res.json();
-        } catch(e) {
+        } catch (e) {
             wmLog(`🔬 Introspection Supabase échouée : ${e.message}`);
             return null;
         }
@@ -6467,7 +6536,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             });
             if (!res.ok) return null;
             return await res.json();
-        } catch(e) { return null; }
+        } catch (e) { return null; }
     }
 
     function currentUserId() {
@@ -6490,7 +6559,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return null;
     }
     let _profileTable = null;
-    try { _profileTable = localStorage.getItem(PROFILE_TABLE_KEY); } catch(e) {}
+    try { _profileTable = localStorage.getItem(PROFILE_TABLE_KEY); } catch (e) { }
     let _profileProbeLogged = false;
     const _usernameCache = new Map();
     async function resolveUsernames(ids) {
@@ -6509,7 +6578,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (!Array.isArray(rows) || rows.length === 0) continue;
                 if (_profileTable !== t) {
                     _profileTable = t;
-                    try { localStorage.setItem(PROFILE_TABLE_KEY, t); } catch(e) {}
+                    try { localStorage.setItem(PROFILE_TABLE_KEY, t); } catch (e) { }
                 }
                 rows.forEach(r => { if (r && r.id) _usernameCache.set(r.id, pickUsername(r) || '?'); });
                 // Diagnostic si la table répond mais qu'aucune colonne ne ressemble à un pseudo.
@@ -6534,7 +6603,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Teste la résolution des pseudos sans attendre qu'un adversaire mise : on résout son
     // PROPRE id par le même chemin que celui utilisé pour les enchérisseurs. Console :
     // wmTestUsernames()  — ou wmTestUsernames('<uuid>') pour un id précis.
-    window.wmTestUsernames = async function(id) {
+    window.wmTestUsernames = async function (id) {
         const uid = id || currentUserId();
         if (!uid) { wmLog(`🔬 Test pseudos : aucun id utilisateur (JWT absent — connecté au site ?)`); return null; }
         _usernameCache.delete(uid); // force une vraie requête plutôt qu'un cache
@@ -6664,7 +6733,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        Console : wmProbeTables()  — ou wmProbeTables(['ma_table']) pour tester un nom précis. */
     const PROBE_TABLE_NAMES = ['auctions', 'marketplace_auctions', 'marketplace_listings',
         'listings', 'market_auctions', 'card_auctions', 'sales', 'auction_bids', 'bids'];
-    window.wmProbeTables = async function(names) {
+    window.wmProbeTables = async function (names) {
         const { token, source } = getSupabaseAccessToken();
         wmLog(`🔬 Sonde Supabase — token utilisateur : <b>${token ? 'trouvé (' + source + ')' : 'ABSENT'}</b>${token ? '' : ' — connecte-toi au site, sinon tout répondra 401.'}`);
         const list = Array.isArray(names) && names.length ? names : PROBE_TABLE_NAMES;
@@ -6682,13 +6751,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     }
                 });
                 body = await res.text();
-            } catch(e) {
+            } catch (e) {
                 wmLog(`🔬 <b>${t}</b> → erreur réseau : ${e.message}`);
                 continue;
             }
             if (res.ok) {
                 let rows = [];
-                try { rows = JSON.parse(body); } catch(e) {}
+                try { rows = JSON.parse(body); } catch (e) { }
                 const cols = (Array.isArray(rows) && rows[0]) ? Object.keys(rows[0]) : null;
                 found.push(t);
                 wmLog(`🔬 ✅ <b style="color:#4ade80;">${t}</b> → lisible · colonnes : <span style="color:#888;font-size:9px;">${cols ? cols.join(', ') : '(table vide, colonnes inconnues)'}</span>`);
@@ -6722,10 +6791,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     function rarityFromMonthlyViews(views) {
         if (!Number.isFinite(views)) return null;
         if (views >= 20000) return 'L';
-        if (views >= 5000)  return 'UR';
-        if (views >= 1000)  return 'SR';
-        if (views >= 250)   return 'R';
-        if (views >= 50)    return 'PC';
+        if (views >= 5000) return 'UR';
+        if (views >= 1000) return 'SR';
+        if (views >= 250) return 'R';
+        if (views >= 50) return 'PC';
         return 'C';
     }
 
@@ -6763,7 +6832,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const data = await res.json();
             const item = Array.isArray(data.items) ? data.items[0] : null;
             return { views: item ? item.views : 0, monthStamp: start, url };
-        } catch(e) {
+        } catch (e) {
             // Un TypeError "Failed to fetch" ici est presque toujours du CORS ou une CSP
             // (connect-src) de la page wiki-masters.com bloquant l'appel vers wikimedia.org —
             // le script tourne en @grant none (pas de GM_xmlhttpRequest pour contourner ça).
@@ -6826,7 +6895,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     }
 
     // Console : wmCheckRarityDrift('Anatolie') ou wmCheckRarityDrift(['Anatolie', 'Autre titre'])
-    window.wmCheckRarityDrift = async function(titles) {
+    window.wmCheckRarityDrift = async function (titles) {
         const list = (Array.isArray(titles) ? titles : [titles]).filter(t => typeof t === 'string' && t.trim());
         if (list.length === 0) {
             wmLog(`🔭 Dérive de rareté : indique au moins un titre d'article exact. Ex. <code>wmCheckRarityDrift('Anatolie')</code>`);
@@ -6869,7 +6938,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         if (row.match) {
             return `<span style="color:#4ade80;font-size:9px;cursor:help;"
-                title="Vues Wikipédia réelles (${row.realViews.toLocaleString('fr-FR')}/mois, ${row.monthStamp.slice(4,6)}/${row.monthStamp.slice(0,4)}) cohérentes avec la rareté ${row.cachedRarity} affichée. Cache WikiMasters vieux de ${row.staleness}.">✅ stable</span>`;
+                title="Vues Wikipédia réelles (${row.realViews.toLocaleString('fr-FR')}/mois, ${row.monthStamp.slice(4, 6)}/${row.monthStamp.slice(0, 4)}) cohérentes avec la rareté ${row.cachedRarity} affichée. Cache WikiMasters vieux de ${row.staleness}.">✅ stable</span>`;
         }
         const up = RARITY_ORDER[row.impliedRarity] > RARITY_ORDER[row.cachedRarity];
         return `<span style="color:${up ? '#fbbf24' : '#888'};font-size:9px;font-weight:700;cursor:help;"
@@ -6883,7 +6952,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         return (entry && Date.now() - entry.ts < RARITY_DRIFT_CACHE_MS) ? entry.row : null;
     }
 
-    window.wmCheckAuctionRarity = async function(auctionId, btn) {
+    window.wmCheckAuctionRarity = async function (auctionId, btn) {
         const hit = activeHitsMap.get(auctionId);
         const a = hit && hit.auction;
         const title = a && a.card && a.card.wikipedia_title;
@@ -6912,7 +6981,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
        si elle échoue, c'est très probablement le quota (~5-10 Mo/origine selon le navigateur)
        qui est atteint — repère aussi les plus grosses clés existantes pour savoir lesquelles
        purger. Console : wmStorageUsage() */
-    window.wmStorageUsage = function() {
+    window.wmStorageUsage = function () {
         const rows = [];
         let totalChars = 0;
         for (let i = 0; i < localStorage.length; i++) {
@@ -6932,7 +7001,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             localStorage.setItem(probeKey, 'x'.repeat(10000)); // 10 Ko, écriture représentative
             localStorage.removeItem(probeKey);
             wmLog(`💾 ✅ Test d'écriture (10 Ko) réussi — le quota n'est <b>probablement pas</b> la cause.`);
-        } catch(e) {
+        } catch (e) {
             wmLog(`💾 ⚠️ <b style="color:#ef4444;">Test d'écriture ÉCHOUÉ</b> : ${e.name || 'Erreur'} — ${e.message || 'inconnue'}. Le quota localStorage est très probablement atteint ou dépassé.`);
         }
         console.table(rows);
@@ -6989,7 +7058,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // Erreur serveur instable → retry avec backoff exponentiel
             if ([500, 502, 503, 504, 429].includes(res.status) && attempt < MAX_ATTEMPTS) {
                 const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-                wmLog(`⚠️ Re-tag Trash HTTP ${res.status}, retry ${attempt}/${MAX_ATTEMPTS-1} dans ${(backoff/1000).toFixed(0)}s…`);
+                wmLog(`⚠️ Re-tag Trash HTTP ${res.status}, retry ${attempt}/${MAX_ATTEMPTS - 1} dans ${(backoff / 1000).toFixed(0)}s…`);
                 await new Promise(r => setTimeout(r, backoff));
                 return reapplyTrashTag(userCardId, attempt + 1);
             }
@@ -6998,11 +7067,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const body = await res.text().catch(() => '');
             wmLog(`❌ Re-tag Trash échec (HTTP ${res.status})${body ? ' · ' + body.slice(0, 100) : ''}`);
             return false;
-        } catch(e) {
+        } catch (e) {
             // Erreur réseau → retry aussi
             if (attempt < MAX_ATTEMPTS) {
                 const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
-                wmLog(`⚠️ Re-tag Trash exception (${e.message}), retry ${attempt}/${MAX_ATTEMPTS-1} dans ${(backoff/1000).toFixed(0)}s…`);
+                wmLog(`⚠️ Re-tag Trash exception (${e.message}), retry ${attempt}/${MAX_ATTEMPTS - 1} dans ${(backoff / 1000).toFixed(0)}s…`);
                 await new Promise(r => setTimeout(r, backoff));
                 return reapplyTrashTag(userCardId, attempt + 1);
             }
@@ -7088,9 +7157,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 // Une ligne encore active n'est pas une conclusion : on la laisse pending,
                 // reconcilePendingSales tranchera plus tard via la collection si besoin.
                 if (match && !auctionRowStillActive(match)) {
-                    s.status     = auctionRowSettledSold(match) ? 'sold' : 'unsold';
+                    s.status = auctionRowSettledSold(match) ? 'sold' : 'unsold';
                     s.finalPrice = match.final_price ?? null;
-                    changed      = true;
+                    changed = true;
 
                     if (s.status === 'sold') {
                         creditSoldSale(s, null);
@@ -7141,14 +7210,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 incrementRetagCount(s.cardId, s.title, s.rarity);
                                 wmLog(`🏷️ Tag Trash remis : <b>${s.title}</b> [${s.rarity}] <span style="color:#555;font-size:9px;">(${sourceTag})</span>`);
                             } else {
-                                wmLog(`💀 Re-tag définitivement échoué : <b>${s.title}</b> · ID tenté : ${targetId.slice(0,8)}… (${sourceTag})`);
+                                wmLog(`💀 Re-tag définitivement échoué : <b>${s.title}</b> · ID tenté : ${targetId.slice(0, 8)}… (${sourceTag})`);
                             }
                         })();
                     }
                 }
             });
             if (changed) { saveSellHistory(); renderSellHistory(); }
-        } catch(e) {}
+        } catch (e) { }
     }
 
     function renderSellHistory() {
@@ -7160,10 +7229,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (el) el.innerHTML = '<span style="color:#444;font-size:10px;">Aucune vente aujourd\'hui.</span>';
             return;
         }
-        const soldItems    = sessionSales.filter(s => s.status === 'sold');
-        const unsoldItems  = sessionSales.filter(s => s.status === 'unsold');
+        const soldItems = sessionSales.filter(s => s.status === 'sold');
+        const unsoldItems = sessionSales.filter(s => s.status === 'unsold');
         const pendingItems = sessionSales.filter(s => s.status === 'pending');
-        const totalGained  = soldItems.reduce((a, b) => a + (b.finalPrice || b.price), 0);
+        const totalGained = soldItems.reduce((a, b) => a + (b.finalPrice || b.price), 0);
 
         // Stats par rareté — moyenne du PRIX RÉEL de vente (finalPrice), pas du prix de base
         const byRarity = {};
@@ -7184,11 +7253,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             .sort((a, b) => (RARITY_ORDER[b[0]] ?? -1) - (RARITY_ORDER[a[0]] ?? -1))
             .map(([r, d]) => {
                 const rc = RARITY[r] || { color: "#aaa" };
-                return `<span style="color:${rc.color};font-size:10px;">${r}: ${d.count} (moy. ${Math.round(d.total/d.count)}💰)</span>`;
+                return `<span style="color:${rc.color};font-size:10px;">${r}: ${d.count} (moy. ${Math.round(d.total / d.count)}💰)</span>`;
             }).join(' · ');
 
         const settled = soldItems.length + unsoldItems.length;
-        const txRate  = settled > 0 ? Math.round((soldItems.length / settled) * 100) : 0;
+        const txRate = settled > 0 ? Math.round((soldItems.length / settled) * 100) : 0;
 
         el.innerHTML = `
             <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -7305,11 +7374,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const totalMin = Math.floor(ms / 60000);
             const h = Math.floor(totalMin / 60);
             const m = totalMin % 60;
-            return h > 0 ? `${h}h ${String(m).padStart(2,'0')}m` : `${m}m`;
+            return h > 0 ? `${h}h ${String(m).padStart(2, '0')}m` : `${m}m`;
         };
         const fmtDate = (ts) => {
             const d = new Date(ts);
-            return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
         };
         // La session courante est désormais écrite au fil de l'eau : on la signale comme
         // « en cours » pour qu'elle ne soit pas prise pour une session déjà close.
@@ -7451,7 +7520,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const fmtDate = (ts) => {
             if (!ts) return '';
             const d = new Date(ts);
-            return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
         };
         const bought = [...buyHistory].sort((a, b) => (b.boughtAt || 0) - (a.boughtAt || 0));
         const totalSpent = bought.reduce((s, x) => s + (Number(x.price) || 0), 0);
@@ -7532,7 +7601,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const fmtDate = (ts) => {
             if (!ts) return '';
             const d = new Date(ts);
-            return `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
         };
         // Récap en-tête : nombre + total encaissé
         const totalFinal = sold.reduce((s, x) => s + (Number(x.final) || 0), 0);
@@ -7842,11 +7911,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         /* ── Countdown ── */
         function cdInfo(str) {
             const ms = new Date(str).getTime() - Date.now();
-            if (ms <= 0) return {text:'⏰', cls:'wm-cd-r'};
-            const s=Math.floor(ms/1000), m=Math.floor(s/60), h=Math.floor(m/60);
-            const text = h>0?`${h}h ${String(m%60).padStart(2,'0')}m`:m>0?`${m}m ${String(s%60).padStart(2,'0')}s`:`${s}s`;
-            const cls = ms<5*60000?'wm-cd-r':ms<10*60000?'wm-cd-o':ms<30*60000?'wm-cd-y':'wm-cd-g';
-            return {text, cls};
+            if (ms <= 0) return { text: '⏰', cls: 'wm-cd-r' };
+            const s = Math.floor(ms / 1000), m = Math.floor(s / 60), h = Math.floor(m / 60);
+            const text = h > 0 ? `${h}h ${String(m % 60).padStart(2, '0')}m` : m > 0 ? `${m}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`;
+            const cls = ms < 5 * 60000 ? 'wm-cd-r' : ms < 10 * 60000 ? 'wm-cd-o' : ms < 30 * 60000 ? 'wm-cd-y' : 'wm-cd-g';
+            return { text, cls };
         }
 
         /* ════════ FAB ════════ */
@@ -7875,7 +7944,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         // Exposé sur window pour que les call-sites puissent incrémenter sans
         // avoir à dépendre du scope createUI()
-        window.wmNotify = function(count = 1) {
+        window.wmNotify = function (count = 1) {
             if (!getSetting('notificationsEnabled')) return;
             // Si l'overlay est déjà ouvert et visible, inutile de notifier
             const overlay = document.getElementById('wm-overlay');
@@ -7883,7 +7952,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             pendingNotifications += count;
             updateBadgeDOM();
         };
-        window.wmClearNotifications = function() {
+        window.wmClearNotifications = function () {
             pendingNotifications = 0;
             updateBadgeDOM();
         };
@@ -7891,10 +7960,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         window.wmRefreshBadge = updateBadgeDOM;
 
         function updateDots() {
-            const p=document.getElementById('fd-p'), m=document.getElementById('fd-m'), t=document.getElementById('fd-t');
-            if(p) p.className='wm-dot wm-dot-pack'+(running?' on':'');
-            if(m) m.className='wm-dot wm-dot-market'+(marketWatcherActive?' on':'');
-            if(t) t.className='wm-dot wm-dot-trash'+(trashSellerRunning?' on':'');
+            const p = document.getElementById('fd-p'), m = document.getElementById('fd-m'), t = document.getElementById('fd-t');
+            if (p) p.className = 'wm-dot wm-dot-pack' + (running ? ' on' : '');
+            if (m) m.className = 'wm-dot wm-dot-market' + (marketWatcherActive ? ' on' : '');
+            if (t) t.className = 'wm-dot wm-dot-trash' + (trashSellerRunning ? ' on' : '');
         }
 
         /* ════════ OVERLAY ════════ */
@@ -8401,14 +8470,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (!TRASH_TAG_ID) await discoverTrashTagId();
                 // Réconciliation des ventes en attente (retag des invendues revenues pendant
                 // que le PC était éteint). Petit délai pour laisser le réseau/JWT se stabiliser.
-                setTimeout(() => { reconcilePendingSales().catch(() => {}); }, 4000);
+                setTimeout(() => { reconcilePendingSales().catch(() => { }); }, 4000);
             } else {
                 wmLog(`⚠️ Utilisateur non identifié — connecte-toi à wiki-masters.com et recharge la page`);
             }
         });
         setTimeout(() => {
             const packsEl = document.getElementById("wm-packs");
-            if (packsEl) packsEl.innerText = `${sessionPacks} pack${sessionPacks>1?'s':''}`;
+            if (packsEl) packsEl.innerText = `${sessionPacks} pack${sessionPacks > 1 ? 's' : ''}`;
             renderRarityStats(document.getElementById('wm-rarity'));
             renderSellHistory();
             renderKeywordsPanel();
@@ -8421,11 +8490,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }, 0);
 
         /* ════════ PACK OPENER ════════ */
-        const startBtn   = document.getElementById("wm-start-btn");
-        const revealEl   = document.getElementById("wm-reveal");
+        const startBtn = document.getElementById("wm-start-btn");
+        const revealEl = document.getElementById("wm-reveal");
         const lastDropEl = document.getElementById("wm-last-drop");
-        const rarityEl   = document.getElementById("wm-rarity");
-        const alertEl    = document.getElementById("wm-alert");
+        const rarityEl = document.getElementById("wm-rarity");
+        const alertEl = document.getElementById("wm-alert");
 
         function setPackOpenerRunning(state) {
             running = state;
@@ -8479,7 +8548,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     wmLog(`📦 Pack ouvert <b>manuellement</b> (bouton) — comptabilisé dans les stats`);
                     await handlePackOpened(data, { animate: true });
                 }
-            } catch(err) {
+            } catch (err) {
                 if (err && err.message === '403') {
                     if (alertEl) alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — réessaie dans un instant</span>`;
                 } else {
@@ -8505,8 +8574,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         /* ════════ MARKET WATCHER ════════ */
         const marketStatusEl = document.getElementById("wm-market-status");
-        const marketAlertEl  = document.getElementById("wm-market-alert");
-        const marketBtn      = document.getElementById("wm-market-btn");
+        const marketAlertEl = document.getElementById("wm-market-alert");
+        const marketBtn = document.getElementById("wm-market-btn");
 
         marketBtn.onclick = () => {
             if (!marketWatcherActive) {
@@ -8535,7 +8604,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         };
 
         const autoSnipeBtn = document.getElementById('wm-autosnipe-btn');
-        autoSnipeBtn.onclick = function() { window.wmToggleAutoSnipe(this); };
+        autoSnipeBtn.onclick = function () { window.wmToggleAutoSnipe(this); };
 
         const aggroChk = document.getElementById('wm-hunter-aggro');
         if (aggroChk) aggroChk.onchange = () => window.wmToggleHunterAggressive();
@@ -8547,7 +8616,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             sortSelect.value = marketSortKey;
             sortSelect.onchange = () => {
                 marketSortKey = sortSelect.value;
-                try { localStorage.setItem(MARKET_SORT_KEY, marketSortKey); } catch(e) {}
+                try { localStorage.setItem(MARKET_SORT_KEY, marketSortKey); } catch (e) { }
                 // Re-render immédiat sans attendre le prochain scan
                 if (lastHitsCache.length > 0) {
                     renderMarketHits(marketAlertEl, lastHitsCache, []);
@@ -8561,7 +8630,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             hideOwnedChk.checked = marketHideOwned;
             hideOwnedChk.onchange = () => {
                 marketHideOwned = hideOwnedChk.checked;
-                try { localStorage.setItem(MARKET_HIDE_OWNED_KEY, marketHideOwned ? '1' : '0'); } catch(e) {}
+                try { localStorage.setItem(MARKET_HIDE_OWNED_KEY, marketHideOwned ? '1' : '0'); } catch (e) { }
                 if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
             };
         }
@@ -8573,7 +8642,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             viewSelect.onchange = () => {
                 if (!MARKET_VIEWS.includes(viewSelect.value)) return;
                 marketView = viewSelect.value;
-                try { localStorage.setItem(MARKET_VIEW_KEY, marketView); } catch(e) {}
+                try { localStorage.setItem(MARKET_VIEW_KEY, marketView); } catch (e) { }
                 // Les lignes dépliées à la main n'ont de sens qu'en compact.
                 if (marketView !== 'compact') marketExpandedIds.clear();
                 if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
@@ -8605,8 +8674,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (cached) {
                 try {
                     const hits = JSON.parse(cached);
-                    hits.forEach(a => { lastMarketHits.add(a.id); activeHitsMap.set(a.id, { auction:a, endAt:a.end_at }); });
-                    hits.sort((a,b) => new Date(a.end_at)-new Date(b.end_at));
+                    hits.forEach(a => { lastMarketHits.add(a.id); activeHitsMap.set(a.id, { auction: a, endAt: a.end_at }); });
+                    hits.sort((a, b) => new Date(a.end_at) - new Date(b.end_at));
                     renderMarketHits(marketAlertEl, hits, []);
                     startCountdownTicker(marketAlertEl);
                     marketWatcherActive = true;
@@ -8617,7 +8686,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     setTimeout(() => startHotLane(), 1000);
                     updateDots();
                     restored = true;
-                } catch(e) {}
+                } catch (e) { }
             }
             // Fallback : si cache manquant ou parse échoué, démarrage fresh
             if (!restored) {
@@ -8629,7 +8698,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         /* ════════ TRASH SELLER ════════ */
-        const trashBtn    = document.getElementById("wm-trash-btn");
+        const trashBtn = document.getElementById("wm-trash-btn");
         const trashStatus = document.getElementById("wm-trash-status");
 
         // Bouton "Refresh ventes" : annule les ventes sans mise et re-liste selon la stratégie
@@ -8673,14 +8742,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         document.getElementById('wm-log-export').onclick = () => exportLogs();
 
         /* ════════ PARAMÈTRES ════════ */
-        const settingsHdr     = document.getElementById('wm-settings-hdr');
-        const settingsBody    = document.getElementById('wm-settings-body');
+        const settingsHdr = document.getElementById('wm-settings-hdr');
+        const settingsBody = document.getElementById('wm-settings-body');
         const settingsChevron = document.getElementById('wm-settings-chevron');
-        const webhookInput    = document.getElementById('wm-webhook-input');
-        const webhookSaveBtn  = document.getElementById('wm-webhook-save');
-        const webhookTestBtn  = document.getElementById('wm-webhook-test');
+        const webhookInput = document.getElementById('wm-webhook-input');
+        const webhookSaveBtn = document.getElementById('wm-webhook-save');
+        const webhookTestBtn = document.getElementById('wm-webhook-test');
         const webhookClearBtn = document.getElementById('wm-webhook-clear');
-        const settingsStatus  = document.getElementById('wm-settings-status');
+        const settingsStatus = document.getElementById('wm-settings-status');
 
         function refreshWebhookStatus() {
             const url = getDiscordWebhook();
@@ -8697,49 +8766,49 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // -- Init valeurs (lecture depuis settings) --
         webhookInput.value = getDiscordWebhook();
-        const discordEnabledChk    = document.getElementById('wm-set-discord-enabled');
-        const logColChk            = document.getElementById('wm-set-log-collection');
-        const logMktChk            = document.getElementById('wm-set-log-market');
-        const logTrashChk          = document.getElementById('wm-set-log-trash');
-        const logAutobidChk        = document.getElementById('wm-set-log-autobid');
-        const autoSnipePriceInput      = document.getElementById('wm-set-autosnipe-price');
+        const discordEnabledChk = document.getElementById('wm-set-discord-enabled');
+        const logColChk = document.getElementById('wm-set-log-collection');
+        const logMktChk = document.getElementById('wm-set-log-market');
+        const logTrashChk = document.getElementById('wm-set-log-trash');
+        const logAutobidChk = document.getElementById('wm-set-log-autobid');
+        const autoSnipePriceInput = document.getElementById('wm-set-autosnipe-price');
         const autoSnipeMinBalanceInput = document.getElementById('wm-set-autosnipe-min-balance');
-        const autoSnipeRatioInput      = document.getElementById('wm-set-autosnipe-ratio');
-        const bidDelayInput            = document.getElementById('wm-set-bid-delay');
-        const dailyAlertChk            = document.getElementById('wm-set-daily-alert');
-        const dailyLimitInput          = document.getElementById('wm-set-daily-limit');
-        const autoRetagChk         = document.getElementById('wm-set-autoretag-enabled');
-        const wishlistKwChk        = document.getElementById('wm-set-wishlist-keyword');
-        const soundNewHitChk       = document.getElementById('wm-set-sound-newhit');
-        const soundOutbidChk       = document.getElementById('wm-set-sound-outbid');
-        const soundPackChk         = document.getElementById('wm-set-sound-pack');
-        const soundLegendaryChk    = document.getElementById('wm-set-sound-legendary');
-        const soundWonChk          = document.getElementById('wm-set-sound-won');
-        const notifsChk            = document.getElementById('wm-set-notifications-enabled');
-        const tagNameInput         = document.getElementById('wm-set-tag-name');
-        const tagSaveBtn           = document.getElementById('wm-set-tag-save');
-        const tagStatusEl          = document.getElementById('wm-set-tag-status');
+        const autoSnipeRatioInput = document.getElementById('wm-set-autosnipe-ratio');
+        const bidDelayInput = document.getElementById('wm-set-bid-delay');
+        const dailyAlertChk = document.getElementById('wm-set-daily-alert');
+        const dailyLimitInput = document.getElementById('wm-set-daily-limit');
+        const autoRetagChk = document.getElementById('wm-set-autoretag-enabled');
+        const wishlistKwChk = document.getElementById('wm-set-wishlist-keyword');
+        const soundNewHitChk = document.getElementById('wm-set-sound-newhit');
+        const soundOutbidChk = document.getElementById('wm-set-sound-outbid');
+        const soundPackChk = document.getElementById('wm-set-sound-pack');
+        const soundLegendaryChk = document.getElementById('wm-set-sound-legendary');
+        const soundWonChk = document.getElementById('wm-set-sound-won');
+        const notifsChk = document.getElementById('wm-set-notifications-enabled');
+        const tagNameInput = document.getElementById('wm-set-tag-name');
+        const tagSaveBtn = document.getElementById('wm-set-tag-save');
+        const tagStatusEl = document.getElementById('wm-set-tag-status');
 
-        discordEnabledChk.checked         = getSetting('discordEnabled');
-        logColChk.checked                 = getSetting('logCollection');
-        logMktChk.checked                 = getSetting('logMarket');
-        logTrashChk.checked               = getSetting('logTrash');
-        logAutobidChk.checked             = getSetting('logAutobid');
-        autoSnipePriceInput.value         = getSetting('autoSnipePrice');
-        autoSnipeMinBalanceInput.value    = getSetting('minBalanceForAutoSnipe');
-        autoSnipeRatioInput.value         = Math.round(getSetting('autoSnipeAdaptiveRatio') * 100);
+        discordEnabledChk.checked = getSetting('discordEnabled');
+        logColChk.checked = getSetting('logCollection');
+        logMktChk.checked = getSetting('logMarket');
+        logTrashChk.checked = getSetting('logTrash');
+        logAutobidChk.checked = getSetting('logAutobid');
+        autoSnipePriceInput.value = getSetting('autoSnipePrice');
+        autoSnipeMinBalanceInput.value = getSetting('minBalanceForAutoSnipe');
+        autoSnipeRatioInput.value = Math.round(getSetting('autoSnipeAdaptiveRatio') * 100);
         if (bidDelayInput) bidDelayInput.value = getSetting('humanizedBidDelayMs');
-        dailyAlertChk.checked             = getSetting('dailyPackAlert');
-        dailyLimitInput.value             = getSetting('dailyPackLimit');
-        autoRetagChk.checked              = getSetting('autoRetagEnabled');
+        dailyAlertChk.checked = getSetting('dailyPackAlert');
+        dailyLimitInput.value = getSetting('dailyPackLimit');
+        autoRetagChk.checked = getSetting('autoRetagEnabled');
         if (wishlistKwChk) wishlistKwChk.checked = getSetting('wishlistToKeyword');
-        soundNewHitChk.checked            = getSetting('soundNewHit');
-        soundOutbidChk.checked            = getSetting('soundOutbid');
-        soundPackChk.checked              = getSetting('soundPackOpen');
-        soundLegendaryChk.checked         = getSetting('soundLegendary');
+        soundNewHitChk.checked = getSetting('soundNewHit');
+        soundOutbidChk.checked = getSetting('soundOutbid');
+        soundPackChk.checked = getSetting('soundPackOpen');
+        soundLegendaryChk.checked = getSetting('soundLegendary');
         if (soundWonChk) soundWonChk.checked = getSetting('soundWon');
-        notifsChk.checked                 = getSetting('notificationsEnabled');
-        tagNameInput.value                = getSetting('sellTagName');
+        notifsChk.checked = getSetting('notificationsEnabled');
+        tagNameInput.value = getSetting('sellTagName');
 
         // Radio mode auto-snipe + affichage conditionnel des champs fixe/adaptatif
         function applySnipeModeUI() {
@@ -8838,17 +8907,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // -- Plages horaires par module (démarrage/arrêt programmé) --
         [
-            { label: 'Pack Opener',    ena: 'schedulePackEnabled',   start: 'schedulePackStart',   end: 'schedulePackEnd',   ids: ['pack'] },
+            { label: 'Pack Opener', ena: 'schedulePackEnabled', start: 'schedulePackStart', end: 'schedulePackEnd', ids: ['pack'] },
             { label: 'Market Watcher', ena: 'scheduleMarketEnabled', start: 'scheduleMarketStart', end: 'scheduleMarketEnd', ids: ['market'] },
-            { label: 'Trash Seller',   ena: 'scheduleTrashEnabled',  start: 'scheduleTrashStart',  end: 'scheduleTrashEnd',  ids: ['trash'] },
+            { label: 'Trash Seller', ena: 'scheduleTrashEnabled', start: 'scheduleTrashStart', end: 'scheduleTrashEnd', ids: ['trash'] },
         ].forEach(mod => {
             const id = mod.ids[0];
             const ena = document.getElementById(`wm-set-schedule-${id}-enabled`);
-            const st  = document.getElementById(`wm-set-schedule-${id}-start`);
-            const en  = document.getElementById(`wm-set-schedule-${id}-end`);
+            const st = document.getElementById(`wm-set-schedule-${id}-start`);
+            const en = document.getElementById(`wm-set-schedule-${id}-end`);
             if (ena) ena.checked = getSetting(mod.ena);
-            if (st)  st.value    = getSetting(mod.start);
-            if (en)  en.value    = getSetting(mod.end);
+            if (st) st.value = getSetting(mod.start);
+            if (en) en.value = getSetting(mod.end);
             const onChange = () => {
                 if (ena) setSetting(mod.ena, ena.checked);
                 if (st && st.value) setSetting(mod.start, st.value);
@@ -8859,8 +8928,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (window.wmScheduleReeval) window.wmScheduleReeval();
             };
             if (ena) ena.onchange = onChange;
-            if (st)  st.onchange  = onChange;
-            if (en)  en.onchange  = onChange;
+            if (st) st.onchange = onChange;
+            if (en) en.onchange = onChange;
         });
 
         // Radio packCooldown : coche le bon bouton selon la valeur stockée
@@ -8928,7 +8997,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!tbody) return;
             const cfg = getSellConfig();
             const order = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
-            const durLabel = m => m < 60 ? `${m} min` : `${m/60} h`;
+            const durLabel = m => m < 60 ? `${m} min` : `${m / 60} h`;
             tbody.innerHTML = order.map(rar => {
                 const c = RARITY[rar] || { color: '#888' };
                 const { price, duration } = cfg[rar];
@@ -8965,7 +9034,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         if (!Number.isFinite(v)) return;
                         cfg[rar].duration = v;
                         setSellConfig(cfg);
-                        wmLog(`🕒 Durée <b>${rar}</b> : <b>${v < 60 ? v + ' min' : (v/60) + ' h'}</b>`);
+                        wmLog(`🕒 Durée <b>${rar}</b> : <b>${v < 60 ? v + ' min' : (v / 60) + ' h'}</b>`);
                     }
                 };
             });
@@ -9048,9 +9117,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 setSetting('trashSellStrategy', trashStrategySelect.value);
                 const labels = {
                     coverage: 'Équitable (moins listées d\'abord)',
-                    value:    'Valeur (plus chères d\'abord)',
-                    rarity:   'Rareté (plus rares d\'abord)',
-                    random:   'Aléatoire'
+                    value: 'Valeur (plus chères d\'abord)',
+                    rarity: 'Rareté (plus rares d\'abord)',
+                    random: 'Aléatoire'
                 };
                 wmLog(`🎯 Trash Seller : priorité de vente → <b>${labels[trashStrategySelect.value] || trashStrategySelect.value}</b>`);
             };
@@ -9060,7 +9129,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const name = getSetting('sellTagName');
             const id = TRASH_TAG_ID;
             if (id) {
-                tagStatusEl.innerHTML = `<span style="color:#4ade80;">✓ Tag "<b>${name}</b>"</span> · <span style="color:#555;font-family:'JetBrains Mono',monospace;font-size:9px;">${id.slice(0,8)}…</span>`;
+                tagStatusEl.innerHTML = `<span style="color:#4ade80;">✓ Tag "<b>${name}</b>"</span> · <span style="color:#555;font-family:'JetBrains Mono',monospace;font-size:9px;">${id.slice(0, 8)}…</span>`;
             } else {
                 tagStatusEl.innerHTML = `<span style="color:#fbbf24;">⚠ Tag "<b>${name}</b>" non découvert — crée-le sur wiki-masters</span>`;
             }
@@ -9072,9 +9141,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // État ouvert/fermé des panneaux accordéon, persisté entre les sessions
         const PANEL_STATE_KEY = 'wm_panel_open_state';
         let panelOpenState = {};
-        try { panelOpenState = JSON.parse(localStorage.getItem(PANEL_STATE_KEY) || '{}') || {}; } catch(e) {}
+        try { panelOpenState = JSON.parse(localStorage.getItem(PANEL_STATE_KEY) || '{}') || {}; } catch (e) { }
         function savePanelState() {
-            try { localStorage.setItem(PANEL_STATE_KEY, JSON.stringify(panelOpenState)); } catch(e) {}
+            try { localStorage.setItem(PANEL_STATE_KEY, JSON.stringify(panelOpenState)); } catch (e) { }
         }
 
         settingsHdr.onclick = () => {
@@ -9085,8 +9154,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         };
 
         // -- Panneau Statistiques (accordéon jumeau) --
-        const statsHdr     = document.getElementById('wm-stats-hdr');
-        const statsBody     = document.getElementById('wm-stats-body');
+        const statsHdr = document.getElementById('wm-stats-hdr');
+        const statsBody = document.getElementById('wm-stats-body');
         const statsChevron = document.getElementById('wm-stats-chevron');
         if (statsHdr) {
             statsHdr.onclick = () => {
@@ -9110,21 +9179,21 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         // -- Module Étiquetage en masse --
-        const taggerHdr      = document.getElementById('wm-tagger-hdr');
-        const taggerBody     = document.getElementById('wm-tagger-body');
-        const taggerChevron  = document.getElementById('wm-tagger-chevron');
-        const taggerKeyword  = document.getElementById('wm-tagger-keyword');
+        const taggerHdr = document.getElementById('wm-tagger-hdr');
+        const taggerBody = document.getElementById('wm-tagger-body');
+        const taggerChevron = document.getElementById('wm-tagger-chevron');
+        const taggerKeyword = document.getElementById('wm-tagger-keyword');
         const taggerTagInput = document.getElementById('wm-tagger-tag');
         const taggerGroupInput = document.getElementById('wm-tagger-group');
-        const taggerGroupList  = document.getElementById('wm-tagger-grouplist');
+        const taggerGroupList = document.getElementById('wm-tagger-grouplist');
         const taggerUntagged = document.getElementById('wm-tagger-untagged-only');
         const taggerExtended = document.getElementById('wm-tagger-extended');
         const taggerForceScan = document.getElementById('wm-tagger-force-scan');
         const taggerDuplicatesBtn = document.getElementById('wm-tagger-duplicates');
-        const taggerScanBtn  = document.getElementById('wm-tagger-scan');
+        const taggerScanBtn = document.getElementById('wm-tagger-scan');
         const taggerApplyBtn = document.getElementById('wm-tagger-apply');
-        const taggerStatus   = document.getElementById('wm-tagger-status');
-        const taggerResults  = document.getElementById('wm-tagger-results');
+        const taggerStatus = document.getElementById('wm-tagger-status');
+        const taggerResults = document.getElementById('wm-tagger-results');
         const taggerDatalist = document.getElementById('wm-tagger-taglist');
         let taggerMatches = [];
         // Groupes de présets repliés (état transitoire, non persisté)
@@ -9222,8 +9291,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         /* ── Recherches enregistrées (presets) : un clic = scan + application du tag ── */
         const TAGGER_PRESETS_KEY = 'wm_tagger_presets';
         let taggerPresets = [];
-        try { taggerPresets = JSON.parse(localStorage.getItem(TAGGER_PRESETS_KEY) || '[]') || []; } catch(e) { taggerPresets = []; }
-        function saveTaggerPresets() { try { localStorage.setItem(TAGGER_PRESETS_KEY, JSON.stringify(taggerPresets)); } catch(e) {} }
+        try { taggerPresets = JSON.parse(localStorage.getItem(TAGGER_PRESETS_KEY) || '[]') || []; } catch (e) { taggerPresets = []; }
+        function saveTaggerPresets() { try { localStorage.setItem(TAGGER_PRESETS_KEY, JSON.stringify(taggerPresets)); } catch (e) { } }
         // Index du préset en cours d'édition (via le crayon ✏️), -1 = mode ajout normal.
         let editingPresetIndex = -1;
 
@@ -9243,7 +9312,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
             });
             if (changed) saveTaggerPresets();
-            try { localStorage.setItem('wm_tagger_presets_sep_v2', '1'); } catch(e) {}
+            try { localStorage.setItem('wm_tagger_presets_sep_v2', '1'); } catch (e) { }
             if (changed) wmLog('🔀 Présets migrés : séparateur des mots-clés passé de « , » à « ; » (titres à virgule désormais préservés).');
         })();
         const presetGroupName = (p) => (((p && p.group) || '').trim()) || 'Sans catégorie';
@@ -9342,22 +9411,22 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const p = taggerPresets[idx];
             if (!p) return;
             editingPresetIndex = idx;
-            if (taggerKeyword)    taggerKeyword.value    = p.kw || '';
-            if (taggerTagInput)   taggerTagInput.value   = p.tag || '';
+            if (taggerKeyword) taggerKeyword.value = p.kw || '';
+            if (taggerTagInput) taggerTagInput.value = p.tag || '';
             if (taggerGroupInput) taggerGroupInput.value = p.group || '';
-            if (taggerUntagged)   taggerUntagged.checked = !!p.untagged;
-            if (taggerExtended)   taggerExtended.checked = !!p.extended;
+            if (taggerUntagged) taggerUntagged.checked = !!p.untagged;
+            if (taggerExtended) taggerExtended.checked = !!p.extended;
             updateSavePresetLabel();
-            if (taggerKeyword) { try { taggerKeyword.focus(); taggerKeyword.scrollIntoView({ block: 'nearest' }); } catch(e) {} }
+            if (taggerKeyword) { try { taggerKeyword.focus(); taggerKeyword.scrollIntoView({ block: 'nearest' }); } catch (e) { } }
             if (taggerStatus) taggerStatus.innerHTML = `<span style="color:#a78bfa;">✏️ Édition de « ${taggerEsc(p.tag)} » — modifie les champs puis « Enregistrer les modifications » (ou Annuler).</span>`;
         }
         function cancelEditPreset() {
             editingPresetIndex = -1;
-            if (taggerKeyword)    taggerKeyword.value    = '';
-            if (taggerTagInput)   taggerTagInput.value   = '';
+            if (taggerKeyword) taggerKeyword.value = '';
+            if (taggerTagInput) taggerTagInput.value = '';
             if (taggerGroupInput) taggerGroupInput.value = '';
-            if (taggerUntagged)   taggerUntagged.checked = false;
-            if (taggerExtended)   taggerExtended.checked = false;
+            if (taggerUntagged) taggerUntagged.checked = false;
+            if (taggerExtended) taggerExtended.checked = false;
             updateSavePresetLabel();
             if (taggerStatus) taggerStatus.innerHTML = '<span style="color:#888;">Édition annulée.</span>';
         }
@@ -9465,7 +9534,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 taggerStatus.innerHTML = `<span style="color:#4ade80;">✔ ${r.totalOk} tag(s) posé(s) sur ${r.totalMatched} carte(s)${r.totalFail ? ` · <span style="color:#ef4444;">${r.totalFail} échec(s)</span>` : ''} — 1 seul scan.</span>`;
                 renderTaggerFailures(r.failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
-            } catch(e) {
+            } catch (e) {
                 taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
             } finally {
                 taggerScanBtn.disabled = false;
@@ -9492,7 +9561,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 }
                 renderTaggerFailures(r.failures); // détail des échecs (carte, tag, raison)
                 await populateTagDatalist();
-            } catch(e) {
+            } catch (e) {
                 taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
             } finally {
                 taggerScanBtn.disabled = false;
@@ -9639,7 +9708,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         taggerStatus.innerHTML = `<span style="color:#4ade80;">${taggerMatches.length} carte(s) ${scope} sur ${all.length}${shownNote}. Décoche celles à exclure, puis clique Appliquer si tu veux les taguer.</span>`;
                         taggerApplyBtn.disabled = false;
                     }
-                } catch(e) {
+                } catch (e) {
                     taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
                 } finally {
                     taggerScanBtn.disabled = false;
@@ -9692,7 +9761,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         taggerStatus.innerHTML = `<span style="color:#4ade80;">${taggerMatches.length} carte(s) en double ou plus (${models} modèle(s) distinct(s)) sur ${all.length}. Décoche celles à exclure, puis clique Appliquer.</span>`;
                         taggerApplyBtn.disabled = false;
                     }
-                } catch(e) {
+                } catch (e) {
                     taggerStatus.innerHTML = `<span style="color:#ef4444;">Erreur : ${e.message}</span>`;
                 } finally {
                     taggerScanBtn.disabled = false; taggerDuplicatesBtn.disabled = false;
@@ -9793,7 +9862,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 } else {
                     settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : HTTP ${res.status}</span>`;
                 }
-            } catch(e) {
+            } catch (e) {
                 settingsStatus.innerHTML = `<span style="color:#ef4444;">⚠ Échec : ${e.message}</span>`;
             }
         };
@@ -9820,10 +9889,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 wmLog(`${chk.checked ? '👁️' : '🙈'} Logs ${label} ${chk.checked ? 'activés' : 'désactivés'}`);
             };
         };
-        bindLogToggle(logColChk,     'logCollection', 'collection');
-        bindLogToggle(logMktChk,     'logMarket',     'market watcher');
-        bindLogToggle(logTrashChk,   'logTrash',      'trash seller');
-        bindLogToggle(logAutobidChk, 'logAutobid',    'auto-bid');
+        bindLogToggle(logColChk, 'logCollection', 'collection');
+        bindLogToggle(logMktChk, 'logMarket', 'market watcher');
+        bindLogToggle(logTrashChk, 'logTrash', 'trash seller');
+        bindLogToggle(logAutobidChk, 'logAutobid', 'auto-bid');
 
         // -- Auto-snipe price --
         autoSnipePriceInput.onchange = () => {
@@ -9919,7 +9988,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             setSetting('sellTagName', newName);
             // Invalide le cache du tag_id et redécouvre avec le nouveau nom
             TRASH_TAG_ID = null;
-            try { localStorage.removeItem(TRASH_TAG_CACHE_KEY); } catch(e) {}
+            try { localStorage.removeItem(TRASH_TAG_CACHE_KEY); } catch (e) { }
             tagStatusEl.innerHTML = `<span style="color:#888;">⏳ Découverte du tag "${newName}"…</span>`;
             wmLog(`🏷️ Nouveau nom de tag : <b>${newName}</b> · redécouverte en cours…`);
             await discoverTrashTagId();
@@ -9927,11 +9996,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         };
 
         /* ════════ IDENTITÉ / PSEUDO ════════ */
-        const usernameInput   = document.getElementById('wm-set-username');
+        const usernameInput = document.getElementById('wm-set-username');
         const usernameSaveBtn = document.getElementById('wm-set-username-save');
         const identityRefresh = document.getElementById('wm-set-identity-refresh');
-        const identityInfo    = document.getElementById('wm-set-identity-info');
-        const identityStatus  = document.getElementById('wm-set-identity-status');
+        const identityInfo = document.getElementById('wm-set-identity-info');
+        const identityStatus = document.getElementById('wm-set-identity-status');
 
         if (usernameInput) usernameInput.value = getSetting('usernameOverride');
         function refreshIdentityInfo() {
@@ -9956,7 +10025,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             const v = usernameInput.value.trim();
             setSetting('usernameOverride', v);
             // Vide le cache d'identité pour repartir propre
-            try { localStorage.removeItem(CURRENT_USER_CACHE_KEY); } catch(e) {}
+            try { localStorage.removeItem(CURRENT_USER_CACHE_KEY); } catch (e) { }
             await fetchCurrentUser();
             refreshIdentityInfo();
             reapplyIdentityToHits();
@@ -9970,7 +10039,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         };
 
         if (identityRefresh) identityRefresh.onclick = async () => {
-            try { localStorage.removeItem(CURRENT_USER_CACHE_KEY); } catch(e) {}
+            try { localStorage.removeItem(CURRENT_USER_CACHE_KEY); } catch (e) { }
             identityStatus.innerHTML = `<span style="color:#888;">⏳ Re-détection de l'identité…</span>`;
             await fetchCurrentUser();
             refreshIdentityInfo();
@@ -10017,7 +10086,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 data
             };
             const jsonStr = JSON.stringify(payload, null, 2);
-            const ts = new Date().toISOString().slice(0,19).replace(/[T:]/g, '-');
+            const ts = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
             const filename = `wm-backup${lite ? '-lite' : ''}-${currentUsername || 'user'}-${ts}.json`;
             return { jsonStr, filename, count };
         }
@@ -10054,7 +10123,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     return { ok: true, filename, count };
                 }
                 return { ok: false, error: `HTTP ${res.status}`, status: res.status };
-            } catch(e) {
+            } catch (e) {
                 return { ok: false, error: e.message };
             }
         }
@@ -10149,8 +10218,8 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     content: `🗄️ **Backup (fermeture)** · ${count} clés · ${currentUsername || 'user'} · ${new Date().toLocaleString('fr-FR')}`
                 }));
                 form.append('file', new Blob([jsonStr], { type: 'application/json' }), filename);
-                fetch(webhook, { method: 'POST', body: form, keepalive: true }).catch(() => {});
-            } catch(e) {}
+                fetch(webhook, { method: 'POST', body: form, keepalive: true }).catch(() => { });
+            } catch (e) { }
         };
 
         importBtn.onclick = () => {
@@ -10214,17 +10283,17 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     let written = 0; const failed = [];
                     importKeys.forEach(k => {
                         try { localStorage.setItem(k, parsed.data[k]); written++; }
-                        catch(e) { failed.push(k); }
+                        catch (e) { failed.push(k); }
                     });
                     if (failed.length > 0) {
-                        ioxStatus.innerHTML = `<span style="color:#fbbf24;">✓ ${written} clés importées · ⚠ ${failed.length} ignorée(s) (quota) : ${failed.slice(0,3).join(', ')}${failed.length > 3 ? '…' : ''}. Rechargement…</span>`;
+                        ioxStatus.innerHTML = `<span style="color:#fbbf24;">✓ ${written} clés importées · ⚠ ${failed.length} ignorée(s) (quota) : ${failed.slice(0, 3).join(', ')}${failed.length > 3 ? '…' : ''}. Rechargement…</span>`;
                         wmLog(`📥 Import : <b>${written}</b> clés restaurées, <b>${failed.length}</b> ignorée(s) faute de place (${failed.join(', ')}).`);
                     } else {
                         ioxStatus.innerHTML = `<span style="color:#4ade80;">✓ ${written} clés importées${skippedCache ? ` (cache collection ignoré, régénéré au reload)` : ''}. Rechargement…</span>`;
                         wmLog(`📥 Import : <b>${written}</b> clés restaurées depuis <b>${file.name}</b>${skippedCache ? ` (${skippedCache} clé(s) de cache ignorées)` : ''}. La page va recharger.`);
                     }
                     setTimeout(() => location.reload(), 1200);
-                } catch(e) {
+                } catch (e) {
                     ioxStatus.innerHTML = `<span style="color:#ef4444;">⚠ Erreur : ${e.message}</span>`;
                 }
             };
@@ -10302,9 +10371,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
         // Chaque module a son propre horaire + son bouton. On n'agit qu'aux transitions.
         const SCHED_MODULES = [
-            { key: 'pack',   label: '📦 Pack Opener',    btn: 'wm-start-btn',  isOn: () => running,             ena: 'schedulePackEnabled',   start: 'schedulePackStart',   end: 'schedulePackEnd' },
+            { key: 'pack', label: '📦 Pack Opener', btn: 'wm-start-btn', isOn: () => running, ena: 'schedulePackEnabled', start: 'schedulePackStart', end: 'schedulePackEnd' },
             { key: 'market', label: '🛒 Market Watcher', btn: 'wm-market-btn', isOn: () => marketWatcherActive, ena: 'scheduleMarketEnabled', start: 'scheduleMarketStart', end: 'scheduleMarketEnd' },
-            { key: 'trash',  label: '🗑️ Trash Seller',   btn: 'wm-trash-btn',  isOn: () => trashSellerRunning,  ena: 'scheduleTrashEnabled',  start: 'scheduleTrashStart',  end: 'scheduleTrashEnd' },
+            { key: 'trash', label: '🗑️ Trash Seller', btn: 'wm-trash-btn', isOn: () => trashSellerRunning, ena: 'scheduleTrashEnabled', start: 'scheduleTrashStart', end: 'scheduleTrashEnd' },
         ];
         const _schedLast = {}; // key → dernier état "dans la plage" (n'agit qu'aux bascules)
         function checkSchedule() {
@@ -10342,7 +10411,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // rafraîchissement automatique (incrémental) ci-dessous.
         const collProgress = (loaded, total) => {
             if (total && total > 0) {
-                const pct = Math.round((loaded/total)*100);
+                const pct = Math.round((loaded / total) * 100);
                 refreshBtn.innerText = `⏳ ${pct}%`;
             } else {
                 // Mode dégradé (total inconnu) : on affiche le compte chargé
@@ -10379,7 +10448,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         setInterval(async () => {
             if (refreshBtn.disabled) return;
             await fetchCollection(collProgress);
-        }, 3*60*1000);
+        }, 3 * 60 * 1000);
 
         // Refresh auto des ventes actives toutes les 30s, indépendamment du trash seller.
         // Porte AUSSI la synchro des enchères gagnées, pour ne pas rouvrir une requête /mine.
@@ -10400,14 +10469,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Filet de sécurité : réconcilie les ventes en attente toutes les 5 min (retag des
         // invendues revenues), même si le Trash Seller n'est pas lancé. Sans effet si rien
         // n'est en attente. Complète la passe unique du démarrage.
-        setInterval(() => { reconcilePendingSales().catch(() => {}); }, 5 * 60 * 1000);
+        setInterval(() => { reconcilePendingSales().catch(() => { }); }, 5 * 60 * 1000);
 
         // (La synchro des enchères gagnées est portée par refreshActiveSales ci-dessus : elle
         // tourne donc bien même Market Watcher à l'arrêt, sans requête supplémentaire.)
 
         // Sauvegarde périodique de la session en cours : si le navigateur meurt sans prévenir
         // (crash, extinction PC, onglet libéré par Chrome), on ne perd au pire qu'une minute.
-        setInterval(() => { try { finalizeSession(); } catch(e) {} }, 60000);
+        setInterval(() => { try { finalizeSession(); } catch (e) { } }, 60000);
 
         // Ticker seconde par seconde pour mettre à jour le temps restant des ventes actives
         // Source de vérité = data-end sur chaque span .wm-sale-cd (pas de Map à maintenir)
@@ -10436,7 +10505,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (Array.isArray(saved) && saved.length === 3 && saved.every(n => Number.isFinite(n) && n > 0)) {
                     cols = saved;
                 }
-            } catch(e) {}
+            } catch (e) { }
 
             const RESIZER = '6px';
             function applyCols() {
@@ -10482,7 +10551,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         document.body.style.cursor = '';
                         document.removeEventListener('mousemove', onMove);
                         document.removeEventListener('mouseup', onUp);
-                        try { localStorage.setItem(COLS_KEY, JSON.stringify(cols)); } catch(e) {}
+                        try { localStorage.setItem(COLS_KEY, JSON.stringify(cols)); } catch (e) { }
                     }
                     document.addEventListener('mousemove', onMove);
                     document.addEventListener('mouseup', onUp);
@@ -10492,7 +10561,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 resizer.addEventListener('dblclick', () => {
                     cols = [1, 1, 1];
                     applyCols();
-                    try { localStorage.setItem(COLS_KEY, JSON.stringify(cols)); } catch(e) {}
+                    try { localStorage.setItem(COLS_KEY, JSON.stringify(cols)); } catch (e) { }
                 });
             });
         })();
@@ -10501,7 +10570,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         (function setupRowResize() {
             const HEIGHTS_KEY = 'wm_panel_heights';
             let heights = {};
-            try { heights = JSON.parse(localStorage.getItem(HEIGHTS_KEY) || '{}') || {}; } catch(e) {}
+            try { heights = JSON.parse(localStorage.getItem(HEIGHTS_KEY) || '{}') || {}; } catch (e) { }
 
             // Restaure les hauteurs sauvegardées
             Object.entries(heights).forEach(([cssVar, px]) => {
@@ -10520,7 +10589,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 };
                 syncVisibility();
                 // Observe l'ouverture/fermeture du panneau (toggle de la classe 'open')
-                new MutationObserver(syncVisibility).observe(body, { attributes:true, attributeFilter:['class'] });
+                new MutationObserver(syncVisibility).observe(body, { attributes: true, attributeFilter: ['class'] });
 
                 resizer.addEventListener('mousedown', (e) => {
                     e.preventDefault();
@@ -10550,7 +10619,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         const finalH = parseInt(getComputedStyle(document.documentElement).getPropertyValue(cssVar), 10);
                         if (Number.isFinite(finalH)) {
                             heights[cssVar] = finalH;
-                            try { localStorage.setItem(HEIGHTS_KEY, JSON.stringify(heights)); } catch(e) {}
+                            try { localStorage.setItem(HEIGHTS_KEY, JSON.stringify(heights)); } catch (e) { }
                         }
                     }
                     document.addEventListener('mousemove', onMove);
@@ -10561,7 +10630,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 resizer.addEventListener('dblclick', () => {
                     document.documentElement.style.removeProperty(cssVar);
                     delete heights[cssVar];
-                    try { localStorage.setItem(HEIGHTS_KEY, JSON.stringify(heights)); } catch(e) {}
+                    try { localStorage.setItem(HEIGHTS_KEY, JSON.stringify(heights)); } catch (e) { }
                 });
             });
         })();
@@ -10591,11 +10660,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const soldAt = new Date(sale.settled_at).getTime();
                 if (!Number.isFinite(soldAt) || Date.now() - soldAt > 2 * 60 * 1000) continue;
 
-                const title    = sale.card?.wikipedia_title || "?";
-                const rarity   = (sale.snapshot_rarity || sale.card?.rarity || "?").toUpperCase();
-                const base     = sale.listing_base_amount || sale.base_amount || 0;
-                const final    = sale.final_price || sale.current_bid || 0;
-                const gain     = final - base;
+                const title = sale.card?.wikipedia_title || "?";
+                const rarity = (sale.snapshot_rarity || sale.card?.rarity || "?").toUpperCase();
+                const base = sale.listing_base_amount || sale.base_amount || 0;
+                const final = sale.final_price || sale.current_bid || 0;
+                const gain = final - base;
 
                 sendToDiscord(
                     "💰 **VENDU !**\n" +
@@ -10605,7 +10674,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     5763719
                 );
             }
-        } catch(e) {}
+        } catch (e) { }
     }
 
     function startSalesMonitor() {
@@ -10614,7 +10683,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // Le setInterval part dans tous les cas (succès ou échec), comme avant.
         fetchSoldFromDb(50)
             .then(rows => { (rows || []).forEach(h => knownSoldIds.add(h.id)); })
-            .catch(() => {})
+            .catch(() => { })
             .finally(() => { salesMonitorInterval = setInterval(checkRecentSales, 30000); });
     }
 
@@ -10671,7 +10740,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // Séparateur = POINT-VIRGULE (;) pour préserver les titres à virgule.
     function presetTerms(raw) { return (raw || '').split(';').map(s => presetNorm(s.trim())).filter(Boolean); }
     function loadTaggerPresets() {
-        try { return JSON.parse(localStorage.getItem('wm_tagger_presets') || '[]') || []; } catch(e) { return []; }
+        try { return JSON.parse(localStorage.getItem('wm_tagger_presets') || '[]') || []; } catch (e) { return []; }
     }
     // Champs "identité" (ce que la carte EST) vs "étendus" (ce qu'elle MENTIONNE).
     // Miroir de TAGGER_ID_KEYS/TAGGER_TEXT_KEYS côté auto-tag des packs.
@@ -10786,7 +10855,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // 🔥 ALERTES RARETÉ
         const rareDrop = cards.find(c => (c.rarity || "").toUpperCase() === "L");
-        const urDrop   = cards.find(c => (c.rarity || "").toUpperCase() === "UR");
+        const urDrop = cards.find(c => (c.rarity || "").toUpperCase() === "UR");
 
         // 🔊 Sons : si une Légendaire tombe → fanfare (prioritaire) ; sinon petit son
         // d'ouverture. Chaque son est indépendamment activable dans les Paramètres.
@@ -10820,7 +10889,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         if (lastDropEl) {
             lastDropEl.innerHTML = cards.map(c => {
                 const rarity = (c.rarity || "").toUpperCase();
-                const r = RARITY[rarity] || { color:"#aaa", bg:"rgba(170,170,170,0.1)" };
+                const r = RARITY[rarity] || { color: "#aaa", bg: "rgba(170,170,170,0.1)" };
                 const title = c.wikipedia_title || "?";
                 const url = c.wikipedia_url || "";
                 // Le site ouvre les cartes de collection dans une popup SANS URL → pas de
@@ -10868,7 +10937,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         }
 
         // Auto-tag des cartes packées selon les recherches enregistrées (non bloquant).
-        autoTagPackedCards(cards).catch(() => {});
+        autoTagPackedCards(cards).catch(() => { });
     }
 
     // Récupération de tags : quand le SITE échoue à poser des tags en LOT
@@ -10878,7 +10947,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // uniques, donc jamais re-traitées → aucune boucle.
     async function recoverFailedTagBatch(bodyStr, status) {
         let rows;
-        try { rows = JSON.parse(bodyStr); } catch(e) { return; }
+        try { rows = JSON.parse(bodyStr); } catch (e) { return; }
         if (!Array.isArray(rows)) return; // requête du bot (objet unique) → on ignore
         const pairs = rows.filter(r => r && r.user_card_id && r.tag_id);
         if (pairs.length === 0) return;
@@ -10931,7 +11000,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (del.ok) { const arr = await del.json().catch(() => []); return { ok: true, count: Array.isArray(arr) ? arr.length : 0, status: del.status }; }
                 const body = await del.text().catch(() => '');
                 return { ok: false, count: 0, status: del.status, body };
-            } catch(e) { return { ok: false, count: 0, status: 0, body: e.message }; }
+            } catch (e) { return { ok: false, count: 0, status: 0, body: e.message }; }
         }
 
         // Diviser-pour-régner : si un lot timeout (500), on le coupe en deux et on réessaie,
@@ -10970,7 +11039,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     return;
                 }
                 rows = await sel.json();
-            } catch(e) { await new Promise(r => setTimeout(r, 1500)); continue; }
+            } catch (e) { await new Promise(r => setTimeout(r, 1500)); continue; }
 
             if (!Array.isArray(rows) || rows.length === 0) break;
             const ids = rows.map(r => r.user_card_id).filter(Boolean);
@@ -10979,7 +11048,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             // 2) supprime ce lot en diviser-pour-régner
             let res;
             try { res = await deleteChunk(ids); }
-            catch(err) { wmLog(`❌ Suppression des liaisons refusée (HTTP ${err.status})${err.body ? ' · ' + String(err.body).slice(0, 160) : ''}`); return; }
+            catch (err) { wmLog(`❌ Suppression des liaisons refusée (HTTP ${err.status})${err.body ? ' · ' + String(err.body).slice(0, 160) : ''}`); return; }
 
             // Serveur OK mais 0 supprimé → RLS bloque la suppression directe
             if (res.rls > 0 && res.deleted === 0 && res.stuck === 0) {
@@ -11023,7 +11092,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     wmLog(`❌ Suppression du tag échouée (HTTP ${del.status})${b ? ' · ' + b.slice(0, 140) : ''}`);
                     return;
                 }
-            } catch(e) {}
+            } catch (e) { }
             await new Promise(r => setTimeout(r, Math.min(1000 * Math.pow(2, attempt), 8000)));
         }
         wmLog(`⚠️ Liaisons nettoyées (${removed}) mais le tag lui-même reste — relance la suppression sur le site, ça devrait passer maintenant.`);
@@ -11053,7 +11122,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             if (!res.ok) return { httpOk: false, status: res.status };
             const data = await res.json().catch(() => null);
             return { httpOk: true, data };
-        } catch(e) { return { httpOk: false, error: e.message }; }
+        } catch (e) { return { httpOk: false, error: e.message }; }
     }
     // Heuristique "l'échange est-il déjà accepté/clôturé ?" — on ratisse large sur les champs
     // de statut plausibles (le shape exact de l'API n'est pas garanti).
@@ -11062,7 +11131,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         const t = data.trade || data.data || data;
         if (!t || typeof t !== 'object') return false;
         const s = String(t.status || t.state || '').toLowerCase();
-        if (['accepted','completed','complete','done','closed','fulfilled','settled','success'].includes(s)) return true;
+        if (['accepted', 'completed', 'complete', 'done', 'closed', 'fulfilled', 'settled', 'success'].includes(s)) return true;
         if (t.accepted_at || t.completed_at || t.closed_at) return true;
         return false;
     }
@@ -11090,7 +11159,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     return;
                 }
             }
-        } catch(e) {}
+        } catch (e) { }
         // 3) La tentative a pu aboutir malgré une réponse en erreur → on revérifie l'état réel.
         const st1 = await fetchTradeState(tradeId);
         if (st1.httpOk && tradeLooksAccepted(st1.data)) {
@@ -11119,7 +11188,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const t = row && (row.wikipedia_title || row.name || row.title);
                 if (t) return t;
             }
-        } catch(e) {}
+        } catch (e) { }
         // 2) Repli : marketplace filtré par card_id
         try {
             const res = await fetch(`${MARKET_API_BASE}?card_id=${cardId}&limit=1`, { credentials: 'include' });
@@ -11129,7 +11198,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const t = a?.card?.wikipedia_title;
                 if (t) return t;
             }
-        } catch(e) {}
+        } catch (e) { }
         return null;
     }
 
@@ -11138,14 +11207,14 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     async function handleWishlistAdd(bodyStr) {
         if (!getSetting('wishlistToKeyword')) return;
         let payload;
-        try { payload = JSON.parse(bodyStr); } catch(e) { return; }
+        try { payload = JSON.parse(bodyStr); } catch (e) { return; }
         const rows = Array.isArray(payload) ? payload : [payload];
         for (const row of rows) {
             const cardId = row && (row.card_id || row.cardId);
             if (!cardId) continue;
             const title = await fetchCardTitleById(cardId);
             if (!title) {
-                wmLog(`⭐ Wishlist : carte <span style="color:#888;font-size:9px;">${String(cardId).slice(0,8)}…</span> ajoutée, mais titre introuvable → mot-clé non ajouté.`);
+                wmLog(`⭐ Wishlist : carte <span style="color:#888;font-size:9px;">${String(cardId).slice(0, 8)}…</span> ajoutée, mais titre introuvable → mot-clé non ajouté.`);
                 continue;
             }
             if (KEYWORDS_ALERT.some(k => k.toLowerCase() === title.toLowerCase())) {
@@ -11193,7 +11262,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 const capture = () => {
                     if (args[1] && typeof args[1].body === 'string') return { body: args[1].body };
                     if (req && typeof req === 'object' && typeof req.clone === 'function') {
-                        try { return { reqClone: req.clone() }; } catch(e) {}
+                        try { return { reqClone: req.clone() }; } catch (e) { }
                     }
                     return null;
                 };
@@ -11214,7 +11283,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     const m = url.match(/\/api\/trades\/([^/?#]+)/i);
                     if (m) tradeAccept = { id: m[1], cap: capture() };
                 }
-            } catch (e) {}
+            } catch (e) { }
 
             const p = origFetch.apply(this, args);
 
@@ -11223,9 +11292,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     if (res && res.ok) {
                         res.clone().json().then(d => {
                             if (d && d.auction_id) _lastUiListingAuctionId = d.auction_id;
-                        }).catch(() => {});
+                        }).catch(() => { });
                     }
-                }).catch(() => {});
+                }).catch(() => { });
             }
 
             if (isManualPackOpen) {
@@ -11236,9 +11305,9 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                                 wmLog(`🖐️ Pack ouvert <b>manuellement</b> — comptabilisé dans les stats`);
                                 handlePackOpened(d, { animate: false });
                             }
-                        }).catch(() => {});
+                        }).catch(() => { });
                     }
-                }).catch(() => {});
+                }).catch(() => { });
             }
 
             if (tagBatch) {
@@ -11249,12 +11318,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         if (res && res.status >= 500) {
                             let bodyStr = tagBatch.body;
                             if (!bodyStr && tagBatch.reqClone) {
-                                try { bodyStr = await tagBatch.reqClone.text(); } catch(e) {}
+                                try { bodyStr = await tagBatch.reqClone.text(); } catch (e) { }
                             }
                             if (bodyStr) recoverFailedTagBatch(bodyStr, res.status);
                         }
-                    } catch(e) {}
-                }).catch(() => {});
+                    } catch (e) { }
+                }).catch(() => { });
             }
 
             if (wishlistAdd) {
@@ -11264,12 +11333,12 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                         if (res && res.ok) {
                             let bodyStr = wishlistAdd.body;
                             if (!bodyStr && wishlistAdd.reqClone) {
-                                try { bodyStr = await wishlistAdd.reqClone.text(); } catch(e) {}
+                                try { bodyStr = await wishlistAdd.reqClone.text(); } catch (e) { }
                             }
                             if (bodyStr) handleWishlistAdd(bodyStr);
                         }
-                    } catch(e) {}
-                }).catch(() => {});
+                    } catch (e) { }
+                }).catch(() => { });
             }
 
             if (tagDeleteId) {
@@ -11278,7 +11347,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // Le garde-fou interne (_tagDeleteRecovering) empêche que notre propre
                     // DELETE final ne relance une reprise → pas de boucle.
                     if (res && res.status >= 500) recoverFailedTagDelete(tagDeleteId);
-                }).catch(() => {});
+                }).catch(() => { });
             }
 
             // Santé : compte les erreurs serveur (429 / 5xx) et réseau sur TOUTES les requêtes.
@@ -11295,13 +11364,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                     // Vérifie que c'était bien une ACCEPTATION (pas un refus/annulation).
                     let bodyStr = tradeAccept.cap && tradeAccept.cap.body;
                     if (!bodyStr && tradeAccept.cap && tradeAccept.cap.reqClone) {
-                        try { bodyStr = await tradeAccept.cap.reqClone.text(); } catch(e) {}
+                        try { bodyStr = await tradeAccept.cap.reqClone.text(); } catch (e) { }
                     }
                     let action = '';
-                    try { action = (JSON.parse(bodyStr || '{}').action || '').toLowerCase(); } catch(e) {}
+                    try { action = (JSON.parse(bodyStr || '{}').action || '').toLowerCase(); } catch (e) { }
                     if (action !== 'accept') return; // on ne rejoue que les acceptations
                     recoverFailedTradeAccept(tradeAccept.id);
-                }).catch(() => {});
+                }).catch(() => { });
             }
 
             return p;
@@ -11312,76 +11381,76 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
     async function loop(revealEl, lastDropEl, rarityEl, alertEl, epoch) {
 
-    // `epoch === packLoopEpoch` : cette boucle est-elle toujours la boucle courante ?
-    // Un stop→start génère un nouvel epoch ; l'ancienne boucle sort ici au lieu de doubler.
-    const isCurrent = () => running && epoch === packLoopEpoch;
-    while (isCurrent()) {
-        try {
-            // Pause propre si le réseau est coupé (évite de spammer des requêtes en échec)
-            if (!navigator.onLine) {
-                await new Promise(r => setTimeout(r, 5000));
-                continue;
-            }
-            const data = await openPack();
-            if (!isCurrent()) break; // stoppé/relancé pendant l'ouverture → on n'enchaîne pas
-
-            // Comptabilisation + affichage + alertes (mutualisé avec les
-            // ouvertures manuelles interceptées, cf. handlePackOpened).
-            await handlePackOpened(data, { animate: true });
-
-            // ✅ Regen
-            if (data.packs_remaining === 0 || data.error) {
-                // Le setting utilisateur est la source de vérité (l'API peut renvoyer
-                // des valeurs liées au prochain slot, pas au cooldown complet)
-                const cdSec = getSetting('packCooldown');
-                const waitMs = cdSec * 1000;
-
-                // Log uniquement au premier passage ou si la valeur a changé
-                if (loop._lastLoggedCd !== cdSec) {
-                    wmLog(`📦 Pack regen : <b>${cdSec}s</b> (${cdSec === 180 ? '3 min, abonné' : cdSec === 600 ? '10 min, non-abonné' : 'custom'})`);
-                    loop._lastLoggedCd = cdSec;
+        // `epoch === packLoopEpoch` : cette boucle est-elle toujours la boucle courante ?
+        // Un stop→start génère un nouvel epoch ; l'ancienne boucle sort ici au lieu de doubler.
+        const isCurrent = () => running && epoch === packLoopEpoch;
+        while (isCurrent()) {
+            try {
+                // Pause propre si le réseau est coupé (évite de spammer des requêtes en échec)
+                if (!navigator.onLine) {
+                    await new Promise(r => setTimeout(r, 5000));
+                    continue;
                 }
+                const data = await openPack();
+                if (!isCurrent()) break; // stoppé/relancé pendant l'ouverture → on n'enchaîne pas
 
-                // Ticker live qui décompte chaque seconde
-                const endTime = Date.now() + waitMs + 2000;
-                const updateAlert = () => {
-                    // PERF : skip si overlay fermé/hidden — l'alert n'est pas visible
-                    if (document.hidden) return;
-                    const overlay = document.getElementById('wm-overlay');
-                    if (!overlay || overlay.style.display === 'none') return;
-                    const remaining = Math.max(0, endTime - Date.now() - 2000);
-                    alertEl.innerHTML = `<span style="color:#888">⏳ Regen dans ${Math.round(remaining/1000)}s…</span>`;
-                };
-                updateAlert();
-                const tickerId = setInterval(updateAlert, 1000);
-                try {
-                    // Attente interruptible : on sort dès que la boucle n'est plus courante
-                    // (stop/restart) → le ticker est nettoyé aussitôt, pas à la fin du cooldown.
-                    while (isCurrent() && Date.now() < endTime) {
-                        await new Promise(r => setTimeout(r, 1000));
+                // Comptabilisation + affichage + alertes (mutualisé avec les
+                // ouvertures manuelles interceptées, cf. handlePackOpened).
+                await handlePackOpened(data, { animate: true });
+
+                // ✅ Regen
+                if (data.packs_remaining === 0 || data.error) {
+                    // Le setting utilisateur est la source de vérité (l'API peut renvoyer
+                    // des valeurs liées au prochain slot, pas au cooldown complet)
+                    const cdSec = getSetting('packCooldown');
+                    const waitMs = cdSec * 1000;
+
+                    // Log uniquement au premier passage ou si la valeur a changé
+                    if (loop._lastLoggedCd !== cdSec) {
+                        wmLog(`📦 Pack regen : <b>${cdSec}s</b> (${cdSec === 180 ? '3 min, abonné' : cdSec === 600 ? '10 min, non-abonné' : 'custom'})`);
+                        loop._lastLoggedCd = cdSec;
                     }
-                } finally {
-                    clearInterval(tickerId);
+
+                    // Ticker live qui décompte chaque seconde
+                    const endTime = Date.now() + waitMs + 2000;
+                    const updateAlert = () => {
+                        // PERF : skip si overlay fermé/hidden — l'alert n'est pas visible
+                        if (document.hidden) return;
+                        const overlay = document.getElementById('wm-overlay');
+                        if (!overlay || overlay.style.display === 'none') return;
+                        const remaining = Math.max(0, endTime - Date.now() - 2000);
+                        alertEl.innerHTML = `<span style="color:#888">⏳ Regen dans ${Math.round(remaining / 1000)}s…</span>`;
+                    };
+                    updateAlert();
+                    const tickerId = setInterval(updateAlert, 1000);
+                    try {
+                        // Attente interruptible : on sort dès que la boucle n'est plus courante
+                        // (stop/restart) → le ticker est nettoyé aussitôt, pas à la fin du cooldown.
+                        while (isCurrent() && Date.now() < endTime) {
+                            await new Promise(r => setTimeout(r, 1000));
+                        }
+                    } finally {
+                        clearInterval(tickerId);
+                    }
+                    if (!isCurrent()) break;
+                    continue;
                 }
-                if (!isCurrent()) break;
-                continue;
-            }
 
-            // ✅ délai humanisé
-            let delay = 1200 + Math.random() * 1800;
-            await sleep(delay);
+                // ✅ délai humanisé
+                let delay = 1200 + Math.random() * 1800;
+                await sleep(delay);
 
-        } catch (err) {
+            } catch (err) {
 
-            if (err.message === "403") {
-                alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — pause 60s</span>`;
-                await sleep(60000);
-            } else {
-                await sleep(5000);
+                if (err.message === "403") {
+                    alertEl.innerHTML = `<span style="color:#EF4444">⛔ 403 — pause 60s</span>`;
+                    await sleep(60000);
+                } else {
+                    await sleep(5000);
+                }
             }
         }
     }
-}
 
     /* ════════ ONBOARDING (première utilisation) ════════ */
 
@@ -11525,10 +11594,10 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
 
         // ── Logique d'ajout/retrait de mots-clés (locale au modal) ──
         let pendingKeywords = [];
-        const kwInput   = document.getElementById('wm-ob-kw-input');
-        const kwAddBtn  = document.getElementById('wm-ob-kw-add');
-        const kwListEl  = document.getElementById('wm-ob-kw-list');
-        const doneBtn   = document.getElementById('wm-ob-done');
+        const kwInput = document.getElementById('wm-ob-kw-input');
+        const kwAddBtn = document.getElementById('wm-ob-kw-add');
+        const kwListEl = document.getElementById('wm-ob-kw-list');
+        const doneBtn = document.getElementById('wm-ob-done');
 
         function renderKwList() {
             kwListEl.innerHTML = pendingKeywords.map((kw, i) =>
@@ -11568,11 +11637,11 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         // ── Sélection / création de tag ──
         // tagChoice : { mode: 'existing'|'new'|'skip', name, id }
         let tagChoice = { mode: 'skip', name: '', id: null };
-        const tagSelect    = document.getElementById('wm-ob-tag-select');
+        const tagSelect = document.getElementById('wm-ob-tag-select');
         const tagCreateRow = document.getElementById('wm-ob-tag-create-row');
-        const tagInput     = document.getElementById('wm-ob-tag');
+        const tagInput = document.getElementById('wm-ob-tag');
         const tagCreateBtn = document.getElementById('wm-ob-tag-create');
-        const tagStatusEl  = document.getElementById('wm-ob-tag-status');
+        const tagStatusEl = document.getElementById('wm-ob-tag-status');
 
         // Charge les tags existants du compte et remplit le menu déroulant
         (async () => {
@@ -11626,7 +11695,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
             tagCreateBtn.disabled = false;
             if (result.ok) {
                 tagChoice = { mode: 'existing', name, id: result.id || null };
-                if (result.id) { TRASH_TAG_ID = result.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, result.id); } catch(e) {} }
+                if (result.id) { TRASH_TAG_ID = result.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, result.id); } catch (e) { } }
                 tagStatusEl.innerHTML = result.alreadyExists
                     ? `<span style="color:#fbbf24;">⚠️ Le tag "<b>${name}</b>" existait déjà — on l'utilisera.</span>`
                     : `<span style="color:#4ade80;">✅ Tag "<b>${name}</b>" créé et sélectionné !</span>`;
@@ -11663,13 +11732,13 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 });
                 localStorage.setItem(KEYWORDS_STORAGE_KEY, JSON.stringify(merged));
                 KEYWORDS_ALERT = merged;
-            } catch(e) {}
+            } catch (e) { }
 
             // 3) Tag : selon le choix (existant sélectionné, créé, ou passé)
             let tagSummary = '';
             if (tagChoice.mode === 'existing' && tagChoice.name) {
                 setSetting('sellTagName', tagChoice.name);
-                if (tagChoice.id) { TRASH_TAG_ID = tagChoice.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, tagChoice.id); } catch(e) {} }
+                if (tagChoice.id) { TRASH_TAG_ID = tagChoice.id; try { localStorage.setItem(TRASH_TAG_CACHE_KEY, tagChoice.id); } catch (e) { } }
                 tagSummary = ` · tag <b>${tagChoice.name}</b>`;
             }
             // mode 'new' non créé ou 'skip' → on ne touche pas au réglage tag
@@ -11696,27 +11765,41 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         overlay.classList.add('open'); // le tuto pointe des éléments du dashboard
 
         const steps = [
-            { el: () => document.getElementById('wm-start-btn') && document.getElementById('wm-start-btn').closest('.wm-panel'),
-              title: '📦 Pack Opener',
-              text: "Ouvre tes packs en boucle, tout seul. Il repère les cartes qui matchent tes mots-clés (alerte + son), tient les stats (raretés, drops, sessions) et respecte le cooldown de ton compte. Le bouton <b>▶ START</b> le lance." },
-            { el: () => document.getElementById('wm-market-btn') && document.getElementById('wm-market-btn').closest('.wm-panel'),
-              title: '🛒 Market Watcher',
-              text: "Surveille le marché en continu. Tu définis des mots-clés : <b>Standards</b> (alerte), <b>⭐ Prioritaires</b> (auto-bid), <b>🕵️ Fourbe</b> (snipe pile en fin d'enchère), <b>🚫 Exclus</b>. Il peut miser et riposter tout seul, avec un plafond par carte. Le <b>⚡ Hunter</b> mise sur tout ce qui passe sous ton seuil ; la case <b>🕵️ mode fourbe</b> juste en dessous change sa façon de miser : plus de mise immédiate, snipe en fin d'enchère plafonné à ce même seuil. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce, densité max) et <b>🖼 Cadres</b> (grille avec l'image de la carte et un bouton Miser sous chacune). Le bouton <b>🔭</b> sur chaque annonce (Détaillé/Cadres) compare les vues Wikipédia réelles du mois dernier au cache de WikiMasters — utile pour repérer une carte dont la rareté est sur le point de changer avant que le site ne s'en aperçoive." },
-            { el: () => document.getElementById('wm-trash-btn') && document.getElementById('wm-trash-btn').closest('.wm-panel'),
-              title: '🏷️ Trash Seller',
-              text: "Met en vente automatiquement toutes les cartes que tu as taguées (« Trash » par défaut). Tu choisis le prix (par rareté ou au prix moyen du marché) et quelles cartes prioriser. Le bouton <b>🔄 Refresh ventes</b> renouvelle les annonces." },
-            { el: () => document.getElementById('wm-master-btn'),
-              title: '🚀 Tout démarrer',
-              text: "Lance (ou arrête) les 3 modules d'un seul clic." },
-            { el: () => document.getElementById('wm-settings-hdr'),
-              title: '⚙️ Paramètres',
-              text: "Tout se règle ici : notifications & <b>sauvegardes Discord</b>, sons, prix de vente & stratégie de sélection, <b>horaires programmés</b>, alerte volume de packs… Rien n'est définitif, tu ajustes quand tu veux." },
-            { el: () => document.getElementById('wm-stats-hdr'),
-              title: '📊 Statistiques',
-              text: "Ton bilan complet : ventes (taux, gains par rareté), packs ouverts et taux de drop, cartes invendues récurrentes, et l'historique de tes dernières sessions (packs, ventes, achats, net). Les <b>historiques de ventes et d'achats</b> sont archivés en local : ils vont au-delà de la fenêtre glissante du site, qui oublie les plus anciens." },
-            { el: () => document.getElementById('wm-tagger-hdr'),
-              title: '🏷️ Étiquetage en masse',
-              text: "Applique une étiquette à toutes les cartes qui matchent un mot, en un clic. Tu peux <b>enregistrer des recherches en présets</b> (ex. « japon » → tag « Japon »), les ranger par catégorie, et tout relancer d'un coup — pratique pour retaguer tes nouvelles cartes après chaque ouverture. Le bouton <b>🃏×2 Repérer les doublons</b> liste d'un coup toutes les cartes possédées en 2 exemplaires ou plus, prêtes à taguer « Doublon »." },
+            {
+                el: () => document.getElementById('wm-start-btn') && document.getElementById('wm-start-btn').closest('.wm-panel'),
+                title: '📦 Pack Opener',
+                text: "Ouvre tes packs en boucle, tout seul. Il repère les cartes qui matchent tes mots-clés (alerte + son), tient les stats (raretés, drops, sessions) et respecte le cooldown de ton compte. Le bouton <b>▶ START</b> le lance."
+            },
+            {
+                el: () => document.getElementById('wm-market-btn') && document.getElementById('wm-market-btn').closest('.wm-panel'),
+                title: '🛒 Market Watcher',
+                text: "Surveille le marché en continu. Tu définis des mots-clés : <b>Standards</b> (alerte), <b>⭐ Prioritaires</b> (auto-bid), <b>🕵️ Fourbe</b> (snipe pile en fin d'enchère), <b>🚫 Exclus</b>. Il peut miser et riposter tout seul, avec un plafond par carte. Le <b>⚡ Hunter</b> mise sur tout ce qui passe sous ton seuil ; la case <b>🕵️ mode fourbe</b> juste en dessous change sa façon de miser : plus de mise immédiate, snipe en fin d'enchère plafonné à ce même seuil. Le sélecteur de <b>vue</b> (à côté du tri) bascule entre <b>▤ Détaillé</b> (tous les contrôles), <b>☰ Compact</b> (une ligne par annonce, densité max) et <b>🖼 Cadres</b> (grille avec l'image de la carte et un bouton Miser sous chacune). Le bouton <b>🔭</b> sur chaque annonce (Détaillé/Cadres) compare les vues Wikipédia réelles du mois dernier au cache de WikiMasters — utile pour repérer une carte dont la rareté est sur le point de changer avant que le site ne s'en aperçoive."
+            },
+            {
+                el: () => document.getElementById('wm-trash-btn') && document.getElementById('wm-trash-btn').closest('.wm-panel'),
+                title: '🏷️ Trash Seller',
+                text: "Met en vente automatiquement toutes les cartes que tu as taguées (« Trash » par défaut). Tu choisis le prix (par rareté ou au prix moyen du marché) et quelles cartes prioriser. Le bouton <b>🔄 Refresh ventes</b> renouvelle les annonces."
+            },
+            {
+                el: () => document.getElementById('wm-master-btn'),
+                title: '🚀 Tout démarrer',
+                text: "Lance (ou arrête) les 3 modules d'un seul clic."
+            },
+            {
+                el: () => document.getElementById('wm-settings-hdr'),
+                title: '⚙️ Paramètres',
+                text: "Tout se règle ici : notifications & <b>sauvegardes Discord</b>, sons, prix de vente & stratégie de sélection, <b>horaires programmés</b>, alerte volume de packs… Rien n'est définitif, tu ajustes quand tu veux."
+            },
+            {
+                el: () => document.getElementById('wm-stats-hdr'),
+                title: '📊 Statistiques',
+                text: "Ton bilan complet : ventes (taux, gains par rareté), packs ouverts et taux de drop, cartes invendues récurrentes, et l'historique de tes dernières sessions (packs, ventes, achats, net). Les <b>historiques de ventes et d'achats</b> sont archivés en local : ils vont au-delà de la fenêtre glissante du site, qui oublie les plus anciens."
+            },
+            {
+                el: () => document.getElementById('wm-tagger-hdr'),
+                title: '🏷️ Étiquetage en masse',
+                text: "Applique une étiquette à toutes les cartes qui matchent un mot, en un clic. Tu peux <b>enregistrer des recherches en présets</b> (ex. « japon » → tag « Japon »), les ranger par catégorie, et tout relancer d'un coup — pratique pour retaguer tes nouvelles cartes après chaque ouverture. Le bouton <b>🃏×2 Repérer les doublons</b> liste d'un coup toutes les cartes possédées en 2 exemplaires ou plus, prêtes à taguer « Doublon »."
+            },
         ];
 
         let idx = 0;
@@ -11733,7 +11816,7 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
         document.body.appendChild(root);
 
         function end() {
-            try { localStorage.setItem(TOUR_DONE_KEY, '1'); } catch(e) {}
+            try { localStorage.setItem(TOUR_DONE_KEY, '1'); } catch (e) { }
             window.removeEventListener('resize', onResize);
             root.remove();
         }
@@ -11793,19 +11876,19 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
                 if (idx < steps.length - 1) { idx++; render(); return; }
                 end(); return;
             }
-            try { target.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch(e) {}
+            try { target.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch (e) { }
             setTimeout(() => { const t = step.el(); if (t) positionTo(t, step); }, 280);
         }
 
         render();
     }
     // Rejouer le tour à la demande (bouton Paramètres / console).
-    window.wmStartTour = function() { startFeatureTour(true); };
+    window.wmStartTour = function () { startFeatureTour(true); };
 
     // Helper console pour forcer l'affichage du modal d'onboarding sans toucher
     // au reste du localStorage. Utile pour démo ou re-tester.
     // Usage : wmShowOnboarding()
-    window.wmShowOnboarding = function() {
+    window.wmShowOnboarding = function () {
         localStorage.removeItem(ONBOARDING_DONE_KEY);
         const existing = document.getElementById('wm-onboarding');
         if (existing) existing.remove();
@@ -11842,16 +11925,16 @@ function sendToDiscord(text, color = 5814783, category = 'general') {
     // plusieurs fois ne crée aucun doublon.
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden') {
-            try { finalizeSession(); } catch(e) {}
+            try { finalizeSession(); } catch (e) { }
         }
     });
     window.addEventListener('pagehide', () => {
-        try { finalizeSession(); } catch(e) {}
+        try { finalizeSession(); } catch (e) { }
     });
     window.addEventListener('beforeunload', () => {
-        try { finalizeSession(); } catch(e) {}
+        try { finalizeSession(); } catch (e) { }
         // Backup best-effort à la fermeture (si le backup périodique est activé)
-        try { if (window.wmBackupBeacon) window.wmBackupBeacon(); } catch(e) {}
+        try { if (window.wmBackupBeacon) window.wmBackupBeacon(); } catch (e) { }
     });
 
     /* ════════ DÉTECTION DE COUPURE RÉSEAU ════════ */
