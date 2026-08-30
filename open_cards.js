@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.2';
+    const WM_VERSION = '2.2.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -106,6 +106,12 @@
        - Les Exclus restent un garde-fou commun aux deux sources. */
     const GLOBAL_SEARCH_RARITIES_KEY = 'wm_global_search_rarities_v1';
     const HUNTER_DYNAMIC_SOURCE_KEY = 'wm_hunter_dynamic_source_v1';
+
+    // Fenêtre d'entrée du Hunter : aucune première mise automatique si l'enchère
+    // expire dans plus de 5 minutes. Une fois entrée dans l'enchère, l'auto-bid
+    // déjà armé continue normalement jusqu'à son plafond, même si end_at remonte
+    // ensuite à cause d'une extension serveur après un bid tardif.
+    const HUNTER_AUTOBID_ENTRY_MAX_MS = 5 * 60 * 1000;
     const GLOBAL_SEARCH_RARITY_CODES = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
 
     let GLOBAL_SEARCH_RARITIES = new Set();
@@ -3239,6 +3245,29 @@
              */
             if (
                 autoBidSet.has(a.id)
+            ) {
+                continue;
+            }
+
+
+            /* =========================================================
+               FENÊTRE D'ENTRÉE HUNTER : MAX 5 MINUTES
+
+               On n'immobilise pas de Wikibidous trop tôt. Cette règle
+               ne concerne que la PREMIÈRE mise automatique du Hunter.
+               Une enchère déjà armée dans autoBidSet continue ensuite
+               d'être gérée normalement par la Hot Lane jusqu'au plafond.
+               ========================================================= */
+            const hunterEndTs =
+                new Date(a.end_at).getTime();
+
+            const hunterRemainingMs =
+                hunterEndTs - serverNow();
+
+            if (
+                !Number.isFinite(hunterEndTs) ||
+                hunterRemainingMs <= 0 ||
+                hunterRemainingMs > HUNTER_AUTOBID_ENTRY_MAX_MS
             ) {
                 continue;
             }
@@ -16002,7 +16031,7 @@
         `📚 Historique local v2.2 prêt · ` +
         `<b>${localMarketHistory.length}</b> ` +
         `vente(s) conservée(s) · ` +
-        `collecte Standards + Recherche globale · stats séparées par rareté.`
+        `collecte Standards + Recherche globale · stats séparées par rareté · entrée Hunter ≤5 min.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
