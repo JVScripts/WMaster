@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.0';
+    const WM_VERSION = '2.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2970,47 +2970,455 @@
     // Mutualisé entre le scan (nouvelles annonces) ET l'activation du Hunter (annonces déjà
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
     async function runHunterAutoBidPass(list) {
-        if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
-        if (hunterAggressive) return runHunterFourbePass(list); // pas de mise : on arme le snipe
-        let placed = 0;
-        for (const a of list) {
-            if (!a || !a.id) continue;
-            if (matchedHunterEntry(a.card)) continue;                       // géré par le Chasseur ciblé
-            if (hasPriorityKeyword(a.card)) continue;                       // géré par la boucle prioritaire
-            if (snipeSet.has(a.id) || hasFourbeKeyword(a.card)) continue;   // fourbe → snipe en fin
-            const alreadyLeading = isSelf(a.current_bidder?.username);
-            const alreadyOwned = (collectionMap.get(a.card?.id) || 0) > 0;
-            const decision = shouldAutoSnipe(a);
-            if (!(decision.snipe && !alreadyLeading && !alreadyOwned && wikibidousBalance > getSetting('minBalanceForAutoSnipe'))) continue;
-            if (bidLockSet.has(a.id)) continue; // la hot lane / une autre passe bid déjà dessus
-            bidLockSet.add(a.id);
-            await new Promise(r => setTimeout(r, bidDelayMs(a)));
-            const bidAmount = minNextBid(a);
-            try {
-                const res = await fetch(
-                    `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                    {
-                        method: "POST", credentials: "include",
-                        headers: { "Content-Type": "application/json" },
-                        body: JSON.stringify({ amount: bidAmount })
-                    }
-                );
-                const data = await res.json().catch(() => ({}));
-                const title = a.card?.wikipedia_title || "?";
-                const rar = (a.card?.rarity || '').toUpperCase();
-                if (res.ok) {
-                    markAuctionAsMine(a.id, bidAmount, a);
-                    placed++;
-                    const reasonStr = decision.reason ? ` <span style="color:#666;font-size:9px;">(${decision.reason})</span>` : '';
-                    wmLog(`🤖 Hunter : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>${reasonStr}`);
-                    sendToDiscord("🤖 Auto-bid place : **" + title + "** a **" + bidAmount + " coins**", 5763719, 'market');
-                } else {
-                    wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${data?.error || 'erreur'}`);
-                    sendToDiscord("⚠️ Auto-bid echoue : **" + title + "** - " + (data?.error || "erreur inconnue"), 15548997, 'market');
-                }
-            } catch (e) { } finally { bidLockSet.delete(a.id); }
-            await new Promise(r => setTimeout(r, bidDelayMs(a)));
+
+        if (
+            !autoSnipeEnabled ||
+            !Array.isArray(list)
+        ) {
+            return 0;
         }
+
+
+        /*
+         * Hunter agressif :
+         * comportement Fourbe existant.
+         *
+         * Pas de mise immédiate.
+         */
+        if (hunterAggressive) {
+            return runHunterFourbePass(list);
+        }
+
+
+        let placed = 0;
+
+
+        for (const a of list) {
+
+            if (
+                !a ||
+                !a.id
+            ) {
+                continue;
+            }
+
+
+            /*
+             * Les mécanismes spécialisés restent prioritaires.
+             */
+            if (
+                matchedHunterEntry(a.card)
+            ) {
+                continue;
+            }
+
+
+            if (
+                hasPriorityKeyword(a.card)
+            ) {
+                continue;
+            }
+
+
+            if (
+                snipeSet.has(a.id) ||
+                hasFourbeKeyword(a.card)
+            ) {
+                continue;
+            }
+
+
+            const alreadyLeading =
+                iAmLeading(a);
+
+
+            const alreadyOwned =
+                (
+                    collectionMap.get(
+                        a.card?.id
+                    )
+                    ||
+                    0
+                ) > 0;
+
+
+            if (
+                alreadyLeading ||
+                alreadyOwned
+            ) {
+                continue;
+            }
+
+
+            /*
+             * Si cette enchère possède déjà un auto-bid,
+             * on ne vient pas écraser son plafond.
+             *
+             * Elle est déjà prise en charge par la Hot Lane.
+             */
+            if (
+                autoBidSet.has(a.id)
+            ) {
+                continue;
+            }
+
+
+            /* =========================================================
+               DÉCISION HUNTER
+               ========================================================= */
+
+            const decision =
+                shouldAutoSnipe(a);
+
+
+            if (
+                !decision.snipe
+            ) {
+                continue;
+            }
+
+
+            if (
+                wikibidousBalance <=
+                getSetting(
+                    'minBalanceForAutoSnipe'
+                )
+            ) {
+                continue;
+            }
+
+
+            /*
+             * La toute première mise est TOUJOURS
+             * la mise minimale suivante.
+             *
+             * Jamais directement 85 % de la médiane.
+             */
+            const bidAmount =
+                minNextBid(a);
+
+
+            const mode =
+                getSetting(
+                    'autoSnipeMode'
+                );
+
+
+            const isDynamic =
+                mode === 'adaptive';
+
+
+            /* =========================================================
+               HUNTER DYNAMIQUE :
+               le seuil 85 % devient un PLAFOND
+               ========================================================= */
+
+            if (isDynamic) {
+
+                const cap =
+                    Number(
+                        decision.cap
+                    );
+
+
+                /*
+                 * Sécurité :
+                 *
+                 * même si le prix courant est encore sous 85 %,
+                 * l'incrément minimum demandé par WikiMasters peut
+                 * directement dépasser le plafond.
+                 *
+                 * Exemple :
+                 *
+                 * médiane 1000
+                 * plafond 850
+                 * prix courant 840
+                 * prochaine mise 924
+                 *
+                 * → on ne mise PAS.
+                 */
+                if (
+                    !Number.isFinite(cap) ||
+                    cap <= 0 ||
+                    bidAmount > cap
+                ) {
+
+                    const title =
+                        a.card
+                            ?.wikipedia_title
+                        ||
+                        '?';
+
+
+                    const rar =
+                        (
+                            a.card
+                                ?.rarity
+                            ||
+                            ''
+                        )
+                            .toUpperCase();
+
+
+                    wmLog(
+                        `🛑 Hunter dynamique : ` +
+                        `<b>${title}</b> [${rar}] · ` +
+                        `mise minimale ` +
+                        `<b>${bidAmount} 💰</b> ` +
+                        `> plafond ` +
+                        `<b>${cap || '?'} 💰</b> ` +
+                        `→ aucune mise`
+                    );
+
+
+                    continue;
+                }
+            }
+
+
+            if (
+                bidLockSet.has(a.id)
+            ) {
+                continue;
+            }
+
+
+            bidLockSet.add(
+                a.id
+            );
+
+
+            await new Promise(
+                r =>
+                    setTimeout(
+                        r,
+                        bidDelayMs(a)
+                    )
+            );
+
+
+            try {
+
+                const res =
+                    await fetch(
+                        `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
+                        {
+                            method:
+                                "POST",
+
+                            credentials:
+                                "include",
+
+                            headers: {
+                                "Content-Type":
+                                    "application/json"
+                            },
+
+                            body:
+                                JSON.stringify({
+                                    amount:
+                                        bidAmount
+                                })
+                        }
+                    );
+
+
+                const data =
+                    await res
+                        .json()
+                        .catch(
+                            () => ({})
+                        );
+
+
+                const title =
+                    a.card
+                        ?.wikipedia_title
+                    ||
+                    "?";
+
+
+                const rar =
+                    (
+                        a.card
+                            ?.rarity
+                        ||
+                        ''
+                    )
+                        .toUpperCase();
+
+
+                /* =====================================================
+                   MISE INITIALE RÉUSSIE
+                   ===================================================== */
+
+                if (res.ok) {
+
+
+                    /*
+                     * IMPORTANT :
+                     *
+                     * En mode dynamique, APRÈS la première mise réussie,
+                     * on transforme l'enchère en auto-bid plafonné.
+                     */
+                    if (isDynamic) {
+
+                        /*
+                         * Plafond exact calculé depuis :
+                         *
+                         * médiane × autoSnipeAdaptiveRatio
+                         *
+                         * typiquement 85 %.
+                         */
+                        setAutoBidMax(
+                            a.id,
+                            decision.cap
+                        );
+
+
+                        /*
+                         * Active les ripostes automatiques.
+                         */
+                        autoBidSet.add(
+                            a.id
+                        );
+
+
+                        saveAutoBidSet();
+                    }
+
+
+                    /*
+                     * Doit être appelé APRÈS l'armement :
+                     *
+                     * markAuctionAsMine() réveille la Hot Lane,
+                     * qui verra donc immédiatement que cette
+                     * enchère possède maintenant un auto-bid.
+                     */
+                    markAuctionAsMine(
+                        a.id,
+                        bidAmount,
+                        a
+                    );
+
+
+                    placed++;
+
+
+                    if (isDynamic) {
+
+                        wmLog(
+                            `🤖 Hunter dynamique : ` +
+                            `<b>${title}</b> [${rar}] → ` +
+                            `<span style="color:#fbbf24;">` +
+                            `${bidAmount} 💰` +
+                            `</span>` +
+                            ` · médiane ` +
+                            `<b>${decision.reason.match(/\((\d+)\)/)?.[1] || '?'}</b>` +
+                            ` · auto-bid armé jusqu'à ` +
+                            `<span style="color:#4ade80;font-weight:700;">` +
+                            `${decision.cap} 💰` +
+                            `</span>`
+                        );
+
+
+                        sendToDiscord(
+                            "🤖 Hunter dynamique : **" +
+                            title +
+                            "** → mise **" +
+                            bidAmount +
+                            " 💰** · auto-bid jusqu'à **" +
+                            decision.cap +
+                            " 💰**",
+                            5763719,
+                            'market'
+                        );
+
+                    } else {
+
+                        /*
+                         * Mode fixe :
+                         * comportement précédent conservé.
+                         */
+                        const reasonStr =
+                            decision.reason
+                                ?
+                                ` <span style="color:#666;font-size:9px;">` +
+                                `(${decision.reason})` +
+                                `</span>`
+                                :
+                                '';
+
+
+                        wmLog(
+                            `🤖 Hunter : ` +
+                            `<b>${title}</b> [${rar}] → ` +
+                            `<span style="color:#fbbf24;">` +
+                            `${bidAmount} 💰` +
+                            `</span>` +
+                            reasonStr
+                        );
+
+
+                        sendToDiscord(
+                            "🤖 Auto-bid place : **" +
+                            title +
+                            "** a **" +
+                            bidAmount +
+                            " coins**",
+                            5763719,
+                            'market'
+                        );
+                    }
+
+
+                } else {
+
+                    wmLog(
+                        `⚠️ Hunter échoué : ` +
+                        `<b>${title}</b> [${rar}] · ` +
+                        `${data?.error || 'erreur'}`
+                    );
+
+
+                    sendToDiscord(
+                        "⚠️ Auto-bid echoue : **" +
+                        title +
+                        "** - " +
+                        (
+                            data?.error
+                            ||
+                            "erreur inconnue"
+                        ),
+                        15548997,
+                        'market'
+                    );
+                }
+
+
+            } catch (e) {
+
+                // La mise initiale a échoué :
+                // aucun auto-bid n'est armé.
+
+            } finally {
+
+                bidLockSet.delete(
+                    a.id
+                );
+            }
+
+
+            await new Promise(
+                r =>
+                    setTimeout(
+                        r,
+                        bidDelayMs(a)
+                    )
+            );
+        }
+
+
         return placed;
     }
 
