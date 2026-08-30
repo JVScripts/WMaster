@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.1';
+    const WM_VERSION = '2.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -93,6 +93,144 @@
         R: { color: "#A855F7", bg: "rgba(168,85,247,0.15)", label: "R" },
         PC: { color: "#3B82F6", bg: "rgba(59,130,246,0.15)", label: "PC" },
         C: { color: "#22C55E", bg: "rgba(34,197,94,0.15)", label: "C" },
+    };
+
+
+    /* ══════════ RECHERCHE GLOBALE + SOURCE HUNTER DYNAMIQUE (v2.2) ══════════
+       - Recherche globale : UNIQUEMENT un filtre de rareté, totalement indépendant des
+         mots-clés Standards / Prioritaires / Fourbe / Chasseur ciblé.
+       - Hunter dynamique : l'utilisateur choisit sa source : Standards, Recherche globale,
+         ou union des deux.
+       - Historique local : collecte l'union Standards + Recherche globale afin qu'un changement
+         de source Hunter ne fasse pas repartir les statistiques de zéro.
+       - Les Exclus restent un garde-fou commun aux deux sources. */
+    const GLOBAL_SEARCH_RARITIES_KEY = 'wm_global_search_rarities_v1';
+    const HUNTER_DYNAMIC_SOURCE_KEY = 'wm_hunter_dynamic_source_v1';
+    const GLOBAL_SEARCH_RARITY_CODES = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+
+    let GLOBAL_SEARCH_RARITIES = new Set();
+    try {
+        const raw = JSON.parse(localStorage.getItem(GLOBAL_SEARCH_RARITIES_KEY) || '[]');
+        if (Array.isArray(raw)) {
+            GLOBAL_SEARCH_RARITIES = new Set(
+                raw.map(r => String(r || '').toUpperCase())
+                    .filter(r => GLOBAL_SEARCH_RARITY_CODES.includes(r))
+            );
+        }
+    } catch (e) { GLOBAL_SEARCH_RARITIES = new Set(); }
+
+    // Migration sûre : Standards par défaut = comportement historique du Hunter avant v2.2.
+    let hunterDynamicSource = localStorage.getItem(HUNTER_DYNAMIC_SOURCE_KEY) || 'standards';
+    if (!['standards', 'global', 'both'].includes(hunterDynamicSource)) hunterDynamicSource = 'standards';
+
+    function saveGlobalSearchRarities() {
+        try {
+            localStorage.setItem(GLOBAL_SEARCH_RARITIES_KEY, JSON.stringify([...GLOBAL_SEARCH_RARITIES]));
+        } catch (e) { }
+    }
+
+    function saveHunterDynamicSource() {
+        try { localStorage.setItem(HUNTER_DYNAMIC_SOURCE_KEY, hunterDynamicSource); } catch (e) { }
+    }
+
+    function globalAuctionRarity(auction) {
+        return String(
+            auction?.snapshot_rarity ||
+            auction?.card?.rarity ||
+            auction?.rarity ||
+            ''
+        ).trim().toUpperCase();
+    }
+
+    // Recherche globale = rareté cochée, RIEN D'AUTRE. Les Standards n'interviennent jamais ici.
+    function globalSearchMatchesAuction(auction) {
+        if (!auction || GLOBAL_SEARCH_RARITIES.size === 0) return false;
+        const rarity = globalAuctionRarity(auction);
+        if (!rarity || !GLOBAL_SEARCH_RARITIES.has(rarity)) return false;
+        const card = auction.card || auction;
+        return !hasExcludedWord(card); // Exclus = garde-fou commun, pas un filtre Standard.
+    }
+
+    // Source Standards = KEYWORDS_ALERT uniquement. Prioritaires/Fourbe/Chasseur ciblé sont exclus
+    // de cette définition (ils disposent déjà de leur propre logique d'action).
+    function standardSearchMatchesAuction(auction) {
+        if (!auction) return false;
+        const card = auction.card || auction;
+        return !!card && hasKeyword(card, false) && !hasExcludedWord(card);
+    }
+
+    function hunterDynamicMatchesSource(auction, standardMatch) {
+        const isStandard = (typeof standardMatch === 'boolean')
+            ? standardMatch
+            : standardSearchMatchesAuction(auction);
+        const isGlobal = globalSearchMatchesAuction(auction);
+
+        if (hunterDynamicSource === 'global') return isGlobal;
+        if (hunterDynamicSource === 'both') return isStandard || isGlobal;
+        return isStandard;
+    }
+
+    function getHunterDynamicCandidatePool(list) {
+        if (!Array.isArray(list) || list.length === 0) return [];
+        return list.filter(a => hunterDynamicMatchesSource(a));
+    }
+
+    function localHistoryShouldObserve(auction) {
+        return globalSearchMatchesAuction(auction) || standardSearchMatchesAuction(auction);
+    }
+
+    function hunterDynamicSourceLabel(short = false) {
+        if (hunterDynamicSource === 'global') return short ? 'Global' : 'Recherche globale';
+        if (hunterDynamicSource === 'both') return short ? 'Global+Standards' : 'Standards + Recherche globale';
+        return 'Standards';
+    }
+
+    function rerunDynamicHunterOnCurrentPool() {
+        try {
+            paintHunterAggro();
+            if (!autoSnipeEnabled || getSetting('autoSnipeMode') !== 'adaptive') return;
+            if (!Array.isArray(lastAllMarketAuctions) || lastAllMarketAuctions.length === 0) return;
+            const pool = getHunterDynamicCandidatePool(lastAllMarketAuctions);
+            if (pool.length > 0) runHunterAutoBidPass(pool).catch(() => { });
+        } catch (e) { }
+    }
+
+    window.wmToggleGlobalRarity = function (rarity, checked) {
+        const r = String(rarity || '').trim().toUpperCase();
+        if (!GLOBAL_SEARCH_RARITY_CODES.includes(r)) return;
+        if (checked) GLOBAL_SEARCH_RARITIES.add(r);
+        else GLOBAL_SEARCH_RARITIES.delete(r);
+        saveGlobalSearchRarities();
+        renderKeywordsPanel();
+        wmLog(GLOBAL_SEARCH_RARITIES.size
+            ? `🌐 Recherche globale : <b>${[...GLOBAL_SEARCH_RARITIES].join(', ')}</b>`
+            : '🌐 Recherche globale désactivée (aucune rareté cochée).');
+        rerunDynamicHunterOnCurrentPool();
+    };
+
+    window.wmGlobalRarityAll = function () {
+        GLOBAL_SEARCH_RARITIES = new Set(GLOBAL_SEARCH_RARITY_CODES);
+        saveGlobalSearchRarities();
+        renderKeywordsPanel();
+        wmLog('🌐 Recherche globale : toutes les raretés activées.');
+        rerunDynamicHunterOnCurrentPool();
+    };
+
+    window.wmGlobalRarityNone = function () {
+        GLOBAL_SEARCH_RARITIES.clear();
+        saveGlobalSearchRarities();
+        renderKeywordsPanel();
+        wmLog('🌐 Recherche globale désactivée.');
+    };
+
+    window.wmSetHunterDynamicSource = function (source) {
+        if (!['standards', 'global', 'both'].includes(source)) return;
+        hunterDynamicSource = source;
+        saveHunterDynamicSource();
+        renderKeywordsPanel();
+        paintHunterAggro();
+        wmLog(`⚡ Hunter dynamique : source → <b>${hunterDynamicSourceLabel()}</b>. Les enchères déjà engagées restent protégées par leur plafond actuel.`);
+        rerunDynamicHunterOnCurrentPool();
     };
 
     /* ===================== STATE ===================== */
@@ -655,6 +793,7 @@
     }
     const RARITY_ORDER = { L: 5, UR: 4, SR: 3, R: 2, PC: 1, C: 0 };
     let lastHitsCache = []; // cache pour re-render sans attendre le prochain scan
+    let lastAllMarketAuctions = []; // scan complet : source Recherche globale / Hunter dynamique v2.2
 
     /* ═══════ HISTORIQUE DES VENTES & VALORISATION ═══════ */
     // Cache localStorage des ventes passées par carte : card_id → { median, count, fetchedAt }
@@ -835,13 +974,16 @@
 
         if (mode === 'adaptive') {
             const cardId = auction.card?.id ?? auction.card_id;
-            const entry = getCachedSales(cardId);
+            const rarity = globalAuctionRarity(auction);
+            // En non-PRO, getCachedSales(cardId, rarity) lit l'historique local de CETTE rareté.
+            // Une SR historique ne peut donc jamais fausser la médiane d'une UR/L revalorisée.
+            const entry = getCachedSales(cardId, rarity);
 
-            // 0, 1 ou 2 ventes = on ne mise PAS
+            // 0, 1 ou 2 ventes = on ne mise PAS.
             if (!entry || entry.count < 3 || entry.median <= 0) {
                 return {
                     snipe: false,
-                    reason: 'historique insuffisant',
+                    reason: `historique insuffisant${rarity ? ` (${rarity})` : ''}`,
                     cap: 0
                 };
             }
@@ -1366,6 +1508,19 @@
             </span>`;
         }).join('');
 
+        const globalRarityChecks = GLOBAL_SEARCH_RARITY_CODES.map(rarity => {
+            const checked = GLOBAL_SEARCH_RARITIES.has(rarity);
+            const color = (RARITY[rarity] || {}).color || '#aaa';
+            return `<label style="display:inline-flex;align-items:center;gap:4px;padding:3px 7px;border-radius:5px;
+                border:1px solid ${checked ? color + '88' : 'rgba(255,255,255,0.12)'};
+                background:${checked ? color + '18' : 'rgba(255,255,255,0.03)'};
+                color:${checked ? color : '#666'};font-size:10px;font-weight:700;cursor:pointer;user-select:none;">
+                <input type="checkbox" ${checked ? 'checked' : ''}
+                    onchange="window.wmToggleGlobalRarity('${rarity}', this.checked)"
+                    style="width:12px;height:12px;margin:0;cursor:pointer;accent-color:${color};">${rarity}
+            </label>`;
+        }).join('');
+
         el.innerHTML = `
             <div style="font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">⭐ Prioritaires <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(auto-bid forcé)</span></div>
             <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${priorityTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
@@ -1431,6 +1586,35 @@
                 <button onclick="const i=document.getElementById('wm-kw-input');window.wmAddKeyword(i.value);i.value='';"
                     style="padding:3px 10px;border-radius:4px;border:1px solid rgba(6,182,212,0.3);
                     background:rgba(6,182,212,0.1);color:#06b6d4;font-size:13px;cursor:pointer;font-weight:700;">+</button>
+            </div>
+            <div style="margin:2px 0 10px;padding:8px;border-radius:6px;border:1px solid rgba(34,211,238,0.18);background:rgba(34,211,238,0.035);">
+                <div style="font-size:9px;color:#22d3ee;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;">
+                    🌐 Recherche globale
+                    <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(indépendante des Standards · historique local)</span>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px;">${globalRarityChecks}</div>
+                <div style="display:flex;gap:5px;margin-bottom:7px;">
+                    <button onclick="window.wmGlobalRarityAll()" style="padding:2px 7px;border-radius:4px;border:1px solid rgba(34,211,238,0.25);background:rgba(34,211,238,0.07);color:#22d3ee;font-size:9px;cursor:pointer;">Toutes</button>
+                    <button onclick="window.wmGlobalRarityNone()" style="padding:2px 7px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.03);color:#777;font-size:9px;cursor:pointer;">Aucune</button>
+                </div>
+                <div style="font-size:9px;color:#666;line-height:1.4;margin-bottom:8px;">
+                    Observe silencieusement <b>toutes</b> les annonces des raretés cochées, sans tenir compte des mots-clés Standards. Ces observations alimentent l'historique local par <b>carte + rareté</b>.
+                </div>
+                <div style="border-top:1px solid rgba(255,255,255,0.07);padding-top:7px;">
+                    <div style="font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:.7px;margin-bottom:5px;">⚡ Source du Hunter dynamique</div>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:#aaa;margin-bottom:4px;cursor:pointer;">
+                        <input type="radio" name="wm-hunter-source" value="standards" ${hunterDynamicSource === 'standards' ? 'checked' : ''}
+                            onchange="if(this.checked) window.wmSetHunterDynamicSource('standards')"> 🔎 Mots-clés Standards
+                    </label>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:#aaa;margin-bottom:4px;cursor:pointer;">
+                        <input type="radio" name="wm-hunter-source" value="global" ${hunterDynamicSource === 'global' ? 'checked' : ''}
+                            onchange="if(this.checked) window.wmSetHunterDynamicSource('global')"> 🌐 Recherche globale
+                    </label>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:10px;color:#aaa;cursor:pointer;">
+                        <input type="radio" name="wm-hunter-source" value="both" ${hunterDynamicSource === 'both' ? 'checked' : ''}
+                            onchange="if(this.checked) window.wmSetHunterDynamicSource('both')"> 🌐 + 🔎 Les deux
+                    </label>
+                </div>
             </div>
             <div style="font-size:9px;color:#ef4444;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">🚫 Exclus <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(masque strictement les annonces contenant la phrase)</span></div>
             <div style="display:flex;flex-wrap:wrap;margin-bottom:6px;">${excludeTags || '<span style="color:#444;font-size:10px;">Aucun</span>'}</div>
@@ -2960,7 +3144,7 @@
         // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique ${state}${suffix}`;
+            return `⚡ Hunter dynamique · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -3032,14 +3216,11 @@
                 iAmLeading(a);
 
 
-            const alreadyOwned =
-                (
-                    collectionMap.get(
-                        a.card?.id
-                    )
-                    ||
-                    0
-                ) > 0;
+            const listingRarity = globalAuctionRarity(a);
+            const alreadyOwned = isOwnedDuplicate(
+                a.card?.id ?? a.card_id,
+                listingRarity
+            );
 
 
             if (
@@ -3437,7 +3618,7 @@
             if (hasFourbeKeyword(a.card)) continue;     // déjà couvert par les mots-clés fourbe
             if (snipeSet.has(a.id) || autoBidSet.has(a.id)) continue;
             if (isSelf(a.current_bidder?.username)) continue;
-            if ((collectionMap.get(a.card?.id) || 0) > 0) continue; // déjà en collection
+            if (isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a))) continue; // déjà possédée DANS cette rareté
             const decision = shouldAutoSnipe(a);
             if (!decision.snipe) continue;
             if (!armHunterFourbe(a, decision.cap)) continue;
@@ -3479,12 +3660,18 @@
             wmLog(`🕵️ <b style="color:#c084fc;">Hunter agressif ON</b> — plus de mise immédiate : les cartes qui matchent sont snipées en fin d'enchère, plafonnées au seuil du Hunter.`);
             if (!autoSnipeEnabled) {
                 wmLog(`⚠️ Le Hunter est <b>OFF</b> : l'armement commencera dès que tu l'allumeras.`);
-            } else if (Array.isArray(lastHitsCache) && lastHitsCache.length > 0) {
-                // Rattrapage sur les enchères déjà affichées, comme à l'activation du Hunter.
-                const n = runHunterFourbePass([...lastHitsCache]);
-                wmLog(n > 0
-                    ? `🕵️ <b>${n}</b> enchère(s) déjà en cours armée(s) en fourbe.`
-                    : `🕵️ Aucune enchère en cours ne correspond au critère du Hunter pour l'instant.`);
+            } else {
+                // En dynamique, le rattrapage suit explicitement la source choisie (Standards /
+                // Global / Les deux). En fixe, comportement historique = hits affichés.
+                const basePool = getSetting('autoSnipeMode') === 'adaptive'
+                    ? getHunterDynamicCandidatePool(lastAllMarketAuctions)
+                    : [...lastHitsCache];
+                if (basePool.length > 0) {
+                    const n = runHunterFourbePass(basePool);
+                    wmLog(n > 0
+                        ? `🕵️ <b>${n}</b> enchère(s) déjà en cours armée(s) en fourbe.`
+                        : `🕵️ Aucune enchère en cours ne correspond au critère du Hunter pour l'instant.`);
+                }
             }
         } else {
             const n = disarmAllHunterFourbe();
@@ -3502,13 +3689,15 @@
             btn.style.background = 'rgba(74,222,128,0.08)';
             // Rattrapage : traite aussi les enchères DÉJÀ présentes qui matchent le critère,
             // pas seulement les prochaines. (bidLockSet évite les doublons avec le scan.)
-            if (Array.isArray(lastHitsCache) && lastHitsCache.length > 0) {
+            const activationPool = getSetting('autoSnipeMode') === 'adaptive'
+                ? getHunterDynamicCandidatePool(lastAllMarketAuctions)
+                : [...lastHitsCache];
+            if (activationPool.length > 0) {
                 wmLog(hunterAggressive
-                    ? '⚡ Hunter activé (mode fourbe) — armement des enchères déjà en cours…'
-                    : '⚡ Hunter activé — vérification des enchères déjà en cours…');
-                runHunterAutoBidPass([...lastHitsCache]).then(n => {
+                    ? `⚡ Hunter activé (mode fourbe · ${getSetting('autoSnipeMode') === 'adaptive' ? hunterDynamicSourceLabel() : 'hits'}) — armement des enchères déjà en cours…`
+                    : `⚡ Hunter activé${getSetting('autoSnipeMode') === 'adaptive' ? ` · source ${hunterDynamicSourceLabel()}` : ''} — vérification des enchères déjà en cours…`);
+                runHunterAutoBidPass(activationPool).then(n => {
                     if (n > 0 && !hunterAggressive) wmLog(`⚡ Hunter : <b>${n}</b> mise(s) placée(s) sur des enchères déjà présentes.`);
-                    // En mode fourbe, runHunterFourbePass loggue déjà chaque armement.
                 }).catch(() => { });
             }
         } else {
@@ -3728,6 +3917,7 @@
                 marketStatusEl.innerHTML =
                     `<span style="color:#06b6d4;font-size:10px;white-space:nowrap;">⏳ p.${page}/${total} · ${found} annonces</span>`;
             });
+            lastAllMarketAuctions = auctions;
 
             const now = new Date().toLocaleTimeString("fr-FR",
                 { hour: "2-digit", minute: "2-digit", second: "2-digit" });
@@ -3908,6 +4098,22 @@
                 if (cls.excluded) return false;
                 return cls.keywordMatch;
             });
+
+
+            // ⚡ Hunter DYNAMIQUE : pool totalement découplé de l'affichage du Market Watcher.
+            // Standards = cls.alert (KEYWORDS_ALERT uniquement) ; Global = raretés cochées.
+            // Il tourne avant le `hits.length === 0` afin que le mode Global fonctionne même
+            // lorsque l'utilisateur n'a aucun mot-clé visible en vente.
+            if (autoSnipeEnabled && getSetting('autoSnipeMode') === 'adaptive') {
+                const hunterCandidates = auctions.filter(a => {
+                    const cls = kwClassCache.get(a.id);
+                    if (cls?.excluded) return false;
+                    return hunterDynamicMatchesSource(a, !!cls?.alert);
+                });
+                if (hunterCandidates.length > 0) {
+                    await runHunterAutoBidPass(hunterCandidates);
+                }
+            }
 
             // Marque l'instant de première détection de chaque hit (pour tri "ajout récent")
             // et purge les entrées des enchères qui ne sont plus listées.
@@ -4128,7 +4334,7 @@
 
                 // 🤖 Auto-bid Hunter : mise initiale sur les nouvelles annonces qui matchent.
                 // (Même logique réutilisée à l'activation du Hunter pour les annonces déjà là.)
-                if (autoSnipeEnabled) await runHunterAutoBidPass(newHits);
+                if (autoSnipeEnabled && getSetting('autoSnipeMode') !== 'adaptive') await runHunterAutoBidPass(newHits);
             }
 
             // Met à jour activeHitsMap pour TOUS les hits (keyword + my-bid)
@@ -4252,8 +4458,11 @@
 
                     // L'historique vient peut-être d'être chargé :
                     // on redonne les enchères au Hunter dynamique.
-                    if (autoSnipeEnabled && Array.isArray(lastHitsCache) && lastHitsCache.length > 0) {
-                        runHunterAutoBidPass([...lastHitsCache]).catch(() => { });
+                    if (autoSnipeEnabled) {
+                        const pool = getSetting('autoSnipeMode') === 'adaptive'
+                            ? getHunterDynamicCandidatePool(lastAllMarketAuctions)
+                            : [...lastHitsCache];
+                        if (pool.length > 0) runHunterAutoBidPass(pool).catch(() => { });
                     }
                 });
             }
@@ -4420,7 +4629,7 @@
             // basé sur l'historique des ventes de cette carte.
             const cardId = a.card?.id ?? a.card_id;
             queueSalesFetch(cardId); // met en file si pas en cache
-            const val = computeValuation(bid, cardId);
+            const val = computeValuation(bid, cardId, globalAuctionRarity(a));
             const valBadge = val
                 ? `<span style="
                     display:inline-block;padding:1px 5px;border-radius:4px;
@@ -4582,7 +4791,7 @@
                                 border:1px solid ${modeUi.border};border-radius:4px;background:${modeUi.bg};color:${modeUi.color};
                                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${modeUi.label}</button>
                             <input id="wm-autobidmax-${a.id}" type="number" min="0" value="${capVal ?? ''}"
-                                placeholder="${(() => { const e = getCachedSales(a.card?.id ?? a.card_id); return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max'; })()}"
+                                placeholder="${(() => { const e = getCachedSales(a.card?.id ?? a.card_id, globalAuctionRarity(a)); return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max'; })()}"
                                 title="Plafond : au-delà de ce montant, l'automatisme se coupe pour cette enchère. Vide = sans plafond."
                                 oninput="window.wmOnAutoBidMax('${a.id}', this.value, false)"
                                 onchange="window.wmOnAutoBidMax('${a.id}', this.value, true)"
@@ -4752,13 +4961,13 @@
                     </button>
                     <input id="wm-autobidmax-${a.id}" type="number" min="0" placeholder="${(() => {
                     const cid = a.card?.id ?? a.card_id;
-                    const e = getCachedSales(cid);
+                    const e = getCachedSales(cid, globalAuctionRarity(a));
                     return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max';
                 })()}"
                         value="${getAutoBidMax(a.id) ?? ''}"
                         title="Plafond auto-bid : au-delà de ce montant, l'auto-bid se coupe pour cette enchère. Laisse vide pour ne PAS plafonner (auto-bid illimité).${(() => {
                     const cid = a.card?.id ?? a.card_id;
-                    const e = getCachedSales(cid);
+                    const e = getCachedSales(cid, globalAuctionRarity(a));
                     return (e && e.count > 0) ? ' Médiane marché indicative : ' + e.median + ' 💰' : '';
                 })()}"
                         oninput="window.wmOnAutoBidMax('${a.id}', this.value, false)"
@@ -6552,8 +6761,8 @@
         if (!getSetting('sellUseMarketPrice') || !cardId) {
             result = { price: manual, source: 'table' };
         } else {
-            let entry = getCachedSales(cardId);
-            if (!entry) entry = await fetchCardSales(cardId); // récupère l'historique si pas en cache
+            let entry = getCachedSales(cardId, rarity);
+            if (!entry) entry = await fetchCardSales(cardId, rarity); // historique de cette rareté en mode local
             if (entry && entry.count > 0 && Number.isFinite(entry.avg) && entry.avg > 0) {
                 const pct = getSetting('sellMarketPricePct');
                 let price = Math.max(1, Math.round(entry.avg * (pct / 100)));
@@ -7245,7 +7454,7 @@
         const cardIdOf = (c) => c.card_id || c.card?.id;
         const rarityOf = (c) => (c.card?.rarity || c.rarity || 'C').toUpperCase();
         const valueOf = (c) => {
-            const e = getCachedSales(cardIdOf(c));
+            const e = getCachedSales(cardIdOf(c), rarityOf(c));
             if (e && e.count > 0 && Number.isFinite(e.avg)) return e.avg;
             return getSellPrice(rarityOf(c)); // proxy : prix par rareté si pas d'historique
         };
@@ -7259,13 +7468,13 @@
                 (RARITY_ORDER[rarityOf(b)] ?? -1) - (RARITY_ORDER[rarityOf(a)] ?? -1));
             // 2) Récupère le prix marché réel de ceux qui manquent au cache (concurrence bornée).
             const toFetch = ranked.slice(0, cap)
-                .filter(c => { const id = cardIdOf(c); return id && !getCachedSales(id); });
+                .filter(c => { const id = cardIdOf(c); return id && !getCachedSales(id, rarityOf(c)); });
             if (toFetch.length > 0) {
                 wmLog(`💹 Stratégie « plus chères » : récupération du prix marché de ${toFetch.length} carte(s)…`);
                 const CONC = 4;
                 for (let i = 0; i < toFetch.length; i += CONC) {
                     const grp = toFetch.slice(i, i + CONC);
-                    await Promise.all(grp.map(c => fetchCardSales(cardIdOf(c)).catch(() => null)));
+                    await Promise.all(grp.map(c => fetchCardSales(cardIdOf(c), rarityOf(c)).catch(() => null)));
                     if (i + CONC < toFetch.length) await new Promise(r => setTimeout(r, 200 + Math.random() * 200));
                 }
             }
@@ -13484,7 +13693,7 @@
     };
 
     /* ══════════════════════════════════════════════════════════════════════
-    v1.8 — HISTORIQUE LOCAL DES VENTES OBSERVÉES
+    v2.2 — HISTORIQUE LOCAL DES VENTES OBSERVÉES (CARTE + RARETÉ)
     ══════════════════════════════════════════════════════════════════════ */
 
     const LOCAL_MARKET_HISTORY_KEY = 'wm_local_market_history_v1';
@@ -13500,7 +13709,7 @@
         6 * 60 * 60 * 1000;
 
     const LOCAL_MARKET_HISTORY_MAX = 12000;
-    const LOCAL_MARKET_PENDING_MAX = 5000;
+    const LOCAL_MARKET_PENDING_MAX = 15000;
 
 
     let localMarketHistory = [];
@@ -13571,8 +13780,21 @@
             typeof raw === 'object' &&
             !Array.isArray(raw)
         ) {
-
-            localMarketPending = raw;
+            // v2.2 : format compact { c, r, e }. Les anciens champs p/s n'étaient jamais
+            // utilisés comme prix final et sont retirés pour pouvoir observer des milliers
+            // d'enchères globales sans gonfler inutilement le localStorage.
+            const normalized = {};
+            for (const [id, obs] of Object.entries(raw)) {
+                const c = obs?.c;
+                const e = Number(obs?.e);
+                if (!id || !c || !Number.isFinite(e)) continue;
+                normalized[id] = {
+                    c,
+                    r: String(obs?.r || '').toUpperCase(),
+                    e
+                };
+            }
+            localMarketPending = normalized;
         }
 
     } catch (e) {
@@ -13942,131 +14164,51 @@
         ============================================================ */
 
     function getLocalMarketStats(
-        cardId
+        cardId,
+        rarity = ''
     ) {
+        if (!cardId) return null;
 
-        if (!cardId) {
-            return null;
-        }
+        const wantedRarity = String(rarity || '').trim().toUpperCase();
+        const cutoff = Date.now() - LOCAL_MARKET_HISTORY_WINDOW_MS;
 
+        const sales = (localMarketByCard.get(cardId) || []).filter(s => {
+            if (Number(s.t) < cutoff) return false;
+            if (!wantedRarity) return true; // appels génériques hérités : agrégat de compatibilité
+            return String(s.r || '').toUpperCase() === wantedRarity;
+        });
 
-        const cutoff =
-            Date.now() -
-            LOCAL_MARKET_HISTORY_WINDOW_MS;
+        const prices = sales
+            .map(s => Number(s.p))
+            .filter(p => Number.isFinite(p) && p > 0);
 
-
-        const sales =
-            (
-                localMarketByCard.get(
-                    cardId
-                )
-                ||
-                []
-            )
-
-                .filter(
-                    s =>
-                        Number(s.t)
-                        >=
-                        cutoff
-                );
-
-
-        const prices =
-            sales
-
-                .map(
-                    s =>
-                        Number(
-                            s.p
-                        )
-                )
-
-                .filter(
-                    p =>
-                        Number.isFinite(p)
-                        &&
-                        p > 0
-                );
-
-
-        if (
-            prices.length === 0
-        ) {
-
+        if (prices.length === 0) {
             return {
-
                 median: 0,
                 count: 0,
-
                 last: null,
                 avg: null,
                 min: null,
                 max: null,
-
-                fetchedAt:
-                    Date.now(),
-
-                source:
-                    'local'
+                fetchedAt: Date.now(),
+                source: 'local',
+                rarity: wantedRarity || null
             };
         }
 
-
-        const recent =
-            [...sales]
-
-                .sort(
-                    (a, b) =>
-                        Number(b.t) -
-                        Number(a.t)
-                );
-
-
+        const recent = [...sales].sort((a, b) => Number(b.t) - Number(a.t));
         return {
-
-            median:
-                median(
-                    prices
-                ),
-
-            count:
-                prices.length,
-
-            last:
-                Number(
-                    recent[0].p
-                ),
-
-            avg:
-                Math.round(
-                    prices.reduce(
-                        (sum, p) =>
-                            sum + p,
-                        0
-                    )
-                    /
-                    prices.length
-                ),
-
-            min:
-                Math.min(
-                    ...prices
-                ),
-
-            max:
-                Math.max(
-                    ...prices
-                ),
-
-            fetchedAt:
-                Date.now(),
-
-            source:
-                'local'
+            median: median(prices),
+            count: prices.length,
+            last: Number(recent[0].p),
+            avg: Math.round(prices.reduce((sum, p) => sum + p, 0) / prices.length),
+            min: Math.min(...prices),
+            max: Math.max(...prices),
+            fetchedAt: Date.now(),
+            source: 'local',
+            rarity: wantedRarity || null
         };
     }
-
 
 
     /* ============================================================
@@ -14154,6 +14296,7 @@
             *
             * a = auction ID
             * c = card ID
+            * r = rareté figée/observée au moment de l'enchère
             * p = final price
             * t = settled timestamp
             */
@@ -14164,6 +14307,9 @@
 
             c:
                 obs.c,
+
+            r:
+                String(obs.r || '').toUpperCase(),
 
             p:
                 price,
@@ -14233,146 +14379,41 @@
         auction,
         freshSync = false
     ) {
+        if (!auction?.id) return;
 
+        const cardId = auction.card?.id ?? auction.card_id;
+        if (!cardId) return;
+
+        const endTs = new Date(auction.end_at || NaN).getTime();
+        if (!Number.isFinite(endTs)) return;
+
+        if (localMarketHistoryIds.has(auction.id)) {
+            delete localMarketPending[auction.id];
+            return;
+        }
+
+        const prev = localMarketPending[auction.id] || {};
+        // Les lectures Hot Lane groupées ne portent pas toujours la carte/rareté : dans ce cas
+        // on conserve la rareté capturée lors du scan global initial.
+        const rarity = globalAuctionRarity(auction) || String(prev.r || '').toUpperCase();
+
+        // v2.2 : aucune écriture si cardId/rareté/end_at sont inchangés. current_bid n'est PAS
+        // stocké : seul final_price serveur peut entrer dans l'historique.
         if (
-            !auction?.id
+            prev.c === cardId &&
+            String(prev.r || '').toUpperCase() === rarity &&
+            Number(prev.e) === endTs
         ) {
             return;
         }
 
-
-        const cardId =
-
-            auction.card?.id
-            ??
-            auction.card_id;
-
-
-        if (!cardId) {
-            return;
-        }
-
-
-        const endTs =
-            new Date(
-                auction.end_at
-                ||
-                NaN
-            )
-                .getTime();
-
-
-        if (
-            !Number.isFinite(
-                endTs
-            )
-        ) {
-
-            return;
-        }
-
-
-        if (
-            localMarketHistoryIds.has(
-                auction.id
-            )
-        ) {
-
-            delete localMarketPending[
-                auction.id
-            ];
-
-            return;
-        }
-
-
-        const prev =
-            localMarketPending[
-            auction.id
-            ]
-            ||
-            {};
-
-
-        const currentBid =
-            Number(
-                auction.current_bid
-            );
-
-
-        const hasCurrentBid =
-
-            auction.current_bid
-            !=
-            null
-
-            &&
-
-            Number.isFinite(
-                currentBid
-            );
-
-
-        localMarketPending[
-            auction.id
-        ] = {
-
-            c:
-                cardId,
-
-            e:
-                endTs,
-
-            /*
-                * Ce prix est seulement le dernier bid observé.
-                * Il N'EST PAS archivé comme final_price.
-                */
-            p:
-                hasCurrentBid
-
-                    ?
-
-                    currentBid
-
-                    :
-
-                    (
-                        Number.isFinite(
-                            Number(prev.p)
-                        )
-
-                            ?
-
-                            Number(prev.p)
-
-                            :
-
-                            null
-                    ),
-
-            /*
-                * timestamp du dernier état serveur frais
-                */
-            s:
-                freshSync
-
-                    ?
-
-                    Date.now()
-
-                    :
-
-                    (
-                        Number(prev.s)
-                        ||
-                        0
-                    )
+        localMarketPending[auction.id] = {
+            c: cardId,
+            r: rarity,
+            e: endTs
         };
-
-
         queueLocalMarketPendingSave();
     }
-
 
 
     /* ============================================================
@@ -14382,33 +14423,15 @@
     function observeLocalMarketHits(
         hits
     ) {
+        if (!Array.isArray(hits)) return;
 
-        if (
-            !Array.isArray(
-                hits
-            )
-        ) {
-            return;
+        for (const auction of hits) {
+            if (!localHistoryShouldObserve(auction)) continue;
+            observeLocalMarketAuction(auction, false);
         }
 
-
-        for (
-            const auction
-            of hits
-        ) {
-
-            observeLocalMarketAuction(
-                auction,
-                false
-            );
-        }
-
-
-        pruneLocalMarketHistory(
-            false
-        );
+        pruneLocalMarketHistory(false);
     }
-
 
 
     /* ============================================================
@@ -14468,7 +14491,14 @@
                 ||
                 cached?.card_id
                 ||
-                previous.c
+                previous.c,
+
+            snapshot_rarity:
+                fresh.snapshot_rarity
+                ||
+                cached?.snapshot_rarity
+                ||
+                previous.r
         };
 
 
@@ -14743,31 +14773,8 @@
                     localMarketPending[
                         auctionId
                     ] = {
-
                         ...obs,
-
-                        e:
-                            rowEndTs,
-
-                        p:
-                            Number.isFinite(
-                                Number(
-                                    row.current_bid
-                                )
-                            )
-
-                                ?
-
-                                Number(
-                                    row.current_bid
-                                )
-
-                                :
-
-                                obs.p,
-
-                        s:
-                            Date.now()
+                        e: rowEndTs
                     };
 
 
@@ -14945,7 +14952,8 @@
 
     getCachedSales =
         function (
-            cardId
+            cardId,
+            rarity = ''
         ) {
 
             if (!cardId) {
@@ -14986,7 +14994,8 @@
                 * historique local.
                 */
             return getLocalMarketStats(
-                cardId
+                cardId,
+                rarity
             );
         };
 
@@ -14998,7 +15007,8 @@
 
     fetchCardSales =
         async function (
-            cardId
+            cardId,
+            rarity = ''
         ) {
 
             if (!cardId) {
@@ -15016,7 +15026,8 @@
             ) {
 
                 return getLocalMarketStats(
-                    cardId
+                    cardId,
+                    rarity
                 );
             }
 
@@ -15082,13 +15093,14 @@
                                 `📚 API historique officielle ` +
                                 `réservée aux comptes PRO · ` +
                                 `bascule sur ` +
-                                `<b>l’historique local v1.8</b>.`
+                                `<b>l’historique local v2.2 (carte + rareté)</b>.`
                             );
                         }
 
 
                         return getLocalMarketStats(
-                            cardId
+                            cardId,
+                            rarity
                         );
                     }
 
@@ -15452,12 +15464,14 @@
     computeValuation =
         function (
             currentPrice,
-            cardId
+            cardId,
+            rarity = ''
         ) {
 
             const entry =
                 getCachedSales(
-                    cardId
+                    cardId,
+                    rarity
                 );
 
 
@@ -15514,7 +15528,7 @@
 
                             ?
 
-                            'Aucune vente locale encore observée depuis le passage en v1.8'
+                            'Aucune vente locale encore observée pour cette carte/rareté'
 
                             :
 
@@ -15720,13 +15734,15 @@
                 );
 
 
-            /*
-                * Ne bloque pas le rendu du Market Watcher.
-                */
+            const allAuctions = result?.auctions || [];
+
+            // Le scan complet est déjà téléchargé par le Market Watcher : aucune requête
+            // supplémentaire. observeLocalMarketHits filtre ensuite Standards + Global.
+            observeLocalMarketHits(allAuctions);
+
+            /* Ne bloque pas le rendu du Market Watcher. */
             reconcileLocalMarketHistory(
-                result?.auctions
-                ||
-                []
+                allAuctions
             )
                 .catch(
                     () => { }
@@ -15799,12 +15815,19 @@
                     valid.length,
 
                 cartesDistinctes30j:
-                    new Set(
-                        valid.map(
-                            s =>
-                                s.c
-                        )
-                    ).size,
+                    new Set(valid.map(s => s.c)).size,
+
+                couplesCarteRarete30j:
+                    new Set(valid.filter(s => s.r).map(s => `${s.c}|${s.r}`)).size,
+
+                ventesLegacySansRarete:
+                    valid.filter(s => !s.r).length,
+
+                raretesGlobales:
+                    [...GLOBAL_SEARCH_RARITIES].join(', ') || '(aucune)',
+
+                sourceHunterDynamique:
+                    hunterDynamicSourceLabel(),
 
                 encheresEnObservation:
                     Object.keys(
@@ -15867,7 +15890,8 @@
 
     window.wmLocalHistoryFor =
         function (
-            cardId
+            cardId,
+            rarity = ''
         ) {
 
             const sales =
@@ -15881,10 +15905,8 @@
 
                     .filter(
                         s =>
-                            Number(s.t)
-                            >=
-                            Date.now() -
-                            LOCAL_MARKET_HISTORY_WINDOW_MS
+                            Number(s.t) >= Date.now() - LOCAL_MARKET_HISTORY_WINDOW_MS &&
+                            (!rarity || String(s.r || '').toUpperCase() === String(rarity).toUpperCase())
                     )
 
                     .map(
@@ -15895,6 +15917,9 @@
 
                             cardId:
                                 s.c,
+
+                            rarity:
+                                s.r || '(legacy inconnue)',
 
                             finalPrice:
                                 s.p,
@@ -15925,7 +15950,7 @@
 
             if (
                 !confirm(
-                    'Effacer tout l’historique local v1.8 et les enchères actuellement observées ?'
+                    'Effacer tout l’historique local v2.2 et les enchères actuellement observées ?'
                 )
             ) {
 
@@ -15960,7 +15985,7 @@
 
 
             wmLog(
-                '🗑️ Historique local v1.8 effacé.'
+                '🗑️ Historique local v2.2 effacé.'
             );
 
 
@@ -15974,11 +15999,10 @@
         ============================================================ */
 
     wmLog(
-        `📚 Historique local v1.8 prêt · ` +
+        `📚 Historique local v2.2 prêt · ` +
         `<b>${localMarketHistory.length}</b> ` +
         `vente(s) conservée(s) · ` +
-        `collecte à partir des enchères observées ` +
-        `par le Market Watcher.`
+        `collecte Standards + Recherche globale · stats séparées par rareté.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
