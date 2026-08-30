@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.1';
+    const WM_VERSION = '2.3.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3469,6 +3469,58 @@
     // Refresh programmé juste après NOS propres bids
     const postBidRefreshTimers = new Map();
 
+    // Mode "bataille" : lorsqu'une enchère bouge très vite, on la relit beaucoup plus
+    // fréquemment pendant quelques secondes, sans accélérer inutilement tout le marché.
+    const BID_BATTLE_POLL_MS = 150;
+    const BID_BATTLE_KEEP_MS = 4000;
+    const bidBattleMap = new Map(); // auctionId -> { lastBid, lastChangeAt, until, changes }
+
+    function markBidBattle(auctionId, keepMs = BID_BATTLE_KEEP_MS) {
+        if (!auctionId) return;
+        const now = Date.now();
+        const prev = bidBattleMap.get(auctionId) || { lastBid: null, lastChangeAt: 0, until: 0, changes: 0 };
+        prev.until = Math.max(prev.until || 0, now + keepMs);
+        bidBattleMap.set(auctionId, prev);
+        if (hotLaneActive) scheduleHotLane();
+    }
+
+    function noteBidBattleState(auction) {
+        if (!auction?.id) return;
+        const price = Number(auction.current_bid ?? auction.base_amount ?? 0);
+        if (!Number.isFinite(price)) return;
+
+        const now = Date.now();
+        const prev = bidBattleMap.get(auction.id) || {
+            lastBid: price,
+            lastChangeAt: now,
+            until: 0,
+            changes: 0
+        };
+
+        if (Number.isFinite(prev.lastBid) && price !== prev.lastBid) {
+            const gap = now - (prev.lastChangeAt || 0);
+            prev.changes = gap <= 2000 ? Math.min((prev.changes || 0) + 1, 20) : 1;
+            prev.lastChangeAt = now;
+
+            // Deux changements rapprochés, ou un changement très proche du précédent :
+            // on considère qu'une vraie guerre d'enchères est en cours.
+            if (prev.changes >= 2 || gap <= 1200) {
+                prev.until = Math.max(prev.until || 0, now + BID_BATTLE_KEEP_MS);
+            }
+        }
+
+        prev.lastBid = price;
+        bidBattleMap.set(auction.id, prev);
+    }
+
+    function isBidBattleActive(auctionId) {
+        const s = bidBattleMap.get(auctionId);
+        if (!s) return false;
+        if ((s.until || 0) > Date.now()) return true;
+        if (Date.now() - (s.lastChangeAt || 0) > 30_000) bidBattleMap.delete(auctionId);
+        return false;
+    }
+
     // Expose closure vars to global scope for inline onclick handlers
     window.autoBidSet = autoBidSet;
     window.autoBidMaxMap = autoBidMaxMap;
@@ -4095,6 +4147,10 @@
 
         clearOutbid(auctionId);
         trackMyBid(auctionId);
+
+        // Juste après NOTRE bid, les contre-bids peuvent arriver plusieurs fois dans la même
+        // seconde : on ouvre immédiatement une fenêtre de polling ultra-rapide.
+        markBidBattle(auctionId, BID_BATTLE_KEEP_MS);
 
         // Mise à jour optimiste du prix et du meneur.
         //
@@ -4728,17 +4784,36 @@
                 // Skip si la hot lane a déjà pris en charge cette enchère.
                 if (bidLockSet.has(a.id)) continue;
                 if (!automaticBidTimeAllowed(a)) continue;
-                const bidAmount = minNextBid(a);
-                // Respecte le plafond par enchère (coupe l'auto-bid si dépassé)
-                if (!autoBidWithinCap(a, bidAmount)) continue;
                 bidLockSet.add(a.id);
                 await new Promise(r => setTimeout(r, bidDelayMs(a)));
-                // Revalidation juste avant le POST : jamais de riposte si le timer connu
-                // est remonté au-dessus de 5 min entre la mise en file et l'envoi.
-                if (!automaticBidTimeAllowed(a)) {
+
+                // Le scan complet peut être obsolète en pleine bataille. On relit toujours
+                // cette enchère juste avant la riposte du scan normal.
+                let freshBidAuction = null;
+                try {
+                    freshBidAuction = await fetchSingleAuction(a.id);
+                } catch (e) { }
+
+                if (!freshBidAuction) {
                     bidLockSet.delete(a.id);
                     continue;
                 }
+
+                applyFreshAuctionState(freshBidAuction, { render: false, logExtension: true });
+
+                if (!automaticBidTimeAllowed(freshBidAuction)
+                    || iAmLeading(freshBidAuction)
+                    || autoBidBlockedByUncertainSelfState(freshBidAuction)) {
+                    bidLockSet.delete(a.id);
+                    continue;
+                }
+
+                const bidAmount = minNextBid(freshBidAuction);
+                if (!autoBidWithinCap(freshBidAuction, bidAmount)) {
+                    bidLockSet.delete(a.id);
+                    continue;
+                }
+
                 try {
                     const res = await fetch(
                         "https://www.wiki-masters.com/api/marketplace/" + a.id + "/bid",
@@ -4749,8 +4824,8 @@
                         }
                     );
                     if (res.ok) {
-                        markAuctionAsMine(a.id, bidAmount, a);
-                        markAutoFlipCandidate(a, 'autobid', bidAmount);
+                        markAuctionAsMine(a.id, bidAmount, freshBidAuction);
+                        markAutoFlipCandidate(freshBidAuction, 'autobid', bidAmount);
                         const titleAb = a.card?.wikipedia_title || '?';
                         const rarAb = (a.card?.rarity || '').toUpperCase();
                         wmLog(`🤖 Auto-bid (riposte) : <b>${titleAb}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
@@ -5520,6 +5595,9 @@
             ...fresh
         };
 
+        // Détecte les variations rapides de prix sur les états SERVEUR frais.
+        noteBidBattleState(merged);
+
         // ----------------------------------------
         // Cache principal du Market Watcher
         // ----------------------------------------
@@ -5681,54 +5759,45 @@
     ) {
         if (!auctionId) return;
 
-        const old =
-            postBidRefreshTimers.get(
-                auctionId
-            );
+        const old = postBidRefreshTimers.get(auctionId);
+        if (old) clearTimeout(old);
 
-        if (old) {
-            clearTimeout(old);
-        }
+        // Burst volontairement court : capte les contre-bids qui tombent à 100-300 ms
+        // d'intervalle après notre mise, puis laisse la Hot Lane reprendre.
+        const delays = [70, 140, 260, 450, 750, 1200, 2000];
+        let index = 0;
 
-        const timer =
-            setTimeout(
-                async () => {
+        const scheduleNext = () => {
+            if (!hotLaneActive || index >= delays.length) {
+                postBidRefreshTimers.delete(auctionId);
+                return;
+            }
 
-                    postBidRefreshTimers.delete(
-                        auctionId
-                    );
-
-                    try {
-                        const fresh =
-                            await fetchSingleAuction(
-                                auctionId
-                            );
-
-                        if (fresh) {
-                            applyFreshAuctionState(
-                                fresh,
-                                {
-                                    render: true,
-                                    logExtension: true
-                                }
-                            );
-                        }
-
-                    } catch (e) {
-                        // La Hot Lane réessaiera.
-                        //
-                        // Surtout :
-                        // aucune estimation locale du timer.
+            const delay = delays[index++];
+            const timer = setTimeout(async () => {
+                try {
+                    const fresh = await fetchSingleAuction(auctionId);
+                    if (fresh) {
+                        applyFreshAuctionState(
+                            fresh,
+                            {
+                                render: true,
+                                logExtension: true
+                            }
+                        );
                     }
+                } catch (e) {
+                    // La Hot Lane continuera de toute façon.
+                } finally {
+                    scheduleNext();
+                }
+            }, delay);
 
-                },
-                100
-            );
+            postBidRefreshTimers.set(auctionId, timer);
+        };
 
-        postBidRefreshTimers.set(
-            auctionId,
-            timer
-        );
+        markBidBattle(auctionId, BID_BATTLE_KEEP_MS);
+        scheduleNext();
     }
 
 
@@ -6101,6 +6170,16 @@
             actionInterval = 5000;
         }
 
+        // Une enchère en bataille prime sur l'intervalle normal, quelle que soit sa position
+        // dans la fenêtre des 5 minutes. On ne descend pas sous 150 ms pour éviter de flooder.
+        let battleActive = false;
+        actionTracked.forEach(id => {
+            if (!battleActive && isBidBattleActive(id)) battleActive = true;
+        });
+        if (battleActive) {
+            actionInterval = Math.min(actionInterval, BID_BATTLE_POLL_MS);
+        }
+
 
         // ----------------------------------------
         // Simples timers affichés
@@ -6315,6 +6394,7 @@
             // plus MA propre mise comme une surenchère adverse (fini le prix qui s'auto-gonfle).
             if (isSelf(wasLeading) && bidder && !iAmLeading(a)) {
                 markOutbid(a.id);
+                markBidBattle(a.id, BID_BATTLE_KEEP_MS);
                 const titleOb = a.card?.wikipedia_title || '?';
                 const rarOb = (a.card?.rarity || '').toUpperCase();
                 const bidOb = a.current_bid ?? a.base_amount;
@@ -6385,7 +6465,56 @@
                                 );
                             } else {
                                 const errData = await res.json().catch(() => ({}));
-                                wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errData?.error || 'erreur'}`);
+                                const errText = String(errData?.error || errData?.message || '');
+                                const mm = errText.match(/minimum\s+(\d+)/i);
+                                const serverMin = mm ? Number(mm[1]) : null;
+
+                                // En bataille, quelqu'un peut encore passer entre notre lecture et le POST.
+                                // Un seul retry, après NOUVELLE lecture serveur, jamais à l'aveugle.
+                                if (/mise\s+trop\s+basse/i.test(errText) && Number.isFinite(serverMin)) {
+                                    try {
+                                        const retryFresh = await fetchSingleAuction(a.id);
+                                        if (retryFresh) {
+                                            applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
+
+                                            if (automaticBidTimeAllowed(retryFresh)
+                                                && !iAmLeading(retryFresh)
+                                                && !autoBidBlockedByUncertainSelfState(retryFresh)) {
+
+                                                const retryAmount = Math.max(
+                                                    minNextBid(retryFresh),
+                                                    Math.ceil(serverMin)
+                                                );
+
+                                                if (autoBidWithinCap(retryFresh, retryAmount)) {
+                                                    const retryRes = await fetch(
+                                                        `${MARKET_API_BASE}/${a.id}/bid`,
+                                                        {
+                                                            method: "POST",
+                                                            credentials: "include",
+                                                            headers: { "Content-Type": "application/json" },
+                                                            body: JSON.stringify({ amount: retryAmount })
+                                                        }
+                                                    );
+
+                                                    if (retryRes.ok) {
+                                                        markAuctionAsMine(a.id, retryAmount, retryFresh);
+                                                        markAutoFlipCandidate(retryFresh, 'autobid_hotlane_retry', retryAmount);
+                                                        wmLog(`⚡ Hot-lane retry : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${retryAmount} 💰</span>`);
+                                                        fetchBalance().catch(() => { });
+                                                    } else {
+                                                        const retryErr = await retryRes.json().catch(() => ({}));
+                                                        wmLog(`⚠️ Hot-lane retry échoué : <b>${titleOb}</b> [${rarOb}] · ${retryErr?.error || 'erreur'}`);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } catch (e) {
+                                        wmLog(`⚠️ Hot-lane retry exception : <b>${titleOb}</b> · ${e.message}`);
+                                    }
+                                } else {
+                                    wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errText || 'erreur'}`);
+                                }
                             }
                         } catch (e) {
                             wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
@@ -6460,6 +6589,7 @@
         }
 
         postBidRefreshTimers.clear();
+        bidBattleMap.clear();
 
         lastMarketTimerSyncAt = 0;
 
