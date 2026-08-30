@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.2.1';
+    const WM_VERSION = '2.2.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -107,11 +107,26 @@
     const GLOBAL_SEARCH_RARITIES_KEY = 'wm_global_search_rarities_v1';
     const HUNTER_DYNAMIC_SOURCE_KEY = 'wm_hunter_dynamic_source_v1';
 
-    // Fenêtre d'entrée du Hunter : aucune première mise automatique si l'enchère
-    // expire dans plus de 5 minutes. Une fois entrée dans l'enchère, l'auto-bid
-    // déjà armé continue normalement jusqu'à son plafond, même si end_at remonte
-    // ensuite à cause d'une extension serveur après un bid tardif.
-    const HUNTER_AUTOBID_ENTRY_MAX_MS = 5 * 60 * 1000;
+    // Règle GLOBALE de temps pour les mises automatiques :
+    // aucune mise automatique n'est autorisée tant qu'il reste plus de 5 minutes.
+    // Une enchère peut rester armée dans autoBidSet / snipeSet, mais elle attend.
+    // Si end_at remonte au-dessus de 5 min après une extension serveur, les ripostes
+    // auto-bid se remettent en pause jusqu'à repasser à <= 5 min.
+    const AUTOMATIC_BID_MAX_REMAINING_MS = 5 * 60 * 1000;
+
+    function automaticBidRemainingMs(auction) {
+        if (!auction?.end_at) return NaN;
+        const endTs = new Date(auction.end_at).getTime();
+        if (!Number.isFinite(endTs)) return NaN;
+        return endTs - serverNow();
+    }
+
+    function automaticBidTimeAllowed(auction) {
+        const remaining = automaticBidRemainingMs(auction);
+        return Number.isFinite(remaining)
+            && remaining > 0
+            && remaining <= AUTOMATIC_BID_MAX_REMAINING_MS;
+    }
     const GLOBAL_SEARCH_RARITY_CODES = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
 
     let GLOBAL_SEARCH_RARITIES = new Set();
@@ -2692,10 +2707,33 @@
     // Tracker les enchères où on était meneur : Map<auctionId, username>
     let leadingBidsMap = new Map();
 
-    // Montant de MA dernière mise par enchère (id → montant). Signal d'identité
-    // INDÉPENDANT du pseudo : si le prix courant ne dépasse pas ma dernière mise,
-    // c'est que je mène encore, même si la comparaison de pseudo échoue.
+    // Montant de MA dernière mise par enchère (id → montant). Persisté : après un F5,
+    // le bot doit encore savoir qu'un prix courant correspond déjà à SA propre mise.
+    // Sans persistance, la première boucle après reload pouvait croire qu'elle était
+    // surenchérie et miser par-dessus elle-même avant la résolution du pseudo.
+    const MY_LAST_BIDS_KEY = 'wm_my_last_bids_v1';
     let myLastBidMap = new Map();
+    try {
+        const raw = JSON.parse(localStorage.getItem(MY_LAST_BIDS_KEY) || '[]');
+        if (Array.isArray(raw)) {
+            myLastBidMap = new Map(raw.filter(x => Array.isArray(x) && x[0] && Number.isFinite(Number(x[1]))));
+        }
+    } catch (e) { myLastBidMap = new Map(); }
+
+    function saveMyLastBids() {
+        try {
+            // Garde une borne raisonnable : les enchères terminées sont aussi purgées pendant les scans.
+            localStorage.setItem(MY_LAST_BIDS_KEY, JSON.stringify([...myLastBidMap.entries()].slice(-2000)));
+        } catch (e) { }
+    }
+
+    function rememberMyLeadingBid(auction, amount) {
+        if (!auction?.id) return;
+        const n = Number(amount ?? auction.current_bid);
+        if (!Number.isFinite(n)) return;
+        myLastBidMap.set(auction.id, n);
+        saveMyLastBids();
+    }
 
     // Comparaison de pseudo tolérante (casse + espaces) : évite que le bot ne
     // reconnaisse pas ses propres mises à cause d'une différence de casse entre
@@ -2705,18 +2743,55 @@
         return String(username).trim().toLowerCase() === String(currentUsername).trim().toLowerCase();
     }
 
-    // Suis-je le meneur actuel d'une enchère ? Vrai si le current_bidder est moi
-    // (pseudo tolérant) OU si le prix courant ne dépasse pas ma dernière mise connue.
-    // → empêche l'auto-bid de surenchérir sur lui-même (prix qui monte inutilement).
+    // L'API du site et la lecture Supabase peuvent exposer l'id à des endroits différents.
+    // L'UUID est le signal le plus fiable : il est disponible immédiatement via le JWT,
+    // contrairement au pseudo qui peut être encore null / « ? » juste après un reload.
+    function auctionCurrentBidderId(auction) {
+        return auction?.current_bidder_id
+            || auction?.current_bidder?.id
+            || auction?.current_bidder?.user_id
+            || null;
+    }
+
+    // Suis-je le meneur actuel d'une enchère ? Priorité : UUID → pseudo → dernière mise connue.
+    // → empêche l'auto-bid de surenchérir sur lui-même, y compris juste après un F5.
     function iAmLeading(auction) {
         if (!auction) return false;
+
+        const uid = (typeof currentUserId === 'function') ? currentUserId() : null;
+        const bidderId = auctionCurrentBidderId(auction);
+        if (uid && bidderId && String(uid) === String(bidderId)) return true;
+
         if (isSelf(auction.current_bidder?.username)) return true;
+
         const myLast = myLastBidMap.get(auction.id);
         if (myLast != null) {
-            const cur = auction.current_bid ?? auction.base_amount ?? 0;
-            if (cur <= myLast) return true; // personne n'a misé au-dessus de ma dernière mise
+            const cur = Number(auction.current_bid ?? auction.base_amount ?? 0);
+            if (Number.isFinite(cur) && cur <= Number(myLast)) return true;
         }
         return false;
+    }
+
+    // Filet de sécurité reload : pour une enchère déjà connue comme « mienne », on ne mise
+    // JAMAIS tant qu'on ne peut pas prouver qu'un autre joueur est désormais devant.
+    // Cela évite le cas dangereux : myBidsSet persiste, mais identité/pseudo pas encore résolus.
+    function autoBidBlockedByUncertainSelfState(auction) {
+        if (!auction?.id || !myBidsSet.has(auction.id)) return false;
+        if (iAmLeading(auction)) return true;
+
+        const uid = (typeof currentUserId === 'function') ? currentUserId() : null;
+        const bidderId = auctionCurrentBidderId(auction);
+        if (uid && bidderId) return false; // id différent → on sait qu'un adversaire mène
+
+        const bidderName = auction.current_bidder?.username;
+        if (currentUsername && bidderName && bidderName !== '?') return false; // pseudo différent → adversaire confirmé
+
+        // Si le prix est strictement supérieur à ma dernière mise persistée, je suis forcément dépassé.
+        const myLast = Number(myLastBidMap.get(auction.id));
+        const cur = Number(auction.current_bid ?? auction.base_amount ?? NaN);
+        if (Number.isFinite(myLast) && Number.isFinite(cur) && cur > myLast) return false;
+
+        return true; // état ambigu : on préfère rater un tick que surenchérir sur soi-même
     }
 
     // Enchères avec auto-bid activé : Set<auctionId> — persisté en localStorage
@@ -3231,6 +3306,7 @@
 
             if (
                 alreadyLeading ||
+                autoBidBlockedByUncertainSelfState(a) ||
                 alreadyOwned
             ) {
                 continue;
@@ -3251,24 +3327,9 @@
 
 
             /* =========================================================
-               FENÊTRE D'ENTRÉE HUNTER : MAX 5 MINUTES
-
-               On n'immobilise pas de Wikibidous trop tôt. Cette règle
-               ne concerne que la PREMIÈRE mise automatique du Hunter.
-               Une enchère déjà armée dans autoBidSet continue ensuite
-               d'être gérée normalement par la Hot Lane jusqu'au plafond.
+               RÈGLE GLOBALE : AUCUNE MISE AUTO À PLUS DE 5 MINUTES
                ========================================================= */
-            const hunterEndTs =
-                new Date(a.end_at).getTime();
-
-            const hunterRemainingMs =
-                hunterEndTs - serverNow();
-
-            if (
-                !Number.isFinite(hunterEndTs) ||
-                hunterRemainingMs <= 0 ||
-                hunterRemainingMs > HUNTER_AUTOBID_ENTRY_MAX_MS
-            ) {
+            if (!automaticBidTimeAllowed(a)) {
                 continue;
             }
 
@@ -3405,6 +3466,13 @@
                         bidDelayMs(a)
                     )
             );
+
+            // Le délai humanisé a pu laisser passer une extension serveur :
+            // on ne poste jamais une mise auto si le timer connu est repassé > 5 min.
+            if (!automaticBidTimeAllowed(a)) {
+                bidLockSet.delete(a.id);
+                continue;
+            }
 
 
             try {
@@ -3646,7 +3714,7 @@
             if (hasPriorityKeyword(a.card)) continue;   // prioritaire = mise immédiate assumée
             if (hasFourbeKeyword(a.card)) continue;     // déjà couvert par les mots-clés fourbe
             if (snipeSet.has(a.id) || autoBidSet.has(a.id)) continue;
-            if (isSelf(a.current_bidder?.username)) continue;
+            if (iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) continue;
             if (isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a))) continue; // déjà possédée DANS cette rareté
             const decision = shouldAutoSnipe(a);
             if (!decision.snipe) continue;
@@ -3835,6 +3903,7 @@
                 auctionId,
                 bidAmount
             );
+            saveMyLastBids();
         }
 
         clearOutbid(auctionId);
@@ -3853,8 +3922,11 @@
             ) || auctionObj;
 
         if (target) {
+            const uid = (typeof currentUserId === 'function') ? currentUserId() : null;
+            if (uid) target.current_bidder_id = uid;
             target.current_bidder = {
                 ...(target.current_bidder || {}),
+                ...(uid ? { id: uid } : {}),
                 username: currentUsername
             };
 
@@ -3954,9 +4026,13 @@
                 `<span style="color:#555;font-size:10px;white-space:nowrap;">✅ ${now} · ${total} annonces · ${totalPages} pages</span>`;
             apiHealth.lastMarketScanTs = Date.now(); // santé : dernier scan marché réussi
 
-            // Auto-track : si je suis le current bidder sur une enchère, je la mémorise
+            // Auto-track : UUID/pseudo/dernière mise. Enregistre aussi le montant afin que
+            // l'état survive à un F5 et que le premier scan ne puisse pas miser sur sa propre mise.
             auctions.forEach(a => {
-                if (isSelf(a.current_bidder?.username)) trackMyBid(a.id);
+                if (iAmLeading(a)) {
+                    trackMyBid(a.id);
+                    rememberMyLeadingBid(a, a.current_bid ?? a.base_amount);
+                }
             });
 
             // Prune : retire de myBidsSet les enchères qui ne sont plus en cours
@@ -3993,9 +4069,10 @@
                     wmLog(`📭 Enchère ${id.slice(0, 8)}… terminée`);
                 }
                 myBidsSet.delete(id);
+                myLastBidMap.delete(id);
                 prunedAny = true;
             }
-            if (prunedAny) saveMyBids();
+            if (prunedAny) { saveMyBids(); saveMyLastBids(); }
 
             // Prune autoBidSet : UNIQUEMENT les enchères réellement terminées.
             // Garde-fou anti-blip → on ne coupe plus l'auto-bid sur une enchère qui a
@@ -4265,8 +4342,14 @@
                         hunterAutoDisableMap.set(a.id, h.text);
                         saveHunterAutoDisableMap();
                     }
-                    // 3) Mise initiale unique (les deux modes), jamais au-dessus du plafond
-                    const alreadyLeading = isSelf(a.current_bidder?.username);
+                    // 3) Mise initiale unique (les deux modes), jamais au-dessus du plafond.
+                    // Règle globale : on peut ARMER longtemps à l'avance, mais aucune mise
+                    // automatique n'est envoyée avant T-5:00.
+                    const alreadyLeading = iAmLeading(a) || autoBidBlockedByUncertainSelfState(a);
+                    if (!automaticBidTimeAllowed(a)) {
+                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] — attente T-5 min avant toute mise`);
+                        continue;
+                    }
                     if (alreadyLeading || bidLockSet.has(a.id) || wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) {
                         wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] — pas de mise initiale (${alreadyLeading ? 'déjà meneur' : 'solde/lock'})`);
                         continue;
@@ -4278,6 +4361,10 @@
                     }
                     bidLockSet.add(a.id);
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                    if (!automaticBidTimeAllowed(a)) {
+                        bidLockSet.delete(a.id);
+                        continue;
+                    }
                     try {
                         const res = await fetch(
                             `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
@@ -4303,18 +4390,26 @@
                 for (const a of newHits) {
                     if (handledByHunter.has(a.id)) continue; // déjà géré (plafond + mode) par le chasseur
                     if (!hasPriorityKeyword(a.card)) continue;
-                    const alreadyLeading = isSelf(a.current_bidder?.username);
+                    const alreadyLeading = iAmLeading(a) || autoBidBlockedByUncertainSelfState(a);
                     const alreadyOwned = (collectionMap.get(a.card?.id) || 0) > 0;
                     if (alreadyLeading || alreadyOwned || wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) continue;
                     if (bidLockSet.has(a.id)) continue;
 
-                    // Active l'auto-bid automatiquement sur cette enchère (riposte ultérieure)
+                    // Active l'auto-bid automatiquement sur cette enchère (riposte ultérieure).
+                    // On peut l'armer tôt, mais la règle globale interdit toute mise avant T-5 min.
                     if (!autoBidSet.has(a.id)) {
                         autoBidSet.add(a.id);
                         saveAutoBidSet();
                     }
+                    if (!automaticBidTimeAllowed(a)) {
+                        continue;
+                    }
                     bidLockSet.add(a.id);
                     await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                    if (!automaticBidTimeAllowed(a)) {
+                        bidLockSet.delete(a.id);
+                        continue;
+                    }
                     const bidAmount = minNextBid(a);
                     try {
                         const res = await fetch(
@@ -4352,7 +4447,7 @@
                     if (autoBidSet.has(a.id)) continue;          // déjà en auto-bid → on ne double pas
                     if (snipeSet.has(a.id)) continue;            // déjà armé
                     const alreadyOwned = (collectionMap.get(a.card?.id) || 0) > 0;
-                    if (alreadyOwned || isSelf(a.current_bidder?.username)) continue;
+                    if (alreadyOwned || iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) continue;
                     snipeSet.add(a.id);
                     armedFourbe = true;
                     const title = a.card?.wikipedia_title || '?';
@@ -4400,7 +4495,9 @@
                 // où j'ai du solde. Idempotent : tant que je suis dépassé et sous le
                 // plafond, on re-tente à chaque scan.
                 if (autoBidSet.has(a.id)
+                    && automaticBidTimeAllowed(a)
                     && !iAmLeading(a)
+                    && !autoBidBlockedByUncertainSelfState(a)
                     && wikibidousBalance > 0
                     && !bidLockSet.has(a.id)) {
                     autoBidQueue.push(a);
@@ -4409,6 +4506,7 @@
                 // Mémorise si on est meneur maintenant
                 if (iAmLeading(a)) {
                     if (currentUsername) leadingBidsMap.set(a.id, currentUsername);
+                    rememberMyLeadingBid(a, a.current_bid ?? a.base_amount);
                     clearOutbid(a.id); // on a repris/gardé le lead
                 } else if (leadingBidsMap.has(a.id) && bidder) {
                     leadingBidsMap.set(a.id, bidder);
@@ -4438,13 +4536,20 @@
 
             // 🤖 Auto-bid sur surenchères
             for (const a of autoBidQueue) {
-                // Skip si la hot lane a déjà pris en charge cette enchère
+                // Skip si la hot lane a déjà pris en charge cette enchère.
                 if (bidLockSet.has(a.id)) continue;
+                if (!automaticBidTimeAllowed(a)) continue;
                 const bidAmount = minNextBid(a);
                 // Respecte le plafond par enchère (coupe l'auto-bid si dépassé)
                 if (!autoBidWithinCap(a, bidAmount)) continue;
                 bidLockSet.add(a.id);
                 await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                // Revalidation juste avant le POST : jamais de riposte si le timer connu
+                // est remonté au-dessus de 5 min entre la mise en file et l'envoi.
+                if (!automaticBidTimeAllowed(a)) {
+                    bidLockSet.delete(a.id);
+                    continue;
+                }
                 try {
                     const res = await fetch(
                         "https://www.wiki-masters.com/api/marketplace/" + a.id + "/bid",
@@ -5233,6 +5338,11 @@
             if ('current_bid' in fresh) {
                 cached.current_bid =
                     fresh.current_bid;
+            }
+
+            if ('current_bidder_id' in fresh) {
+                cached.current_bidder_id =
+                    fresh.current_bidder_id;
             }
 
             if ('current_bidder' in fresh) {
@@ -6036,6 +6146,7 @@
                     const cachedHit = lastHitsCache.find(h => h && h.id === a.id);
                     if (cachedHit) {
                         cachedHit.current_bid = a.current_bid;
+                        cachedHit.current_bidder_id = a.current_bidder_id || auctionCurrentBidderId(a);
                         cachedHit.current_bidder = a.current_bidder;
                         if (a.end_at) cachedHit.end_at = a.end_at;
                     }
@@ -6048,12 +6159,20 @@
                 // Riposte instantanée si auto-bid activé sur cette enchère ET sous le plafond.
                 // ⚠️ NE PAS faire `continue` si le plafond est atteint : ça sauterait la MàJ de
                 // leadingBidsMap plus bas → l'outbid serait re-détecté au tick suivant.
-                if (autoBidSet.has(a.id) && wikibidousBalance > 0 && !bidLockSet.has(a.id)) {
+                if (autoBidSet.has(a.id)
+                    && automaticBidTimeAllowed(a)
+                    && wikibidousBalance > 0
+                    && !bidLockSet.has(a.id)) {
                     const bidAmount = bidIncrement(bidOb);
                     if (autoBidWithinCap(a, bidAmount)) { // ne riposte que sous le plafond
                         bidLockSet.add(a.id);
                         try {
-                            // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane)
+                            // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane).
+                            // L'état `a` vient d'être relu côté serveur dans CE tick ; on revalide
+                            // malgré tout la fenêtre de temps au dernier moment.
+                            if (!automaticBidTimeAllowed(a)) {
+                                continue;
+                            }
                             const res = await fetch(
                                 `${MARKET_API_BASE}/${a.id}/bid`,
                                 {
@@ -8466,10 +8585,12 @@
             base_amount: row.base_amount,
             listing_base_amount: row.listing_base_amount,
             current_bid: row.current_bid,
+            current_bidder_id: row.current_bidder_id || null,
             current_bidder: row.current_bidder_id
-                ? { username: (names && names[row.current_bidder_id]) || '?' }
+                ? { id: row.current_bidder_id, username: (names && names[row.current_bidder_id]) || '?' }
                 : null,
-            seller: row.seller_id ? { username: (names && names[row.seller_id]) || '?' } : null,
+            seller_id: row.seller_id || null,
+            seller: row.seller_id ? { id: row.seller_id, username: (names && names[row.seller_id]) || '?' } : null,
             end_at: row.end_at,
             status: row.status,
             winner_id: row.winner_id,
