@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.2.3';
+    const WM_VERSION = '2.3.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -431,6 +431,490 @@
         return true;
     }
 
+    /* ══════════ AUTO-ACHAT → $$$ → FLIP SELLER (v2.3) ══════════
+       Un achat est considéré « auto » uniquement si LE BOT a réellement envoyé au moins
+       une mise automatique gagnante sur cette enchère (Hunter, prioritaire, Fourbe ou
+       riposte auto-bid). Le suivi est persisté : un F5 entre la mise et la victoire ne perd
+       pas l'origine automatique.
+
+       À la victoire :
+       1) archive le vrai final_price (= prix d'achat),
+       2) retrouve l'exemplaire user_card_id reçu,
+       3) crée/pose l'étiquette $$$,
+       4) le Flip Seller peut le revendre ensuite par user_card_id exact.
+
+       Le prix de revente est prudent : plancher = prix d'achat + marge brute configurée ;
+       si une médiane locale/officielle fiable (>=3 ventes) est supérieure, on vise la médiane.
+       L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
+       plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
+    const FLIP_TAG_NAME = '$$$';
+    const AUTO_FLIP_CANDIDATES_KEY = 'wm_auto_flip_candidates_v1';
+    const FLIP_LEDGER_KEY = 'wm_flip_ledger_v1';
+    const FLIP_MARKUP_KEY = 'wm_flip_markup_pct';
+    const FLIP_DURATION_KEY = 'wm_flip_duration_min';
+    const FLIP_UNDERCUT_KEY = 'wm_flip_undercut';
+
+    let FLIP_TAG_ID = null;
+    let flipSellerRunning = false;
+    let flipSellerBusy = false;
+
+    function getFlipMarkupPct() {
+        const n = Number(localStorage.getItem(FLIP_MARKUP_KEY));
+        return Number.isFinite(n) && n >= 0 ? Math.min(500, n) : 20;
+    }
+    function setFlipMarkupPct(v) {
+        const n = Math.max(0, Math.min(500, Number(v) || 0));
+        localStorage.setItem(FLIP_MARKUP_KEY, String(n));
+        return n;
+    }
+    function getFlipDurationMin() {
+        const n = Number(localStorage.getItem(FLIP_DURATION_KEY));
+        return [10, 30, 60, 180, 360, 720, 1440].includes(n) ? n : 60;
+    }
+    function setFlipDurationMin(v) {
+        const n = Number(v);
+        const safe = [10, 30, 60, 180, 360, 720, 1440].includes(n) ? n : 60;
+        localStorage.setItem(FLIP_DURATION_KEY, String(safe));
+        return safe;
+    }
+    function getFlipUndercut() {
+        const raw = localStorage.getItem(FLIP_UNDERCUT_KEY);
+        return raw === null ? true : raw === '1';
+    }
+    function setFlipUndercut(v) {
+        localStorage.setItem(FLIP_UNDERCUT_KEY, v ? '1' : '0');
+    }
+
+    let autoFlipCandidates = new Map();
+    try {
+        const raw = JSON.parse(localStorage.getItem(AUTO_FLIP_CANDIDATES_KEY) || '[]');
+        if (Array.isArray(raw)) autoFlipCandidates = new Map(raw);
+    } catch (e) { autoFlipCandidates = new Map(); }
+
+    function saveAutoFlipCandidates() {
+        try {
+            const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+            for (const [id, c] of [...autoFlipCandidates.entries()]) {
+                if (!c || Number(c.updatedAt || c.firstBidAt || 0) < cutoff) autoFlipCandidates.delete(id);
+            }
+            localStorage.setItem(AUTO_FLIP_CANDIDATES_KEY, JSON.stringify([...autoFlipCandidates.entries()].slice(-2000)));
+        } catch (e) { }
+    }
+
+    // Appelé UNIQUEMENT après une mise automatique réellement acceptée par le serveur.
+    function markAutoFlipCandidate(auction, source, bidAmount) {
+        if (!auction?.id) return;
+        const prev = autoFlipCandidates.get(auction.id) || {};
+        const cardId = auction.card?.id || auction.card_id || prev.cardId || null;
+        autoFlipCandidates.set(auction.id, {
+            auctionId: auction.id,
+            cardId,
+            title: auction.card?.wikipedia_title || prev.title || '?',
+            rarity: globalAuctionRarity(auction) || prev.rarity || '',
+            source: prev.source || source || 'autobid',
+            firstBidAt: prev.firstBidAt || Date.now(),
+            updatedAt: Date.now(),
+            lastAutoBid: Number.isFinite(Number(bidAmount)) ? Number(bidAmount) : (prev.lastAutoBid || null)
+        });
+        saveAutoFlipCandidates();
+    }
+
+    let flipLedger = [];
+    try {
+        const raw = JSON.parse(localStorage.getItem(FLIP_LEDGER_KEY) || '[]');
+        if (Array.isArray(raw)) flipLedger = raw;
+    } catch (e) { flipLedger = []; }
+
+    function saveFlipLedger() {
+        try {
+            flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
+            flipLedger = flipLedger.slice(-1500);
+            localStorage.setItem(FLIP_LEDGER_KEY, JSON.stringify(flipLedger));
+        } catch (e) { }
+        renderFlipHistory();
+    }
+
+    function flipRecordByAuctionId(id) {
+        return flipLedger.find(x => x && x.auctionId === id) || null;
+    }
+    function flipRecordByUserCardId(id) {
+        return flipLedger.find(x => x && x.userCardId === id && x.status !== 'sold') || null;
+    }
+
+    function upsertFlipWin(w, candidate) {
+        let rec = flipRecordByAuctionId(w.id);
+        const buyPrice = Number(w.final_price ?? w.current_bid ?? candidate?.lastAutoBid ?? 0);
+        const boughtAt = w.settled_at ? new Date(w.settled_at).getTime()
+            : w.end_at ? new Date(w.end_at).getTime() : Date.now();
+        if (!rec) {
+            rec = {
+                auctionId: w.id,
+                cardId: w.card?.id || w.card_id || candidate?.cardId || null,
+                title: w.card?.wikipedia_title || candidate?.title || '?',
+                rarity: (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase(),
+                buyPrice: Number.isFinite(buyPrice) ? buyPrice : 0,
+                boughtAt: Number.isFinite(boughtAt) ? boughtAt : Date.now(),
+                source: candidate?.source || 'autobid',
+                userCardId: null,
+                status: 'pending_tag',
+                tagAppliedAt: null,
+                saleAuctionId: null,
+                listPrice: null,
+                listedAt: null,
+                soldPrice: null,
+                soldAt: null,
+                profit: null,
+                relists: 0,
+                lastError: null
+            };
+            flipLedger.push(rec);
+        } else {
+            if (Number.isFinite(buyPrice) && buyPrice > 0) rec.buyPrice = buyPrice;
+            rec.cardId = rec.cardId || w.card?.id || w.card_id || candidate?.cardId || null;
+            rec.title = rec.title || w.card?.wikipedia_title || candidate?.title || '?';
+            rec.rarity = rec.rarity || (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase();
+            rec.source = rec.source || candidate?.source || 'autobid';
+        }
+        saveFlipLedger();
+        return rec;
+    }
+
+    async function ensureFlipTagId() {
+        if (FLIP_TAG_ID) return FLIP_TAG_ID;
+        try {
+            const tags = await fetchUserTags();
+            const existing = Array.isArray(tags) ? tags.find(t => t && t.name === FLIP_TAG_NAME) : null;
+            if (existing?.id) {
+                FLIP_TAG_ID = existing.id;
+                return FLIP_TAG_ID;
+            }
+        } catch (e) { }
+        const created = await createTrashTag(FLIP_TAG_NAME); // helper générique find-or-create
+        if (created?.ok && created.id) FLIP_TAG_ID = created.id;
+        return FLIP_TAG_ID;
+    }
+
+    function itemObtainedTs(item) {
+        if (!item) return NaN;
+        for (const k of ['obtained_at', 'acquired_at', 'updated_at', 'created_at']) {
+            const t = new Date(item[k] || NaN).getTime();
+            if (Number.isFinite(t)) return t;
+        }
+        return NaN;
+    }
+
+    // Retrouve l'exemplaire gagné. /my-collection trié par obtained_at est privilégié car
+    // c'est précisément l'ordre d'acquisition visible côté site ; repli Supabase si nécessaire.
+    async function findWonUserCardIdForFlip(rec) {
+        if (!rec?.cardId) return null;
+        const tagId = await ensureFlipTagId();
+        const targetTs = Number(rec.boughtAt) || Date.now();
+
+        try {
+            const matches = [];
+            for (let page = 0; page < 4; page++) {
+                const res = await fetch(
+                    `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50&sort=obtained_at`,
+                    { credentials: 'include' }
+                );
+                if (!res.ok) break;
+                const data = await res.json();
+                const items = data.collection || [];
+                for (const it of items) {
+                    if ((it.card_id || it.card?.id) !== rec.cardId) continue;
+                    if ((it.tags || []).some(t => t.name === FLIP_TAG_NAME)) {
+                        // Si ce record a déjà été tagué avant un reload, c'est probablement lui.
+                        matches.push({ ...it, _alreadyFlip: true });
+                    } else {
+                        matches.push(it);
+                    }
+                }
+                if (matches.length > 0 || items.length < 50) break;
+            }
+            if (matches.length > 0) {
+                matches.sort((a, b) => {
+                    const ta = itemObtainedTs(a), tb = itemObtainedTs(b);
+                    const da = Number.isFinite(ta) ? Math.abs(ta - targetTs) : Number.MAX_SAFE_INTEGER;
+                    const db = Number.isFinite(tb) ? Math.abs(tb - targetTs) : Number.MAX_SAFE_INTEGER;
+                    return da - db;
+                });
+                if (matches[0]?.id) return matches[0].id;
+            }
+        } catch (e) { }
+
+        const uid = currentUserId();
+        if (!uid) return null;
+        try {
+            const rows = await supabaseSelect(
+                `user_cards?card_id=eq.${rec.cardId}&user_id=eq.${uid}&select=*&order=created_at.desc&limit=20`
+            );
+            if (Array.isArray(rows) && rows.length > 0) {
+                // Évite si possible un exemplaire déjà utilisé par un autre flip actif.
+                const used = new Set(flipLedger.filter(x => x !== rec && x.userCardId && x.status !== 'sold').map(x => x.userCardId));
+                const free = rows.filter(r => !used.has(r.id));
+                const pool = free.length ? free : rows;
+                pool.sort((a, b) => {
+                    const ta = itemObtainedTs(a), tb = itemObtainedTs(b);
+                    const da = Number.isFinite(ta) ? Math.abs(ta - targetTs) : Number.MAX_SAFE_INTEGER;
+                    const db = Number.isFinite(tb) ? Math.abs(tb - targetTs) : Number.MAX_SAFE_INTEGER;
+                    return da - db;
+                });
+                return pool[0]?.id || null;
+            }
+        } catch (e) { }
+        return null;
+    }
+
+    async function tagFlipRecord(rec) {
+        if (!rec || rec.status === 'sold' || rec.status === 'listed') return false;
+        const tagId = await ensureFlipTagId();
+        if (!tagId) {
+            rec.status = 'pending_tag'; rec.lastError = 'tag $$$ introuvable/création impossible'; saveFlipLedger();
+            return false;
+        }
+        if (!rec.userCardId) rec.userCardId = await findWonUserCardIdForFlip(rec);
+        if (!rec.userCardId) {
+            rec.status = 'pending_tag'; rec.lastError = 'exemplaire gagné pas encore visible'; saveFlipLedger();
+            return false;
+        }
+        const r = await addTagToUserCard(rec.userCardId, tagId);
+        if (!r?.ok) {
+            rec.status = 'pending_tag'; rec.lastError = r?.error || `HTTP ${r?.status || '?'}`; saveFlipLedger();
+            return false;
+        }
+        rec.status = 'tagged';
+        rec.tagAppliedAt = Date.now();
+        rec.lastError = null;
+        saveFlipLedger();
+        wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>$$$</b> posé.`);
+        return true;
+    }
+
+    async function processAutoFlipWins(won) {
+        if (!Array.isArray(won) || autoFlipCandidates.size === 0) return;
+        let changedCandidates = false;
+        for (const w of won) {
+            if (!w?.id) continue;
+            const candidate = autoFlipCandidates.get(w.id);
+            if (!candidate) continue;
+            const rec = upsertFlipWin(w, candidate);
+            // En cas de propagation lente, le record reste pending_tag et sera retenté par le seller/sync.
+            await tagFlipRecord(rec).catch(() => false);
+            autoFlipCandidates.delete(w.id);
+            changedCandidates = true;
+        }
+        if (changedCandidates) saveAutoFlipCandidates();
+    }
+
+    async function retryPendingFlipTags() {
+        const pending = flipLedger.filter(r => r && r.status === 'pending_tag').slice(0, 10);
+        for (const rec of pending) {
+            await tagFlipRecord(rec).catch(() => false);
+            await new Promise(r => setTimeout(r, 250));
+        }
+    }
+
+    async function fetchFlipTaggedUserCardIds() {
+        const tagId = await ensureFlipTagId();
+        if (!tagId) return null;
+        const rows = await supabaseSelect(`user_card_tags?tag_id=eq.${tagId}&select=user_card_id&limit=2000`);
+        if (!Array.isArray(rows)) return null;
+        return new Set(rows.map(r => r?.user_card_id).filter(Boolean));
+    }
+
+    async function resolveFlipSellPrice(rec) {
+        const buy = Math.max(1, Number(rec?.buyPrice) || 1);
+        const floor = Math.max(1, Math.ceil(buy * (1 + getFlipMarkupPct() / 100)));
+        const stats = getCachedSales(rec.cardId, rec.rarity);
+        let price = floor;
+        let basis = `achat +${getFlipMarkupPct()}%`;
+        if (stats && stats.count >= 3 && Number(stats.median) > price) {
+            price = Math.round(stats.median);
+            basis = `médiane ${stats.median}`;
+        }
+        if (getFlipUndercut()) {
+            const lowest = await fetchLowestActiveListing(rec.cardId).catch(() => null);
+            if (Number.isFinite(lowest) && lowest > 1) {
+                const under = Math.max(1, Math.round(lowest - 1));
+                // On undercut uniquement si cela baisse notre prix SANS casser la marge plancher.
+                if (under >= floor && under < price) {
+                    price = under;
+                    basis = `undercut ${lowest} (plancher ${floor})`;
+                }
+            }
+        }
+        return { price: Math.max(1, Math.round(price)), floor, basis, stats };
+    }
+
+    async function listFlipRecord(rec) {
+        if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') return { ok: false, reason: 'record_invalide' };
+        const tagged = await fetchFlipTaggedUserCardIds();
+        if (tagged && !tagged.has(rec.userCardId)) return { ok: false, reason: 'tag_absent' };
+        const priceInfo = await resolveFlipSellPrice(rec);
+        const duration = getFlipDurationMin();
+        try {
+            const res = await fetch(MARKET_API_BASE, {
+                method: 'POST', credentials: 'include',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    card_id: rec.cardId,
+                    user_card_id: rec.userCardId,
+                    base_amount: priceInfo.price,
+                    duration_minutes: duration
+                })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
+            rec.status = 'listed';
+            rec.saleAuctionId = data.auction_id || null;
+            rec.listPrice = priceInfo.price;
+            rec.listedAt = Date.now();
+            rec.lastError = null;
+            saveFlipLedger();
+            wmLog(`💸 Flip Seller : <b>${rec.title}</b> [${rec.rarity}] · acheté ${rec.buyPrice} → listé <b>${priceInfo.price} 💰</b> (${priceInfo.basis}, ${duration} min).`);
+            return { ok: true, auctionId: rec.saleAuctionId, priceInfo };
+        } catch (e) {
+            return { ok: false, reason: e.message || 'exception réseau' };
+        }
+    }
+
+    async function syncFlipSaleResults() {
+        const listed = flipLedger.filter(r => r && r.status === 'listed' && r.saleAuctionId);
+        if (listed.length === 0) return;
+        const rows = await fetchAuctionsByIds(listed.map(r => r.saleAuctionId));
+        if (!(rows instanceof Map)) return;
+        let changed = false;
+        for (const rec of listed) {
+            const row = rows.get(rec.saleAuctionId);
+            if (!row || auctionRowStillActive(row)) continue;
+            const fp = Number(row.final_price);
+            if (row.winner_id && Number.isFinite(fp) && fp > 0) {
+                rec.status = 'sold';
+                rec.soldPrice = fp;
+                rec.soldAt = row.settled_at ? new Date(row.settled_at).getTime() : Date.now();
+                rec.profit = fp - Number(rec.buyPrice || 0);
+                rec.lastError = null;
+                changed = true;
+                wmLog(`💰 Flip vendu : <b>${rec.title}</b> · achat ${rec.buyPrice} → vente <b>${fp} 💰</b> · résultat <b style="color:${rec.profit >= 0 ? '#4ade80' : '#ef4444'};">${rec.profit >= 0 ? '+' : ''}${rec.profit} 💰</b>.`);
+                continue;
+            }
+            // Enchère terminée sans acheteur : la carte revient, son ancien lien de tag peut
+            // avoir disparu avec la mise en vente. On la remet dans le circuit $$$.
+            rec.status = 'pending_tag';
+            rec.saleAuctionId = null;
+            rec.userCardId = null;
+            rec.relists = Number(rec.relists || 0) + 1;
+            rec.lastError = 'invendue — retag en attente';
+            changed = true;
+        }
+        if (changed) saveFlipLedger();
+    }
+
+    function renderFlipHistory() {
+        const el = document.getElementById('wm-flip-history');
+        const countEl = document.getElementById('wm-flip-count');
+        if (countEl) {
+            const open = flipLedger.filter(r => r && ['pending_tag', 'tagged', 'listed'].includes(r.status)).length;
+            countEl.textContent = `${open} en cours`;
+        }
+        if (!el) return;
+        const rows = [...flipLedger].sort((a, b) => Number(b.boughtAt || 0) - Number(a.boughtAt || 0)).slice(0, 8);
+        if (rows.length === 0) {
+            el.innerHTML = '<div style="color:#555;font-size:9px;">Aucun achat-revente automatique pour le moment.</div>';
+            return;
+        }
+        const stateLabel = r => {
+            if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${r.soldPrice} · ${r.profit >= 0 ? '+' : ''}${r.profit} 💰</span>`;
+            if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${r.listPrice} 💰</span>`;
+            if (r.status === 'tagged') return '<span style="color:#fbbf24;">$$$ prêt</span>';
+            return '<span style="color:#888;">tag en attente</span>';
+        };
+        el.innerHTML = rows.map(r => `<div style="display:flex;justify-content:space-between;gap:6px;font-size:9px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04);">
+            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;" title="${htmlEsc(r.title || '?')}">${htmlEsc(r.title || '?')} <span style="color:#666;">[${htmlEsc(r.rarity || '?')}]</span></span>
+            <span style="white-space:nowrap;color:#aaa;">achat ${Number(r.buyPrice || 0).toLocaleString('fr-FR')} · ${stateLabel(r)}</span>
+        </div>`).join('');
+    }
+
+    async function runFlipSeller(btn, statusEl) {
+        if (flipSellerBusy) return;
+        flipSellerBusy = true;
+        try {
+            while (flipSellerRunning) {
+                await retryPendingFlipTags();
+                await syncFlipSaleResults();
+                if (!flipSellerRunning) break;
+
+                const taggedIds = await fetchFlipTaggedUserCardIds();
+                if (taggedIds == null) {
+                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag $$$ illisible — réessai dans 15s…</span>';
+                    await new Promise(r => setTimeout(r, 15000));
+                    continue;
+                }
+
+                const ready = flipLedger
+                    .filter(r => r && r.status === 'tagged' && r.userCardId && taggedIds.has(r.userCardId))
+                    .sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
+
+                const state = await fetchSellingState();
+                if (!state) {
+                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>';
+                    await new Promise(r => setTimeout(r, 15000));
+                    continue;
+                }
+                const maxActive = effectiveMaxActive(state.max);
+                const slots = Math.max(0, maxActive - state.count);
+                if (ready.length === 0) {
+                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun $$$ prêt · ${state.count}/${maxActive} ventes actives</span>`;
+                    await new Promise(r => setTimeout(r, 15000));
+                    continue;
+                }
+                if (slots === 0) {
+                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives</span>`;
+                    await new Promise(r => setTimeout(r, 15000));
+                    continue;
+                }
+
+                const batch = ready.slice(0, slots);
+                if (statusEl) statusEl.innerHTML = `<span style="color:#06b6d4;">💸 Mise en vente de ${batch.length} flip(s)…</span>`;
+                let ok = 0, fail = 0;
+                for (const rec of batch) {
+                    if (!flipSellerRunning) break;
+                    const r = await listFlipRecord(rec);
+                    if (r.ok) ok++;
+                    else {
+                        fail++;
+                        rec.lastError = r.reason || 'échec mise en vente';
+                        saveFlipLedger();
+                        wmLog(`⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`);
+                    }
+                    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
+                }
+                if (statusEl) statusEl.innerHTML = `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} échec(s)</span>` : ''}`;
+                renderFlipHistory();
+                await new Promise(r => setTimeout(r, 10000));
+            }
+        } finally {
+            flipSellerBusy = false;
+        }
+    }
+
+    window.wmFlipInfo = function () {
+        const info = {
+            candidatsAuto: autoFlipCandidates.size,
+            achatsFlip: flipLedger.length,
+            pendingTag: flipLedger.filter(r => r.status === 'pending_tag').length,
+            prets: flipLedger.filter(r => r.status === 'tagged').length,
+            enVente: flipLedger.filter(r => r.status === 'listed').length,
+            vendus: flipLedger.filter(r => r.status === 'sold').length,
+            profitBrutRealise: flipLedger.filter(r => r.status === 'sold').reduce((s, r) => s + Number(r.profit || 0), 0),
+            margeCiblePct: getFlipMarkupPct(),
+            dureeMin: getFlipDurationMin(),
+            undercut: getFlipUndercut()
+        };
+        console.table(info);
+        return info;
+    };
+
     /* Aucun `fetch()` de ce fichier n'a de timeout par défaut : si une requête reste bloquée
        (connexion qui stagne, serveur qui ne répond pas), le `await` qui l'attend gèle
        SILENCIEUSEMENT — pas d'erreur, pas de retry, juste une boucle qui ne boucle plus. C'est
@@ -475,6 +959,11 @@
         let won = Array.isArray(data?.won) ? data.won : null;
         if (!won) won = await fetchWonFromDb(100);
         if (!Array.isArray(won)) return;
+
+        // Traite les victoires provenant d'une mise automatique AVANT le garde-fou
+        // wonInitialized : ainsi un reload entre le dernier bid et le settlement n'empêche
+        // jamais le tag $$$ / l'enregistrement du prix d'achat.
+        await processAutoFlipWins(won);
 
         // L'archive est alimentée à CHAQUE passage, y compris le premier : c'est justement
         // lui qui capture la fenêtre serveur existante et amorce l'historique long.
@@ -3235,476 +3724,174 @@
     // Mutualisé entre le scan (nouvelles annonces) ET l'activation du Hunter (annonces déjà
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
     async function runHunterAutoBidPass(list) {
-
-        if (
-            !autoSnipeEnabled ||
-            !Array.isArray(list)
-        ) {
-            return 0;
-        }
-
-
-        /*
-         * Hunter agressif :
-         * comportement Fourbe existant.
-         *
-         * Pas de mise immédiate.
-         */
-        if (hunterAggressive) {
-            return runHunterFourbePass(list);
-        }
-
+        if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
+        if (hunterAggressive) return runHunterFourbePass(list);
 
         let placed = 0;
 
+        // Prépare une mise à partir d'un état FRAIS de l'enchère.
+        // Important : le scan complet peut déjà avoir quelques secondes de retard au moment du POST.
+        async function prepareFreshHunterBid(seed, serverMinimum = null) {
+            if (!seed || !seed.id) return null;
 
-        for (const a of list) {
-
-            if (
-                !a ||
-                !a.id
-            ) {
-                continue;
-            }
-
-
-            /*
-             * Les mécanismes spécialisés restent prioritaires.
-             */
-            if (
-                matchedHunterEntry(a.card)
-            ) {
-                continue;
-            }
-
-
-            if (
-                hasPriorityKeyword(a.card)
-            ) {
-                continue;
-            }
-
-
-            if (
-                snipeSet.has(a.id) ||
-                hasFourbeKeyword(a.card)
-            ) {
-                continue;
-            }
-
-
-            const alreadyLeading =
-                iAmLeading(a);
-
-
-            const listingRarity = globalAuctionRarity(a);
-            const alreadyOwned = isOwnedDuplicate(
-                a.card?.id ?? a.card_id,
-                listingRarity
-            );
-
-
-            if (
-                alreadyLeading ||
-                autoBidBlockedByUncertainSelfState(a) ||
-                alreadyOwned
-            ) {
-                continue;
-            }
-
-
-            /*
-             * Si cette enchère possède déjà un auto-bid,
-             * on ne vient pas écraser son plafond.
-             *
-             * Elle est déjà prise en charge par la Hot Lane.
-             */
-            if (
-                autoBidSet.has(a.id)
-            ) {
-                continue;
-            }
-
-
-            /* =========================================================
-               RÈGLE GLOBALE : AUCUNE MISE AUTO À PLUS DE 5 MINUTES
-               ========================================================= */
-            if (!automaticBidTimeAllowed(a)) {
-                continue;
-            }
-
-
-            /* =========================================================
-               DÉCISION HUNTER
-               ========================================================= */
-
-            const decision =
-                shouldAutoSnipe(a);
-
-
-            if (
-                !decision.snipe
-            ) {
-                continue;
-            }
-
-
-            if (
-                wikibidousBalance <=
-                getSetting(
-                    'minBalanceForAutoSnipe'
-                )
-            ) {
-                continue;
-            }
-
-
-            /*
-             * La toute première mise est TOUJOURS
-             * la mise minimale suivante.
-             *
-             * Jamais directement 85 % de la médiane.
-             */
-            const bidAmount =
-                minNextBid(a);
-
-
-            const mode =
-                getSetting(
-                    'autoSnipeMode'
-                );
-
-
-            const isDynamic =
-                mode === 'adaptive';
-
-
-            /* =========================================================
-               HUNTER DYNAMIQUE :
-               le seuil 85 % devient un PLAFOND
-               ========================================================= */
-
-            if (isDynamic) {
-
-                const cap =
-                    Number(
-                        decision.cap
-                    );
-
-
-                /*
-                 * Sécurité :
-                 *
-                 * même si le prix courant est encore sous 85 %,
-                 * l'incrément minimum demandé par WikiMasters peut
-                 * directement dépasser le plafond.
-                 *
-                 * Exemple :
-                 *
-                 * médiane 1000
-                 * plafond 850
-                 * prix courant 840
-                 * prochaine mise 924
-                 *
-                 * → on ne mise PAS.
-                 */
-                if (
-                    !Number.isFinite(cap) ||
-                    cap <= 0 ||
-                    bidAmount > cap
-                ) {
-
-                    const title =
-                        a.card
-                            ?.wikipedia_title
-                        ||
-                        '?';
-
-
-                    const rar =
-                        (
-                            a.card
-                                ?.rarity
-                            ||
-                            ''
-                        )
-                            .toUpperCase();
-
-
-                    wmLog(
-                        `🛑 Hunter dynamique : ` +
-                        `<b>${title}</b> [${rar}] · ` +
-                        `mise minimale ` +
-                        `<b>${bidAmount} 💰</b> ` +
-                        `> plafond ` +
-                        `<b>${cap || '?'} 💰</b> ` +
-                        `→ aucune mise`
-                    );
-
-
-                    continue;
+            let fresh = seed;
+            try {
+                const serverAuction = await fetchSingleAuction(seed.id);
+                if (serverAuction) {
+                    fresh = serverAuction;
+                    applyFreshAuctionState(fresh, { render: false, logExtension: true });
                 }
+            } catch (e) {
+                // Si la lecture fraîche échoue, on ne prend PAS le risque de bidder sur l'état ancien.
+                return null;
             }
 
+            if (!automaticBidTimeAllowed(fresh)) return null;
+            if (iAmLeading(fresh) || autoBidBlockedByUncertainSelfState(fresh)) return null;
 
-            if (
-                bidLockSet.has(a.id)
-            ) {
-                continue;
+            const listingRarity = globalAuctionRarity(fresh);
+            if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) return null;
+
+            const decision = shouldAutoSnipe(fresh);
+            if (!decision.snipe) return null;
+
+            let amount = minNextBid(fresh);
+            if (Number.isFinite(serverMinimum) && serverMinimum > amount) {
+                // Le message du serveur est la source de vérité si quelqu'un a encore bid
+                // entre notre relecture et le POST précédent.
+                amount = Math.ceil(serverMinimum);
             }
 
+            const mode = getSetting('autoSnipeMode');
+            const isDynamic = mode === 'adaptive';
+            if (isDynamic) {
+                const cap = Number(decision.cap);
+                if (!Number.isFinite(cap) || cap <= 0 || amount > cap) return null;
+            }
 
-            bidLockSet.add(
-                a.id
+            return { auction: fresh, decision, amount, isDynamic };
+        }
+
+        async function postHunterBid(auctionId, amount) {
+            const res = await fetch(
+                `${MARKET_API_BASE}/${auctionId}/bid`,
+                {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount })
+                }
             );
+            const data = await res.json().catch(() => ({}));
+            return { res, data };
+        }
 
+        function minimumFromTooLowError(data) {
+            const text = String(data?.error || data?.message || '');
+            if (!/mise\s+trop\s+basse/i.test(text)) return null;
+            const m = text.match(/minimum\s+(\d+)/i);
+            if (!m) return null;
+            const n = Number(m[1]);
+            return Number.isFinite(n) && n > 0 ? n : null;
+        }
 
-            await new Promise(
-                r =>
-                    setTimeout(
-                        r,
-                        bidDelayMs(a)
-                    )
-            );
+        for (const seed of list) {
+            if (!seed || !seed.id) continue;
+            if (matchedHunterEntry(seed.card)) continue;
+            if (hasPriorityKeyword(seed.card)) continue;
+            if (snipeSet.has(seed.id) || hasFourbeKeyword(seed.card)) continue;
+            if (autoBidSet.has(seed.id)) continue;
 
-            // Le délai humanisé a pu laisser passer une extension serveur :
-            // on ne poste jamais une mise auto si le timer connu est repassé > 5 min.
-            if (!automaticBidTimeAllowed(a)) {
-                bidLockSet.delete(a.id);
-                continue;
-            }
+            // Filtres rapides sur le snapshot du scan : évitent une relecture serveur inutile.
+            if (!automaticBidTimeAllowed(seed)) continue;
+            if (iAmLeading(seed) || autoBidBlockedByUncertainSelfState(seed)) continue;
+            const seedRarity = globalAuctionRarity(seed);
+            if (isOwnedDuplicate(seed.card?.id ?? seed.card_id, seedRarity)) continue;
+            const seedDecision = shouldAutoSnipe(seed);
+            if (!seedDecision.snipe) continue;
+            if (wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) continue;
+            if (bidLockSet.has(seed.id)) continue;
 
+            bidLockSet.add(seed.id);
 
             try {
+                await new Promise(r => setTimeout(r, bidDelayMs(seed)));
 
-                const res =
-                    await fetch(
-                        `https://www.wiki-masters.com/api/marketplace/${a.id}/bid`,
-                        {
-                            method:
-                                "POST",
+                // 1) Relecture autoritaire JUSTE AVANT la mise.
+                let prepared = await prepareFreshHunterBid(seed);
+                if (!prepared) continue;
 
-                            credentials:
-                                "include",
+                let { auction, decision, amount, isDynamic } = prepared;
+                let attempt = await postHunterBid(auction.id, amount);
 
-                            headers: {
-                                "Content-Type":
-                                    "application/json"
-                            },
-
-                            body:
-                                JSON.stringify({
-                                    amount:
-                                        bidAmount
-                                })
+                // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
+                // notre relecture et le POST, le serveur renvoie son minimum actuel. On relit
+                // encore l'enchère, vérifie self-bid / T-5 / plafond, puis retente UNE fois.
+                if (!attempt.res.ok) {
+                    const serverMinimum = minimumFromTooLowError(attempt.data);
+                    if (serverMinimum !== null) {
+                        const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
+                        if (retryPrepared && retryPrepared.amount !== amount) {
+                            auction = retryPrepared.auction;
+                            decision = retryPrepared.decision;
+                            amount = retryPrepared.amount;
+                            isDynamic = retryPrepared.isDynamic;
+                            attempt = await postHunterBid(auction.id, amount);
                         }
-                    );
+                    }
+                }
 
+                const title = auction.card?.wikipedia_title || seed.card?.wikipedia_title || '?';
+                const rar = globalAuctionRarity(auction) || globalAuctionRarity(seed) || '';
 
-                const data =
-                    await res
-                        .json()
-                        .catch(
-                            () => ({})
-                        );
-
-
-                const title =
-                    a.card
-                        ?.wikipedia_title
-                    ||
-                    "?";
-
-
-                const rar =
-                    (
-                        a.card
-                            ?.rarity
-                        ||
-                        ''
-                    )
-                        .toUpperCase();
-
-
-                /* =====================================================
-                   MISE INITIALE RÉUSSIE
-                   ===================================================== */
-
-                if (res.ok) {
-
-
-                    /*
-                     * IMPORTANT :
-                     *
-                     * En mode dynamique, APRÈS la première mise réussie,
-                     * on transforme l'enchère en auto-bid plafonné.
-                     */
+                if (attempt.res.ok) {
                     if (isDynamic) {
-
-                        /*
-                         * Plafond exact calculé depuis :
-                         *
-                         * médiane × autoSnipeAdaptiveRatio
-                         *
-                         * typiquement 85 %.
-                         */
-                        setAutoBidMax(
-                            a.id,
-                            decision.cap
-                        );
-
-
-                        /*
-                         * Active les ripostes automatiques.
-                         */
-                        autoBidSet.add(
-                            a.id
-                        );
-
-
+                        setAutoBidMax(auction.id, decision.cap);
+                        autoBidSet.add(auction.id);
                         saveAutoBidSet();
                     }
 
-
-                    /*
-                     * Doit être appelé APRÈS l'armement :
-                     *
-                     * markAuctionAsMine() réveille la Hot Lane,
-                     * qui verra donc immédiatement que cette
-                     * enchère possède maintenant un auto-bid.
-                     */
-                    markAuctionAsMine(
-                        a.id,
-                        bidAmount,
-                        a
-                    );
-
-
+                    markAuctionAsMine(auction.id, amount, auction);
+                    markAutoFlipCandidate(auction, getSetting('autoSnipeMode') === 'adaptive' ? 'hunter_dynamic' : 'hunter_fixed', amount);
                     placed++;
 
-
                     if (isDynamic) {
-
                         wmLog(
-                            `🤖 Hunter dynamique : ` +
-                            `<b>${title}</b> [${rar}] → ` +
-                            `<span style="color:#fbbf24;">` +
-                            `${bidAmount} 💰` +
-                            `</span>` +
-                            ` · médiane ` +
-                            `<b>${decision.reason.match(/\((\d+)\)/)?.[1] || '?'}</b>` +
+                            `🤖 Hunter dynamique : <b>${title}</b> [${rar}] → ` +
+                            `<span style="color:#fbbf24;">${amount} 💰</span>` +
+                            ` · médiane <b>${decision.reason.match(/\((\d+)\)/)?.[1] || '?'}</b>` +
                             ` · auto-bid armé jusqu'à ` +
-                            `<span style="color:#4ade80;font-weight:700;">` +
-                            `${decision.cap} 💰` +
-                            `</span>`
+                            `<span style="color:#4ade80;font-weight:700;">${decision.cap} 💰</span>`
                         );
-
-
                         sendToDiscord(
-                            "🤖 Hunter dynamique : **" +
-                            title +
-                            "** → mise **" +
-                            bidAmount +
-                            " 💰** · auto-bid jusqu'à **" +
-                            decision.cap +
-                            " 💰**",
+                            `🤖 Hunter dynamique : **${title}** → mise **${amount} 💰** · auto-bid jusqu'à **${decision.cap} 💰**`,
                             5763719,
                             'market'
                         );
-
                     } else {
-
-                        /*
-                         * Mode fixe :
-                         * comportement précédent conservé.
-                         */
-                        const reasonStr =
-                            decision.reason
-                                ?
-                                ` <span style="color:#666;font-size:9px;">` +
-                                `(${decision.reason})` +
-                                `</span>`
-                                :
-                                '';
-
-
-                        wmLog(
-                            `🤖 Hunter : ` +
-                            `<b>${title}</b> [${rar}] → ` +
-                            `<span style="color:#fbbf24;">` +
-                            `${bidAmount} 💰` +
-                            `</span>` +
-                            reasonStr
-                        );
-
-
-                        sendToDiscord(
-                            "🤖 Auto-bid place : **" +
-                            title +
-                            "** a **" +
-                            bidAmount +
-                            " coins**",
-                            5763719,
-                            'market'
-                        );
+                        const reasonStr = decision.reason
+                            ? ` <span style="color:#666;font-size:9px;">(${decision.reason})</span>`
+                            : '';
+                        wmLog(`🤖 Hunter : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${amount} 💰</span>${reasonStr}`);
+                        sendToDiscord(`🤖 Auto-bid place : **${title}** a **${amount} coins**`, 5763719, 'market');
                     }
-
-
                 } else {
-
-                    wmLog(
-                        `⚠️ Hunter échoué : ` +
-                        `<b>${title}</b> [${rar}] · ` +
-                        `${data?.error || 'erreur'}`
-                    );
-
-
-                    sendToDiscord(
-                        "⚠️ Auto-bid echoue : **" +
-                        title +
-                        "** - " +
-                        (
-                            data?.error
-                            ||
-                            "erreur inconnue"
-                        ),
-                        15548997,
-                        'market'
-                    );
+                    const error = attempt.data?.error || attempt.data?.message || 'erreur';
+                    wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${error}`);
+                    sendToDiscord(`⚠️ Auto-bid echoue : **${title}** - ${error}`, 15548997, 'market');
                 }
-
-
             } catch (e) {
-
-                // La mise initiale a échoué :
-                // aucun auto-bid n'est armé.
-
+                // Aucun auto-bid n'est armé si la mise initiale n'a pas abouti.
             } finally {
-
-                bidLockSet.delete(
-                    a.id
-                );
+                bidLockSet.delete(seed.id);
             }
 
-
-            await new Promise(
-                r =>
-                    setTimeout(
-                        r,
-                        bidDelayMs(a)
-                    )
-            );
+            await new Promise(r => setTimeout(r, bidDelayMs(seed)));
         }
-
 
         return placed;
     }
 
-    // Variante AGRESSIVE du Hunter : mêmes cartes, même seuil, mais aucune mise immédiate —
-    // on arme le Fourbe plafonné au seuil. 100 % local (aucune requête) donc instantané, et
-    // sans await : appelable en boucle depuis le scan sans le ralentir.
-    // NB : pas de contrôle du plancher `minBalanceForAutoSnipe` ici, comme pour tout Fourbe —
-    // c'est au moment du tir que le solde est vérifié, et il peut changer d'ici là.
     function runHunterFourbePass(list) {
         if (!Array.isArray(list)) return 0;
         let armed = 0;
@@ -4377,6 +4564,7 @@
                         const data = await res.json().catch(() => ({}));
                         if (res.ok) {
                             markAuctionAsMine(a.id, bidAmount, a);
+                            markAutoFlipCandidate(a, 'hunter_targeted', bidAmount);
                             wmLog(`🎯 Chasseur (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] → mise <span style="color:#fbbf24;">${bidAmount} 💰</span>${h.mode === 'fourbe' ? ' · snipe armé en fin' : ' · riposte activée'}`);
                             sendToDiscord("🎯 Chasseur : **" + title + "** mise **" + bidAmount + " coins** (mode " + h.mode + ", plafond " + h.cap + ")", 3447003, 'market');
                         } else {
@@ -4425,6 +4613,7 @@
                         const rar = (a.card?.rarity || '').toUpperCase();
                         if (res.ok) {
                             markAuctionAsMine(a.id, bidAmount, a);
+                            markAutoFlipCandidate(a, 'priority', bidAmount);
                             wmLog(`⭐ Mot-clé prioritaire : <b>${title}</b> [${rar}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                             sendToDiscord(
                                 "⭐ Auto-bid prioritaire : **" + title + "** à **" + bidAmount + " coins**",
@@ -4561,6 +4750,7 @@
                     );
                     if (res.ok) {
                         markAuctionAsMine(a.id, bidAmount, a);
+                        markAutoFlipCandidate(a, 'autobid', bidAmount);
                         const titleAb = a.card?.wikipedia_title || '?';
                         const rarAb = (a.card?.rarity || '').toUpperCase();
                         wmLog(`🤖 Auto-bid (riposte) : <b>${titleAb}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
@@ -6098,6 +6288,7 @@
                             );
                             if (res.ok) {
                                 markAuctionAsMine(a.id, bidAmount, a);
+                                markAutoFlipCandidate(a, 'fourbe', bidAmount);
                                 const secLeft = Math.round(remaining / 1000);
                                 wmLog(`🕵️ Fourbe (snipe à ${secLeft}s) : <b>${titleSn}</b> [${rarSn}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                                 fetchBalance().catch(() => { });
@@ -6183,6 +6374,7 @@
                             );
                             if (res.ok) {
                                 markAuctionAsMine(a.id, bidAmount, a);
+                                markAutoFlipCandidate(a, 'autobid_hotlane', bidAmount);
                                 wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                                 // Refresh balance en arrière-plan, sans bloquer le tick
                                 fetchBalance().catch(() => { });
@@ -10079,6 +10271,28 @@
                     <div class="wm-lbl">Ventes (aujourd'hui)</div>
                     <div id="wm-sell-history" style="margin-bottom:8px;"></div>
                     <div class="wm-sep"></div>
+                    <div style="display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:5px;">
+                        <div class="wm-lbl" style="margin:0;color:#4ade80;">💸 Flip Seller <span id="wm-flip-count" style="color:#666;font-size:9px;font-weight:400;"></span></div>
+                        <button class="wm-btn wm-g wm-sm" id="wm-flip-btn" style="padding:2px 8px;">▶ START</button>
+                    </div>
+                    <div id="wm-flip-status" style="font-size:9px;color:#888;min-height:13px;margin-bottom:5px;"></div>
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:5px;">
+                        <label style="font-size:9px;color:#888;">Marge brute mini %
+                            <input id="wm-flip-markup" type="number" min="0" max="500" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#888;">Durée
+                            <select id="wm-flip-duration" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
+                                <option value="10">10 min</option><option value="30">30 min</option><option value="60">1 h</option><option value="180">3 h</option><option value="360">6 h</option><option value="720">12 h</option><option value="1440">24 h</option>
+                            </select>
+                        </label>
+                    </div>
+                    <label style="display:flex;align-items:center;gap:5px;font-size:9px;color:#888;margin-bottom:5px;cursor:pointer;">
+                        <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
+                        <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
+                    </label>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>$$$</b>. Prix de revente = au moins achat + marge ; si médiane fiable plus haute, elle est visée.</div>
+                    <div id="wm-flip-history" style="margin-bottom:7px;"></div>
+                    <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                         <div class="wm-lbl" style="margin:0;">Log</div>
                         <button id="wm-log-export" title="Exporter le log en .txt"
@@ -10683,6 +10897,71 @@
         if (sessionStorage.getItem('wm_trashseller_active')) {
             startTrashSeller();
         }
+
+        /* ════════ FLIP SELLER ($$$) ════════ */
+        const flipBtn = document.getElementById('wm-flip-btn');
+        const flipStatus = document.getElementById('wm-flip-status');
+        const flipMarkup = document.getElementById('wm-flip-markup');
+        const flipDuration = document.getElementById('wm-flip-duration');
+        const flipUndercut = document.getElementById('wm-flip-undercut');
+
+        if (flipMarkup) {
+            flipMarkup.value = getFlipMarkupPct();
+            flipMarkup.onchange = () => {
+                const v = setFlipMarkupPct(flipMarkup.value);
+                flipMarkup.value = v;
+                wmLog(`💸 Flip Seller : marge brute minimale → <b>${v}%</b>.`);
+            };
+        }
+        if (flipDuration) {
+            flipDuration.value = String(getFlipDurationMin());
+            flipDuration.onchange = () => {
+                const v = setFlipDurationMin(flipDuration.value);
+                flipDuration.value = String(v);
+                wmLog(`💸 Flip Seller : durée → <b>${v} min</b>.`);
+            };
+        }
+        if (flipUndercut) {
+            flipUndercut.checked = getFlipUndercut();
+            flipUndercut.onchange = () => {
+                setFlipUndercut(flipUndercut.checked);
+                wmLog(`💸 Flip Seller : undercut ${flipUndercut.checked ? '<b>ON</b>' : '<b>OFF</b>'}.`);
+            };
+        }
+
+        function startFlipSeller() {
+            if (!flipBtn) return;
+            flipSellerRunning = true;
+            flipBtn.innerText = '⏹ STOP';
+            flipBtn.className = 'wm-btn wm-r wm-sm';
+            sessionStorage.setItem('wm_flipseller_active', '1');
+            runFlipSeller(flipBtn, flipStatus).catch(e => {
+                if (flipStatus) flipStatus.textContent = 'Erreur Flip Seller : ' + (e?.message || e);
+            });
+            renderFlipHistory();
+        }
+
+        if (flipBtn) {
+            flipBtn.onclick = () => {
+                if (!flipSellerRunning) startFlipSeller();
+                else {
+                    flipSellerRunning = false;
+                    flipBtn.innerText = '▶ START';
+                    flipBtn.className = 'wm-btn wm-g wm-sm';
+                    sessionStorage.removeItem('wm_flipseller_active');
+                    if (flipStatus) flipStatus.innerHTML = '<span style="color:#888;">Arrêté.</span>';
+                    wmLog('⏹ Flip Seller arrêté');
+                }
+            };
+            if (sessionStorage.getItem('wm_flipseller_active')) startFlipSeller();
+        }
+        renderFlipHistory();
+        // Retente régulièrement les tags $$$ même si le Flip Seller n'est pas lancé : le but
+        // est que la carte soit marquée dès la victoire, pas seulement au prochain START.
+        setInterval(() => {
+            retryPendingFlipTags().catch(() => { });
+            syncFlipSaleResults().catch(() => { });
+        }, 30000);
 
         /* ════════ HEADER CONTROLS ════════ */
         document.getElementById('wm-close-btn').onclick = () => overlay.classList.remove('open');
@@ -12247,11 +12526,11 @@
             fileInput.click();
         };
 
-        /* ════════ MASTER START/STOP (toggle 3 features at once) ════════ */
+        /* ════════ MASTER START/STOP (toggle 4 features at once) ════════ */
         const masterBtn = document.getElementById('wm-master-btn');
         const refreshMasterLabel = () => {
-            const anyRunning = running || marketWatcherActive || trashSellerRunning;
-            const allRunning = running && marketWatcherActive && trashSellerRunning;
+            const anyRunning = running || marketWatcherActive || trashSellerRunning || flipSellerRunning;
+            const allRunning = running && marketWatcherActive && trashSellerRunning && flipSellerRunning;
             if (allRunning) {
                 masterBtn.innerText = '⏹ Tout arrêter';
                 masterBtn.style.color = '#ef4444';
@@ -12267,12 +12546,14 @@
             const startBtn = document.getElementById('wm-start-btn');
             const marketBtn = document.getElementById('wm-market-btn');
             const trashBtn = document.getElementById('wm-trash-btn');
-            const allRunning = running && marketWatcherActive && trashSellerRunning;
+            const flipBtn = document.getElementById('wm-flip-btn');
+            const allRunning = running && marketWatcherActive && trashSellerRunning && flipSellerRunning;
             if (allRunning) {
                 if (running) startBtn.click();
                 if (marketWatcherActive) marketBtn.click();
                 if (trashSellerRunning) trashBtn.click();
-                wmLog('⏹ Master : arrêt des 3 fonctionnalités');
+                if (flipSellerRunning && flipBtn) flipBtn.click();
+                wmLog('⏹ Master : arrêt des 4 fonctionnalités');
                 // Backup auto sur Discord (option activable dans Paramètres → Sauvegarde)
                 if (getSetting('autoBackupOnStop') && getDiscordWebhook() && typeof window.wmSendBackupToDiscord === 'function') {
                     wmLog('🗄️ Backup auto (Tout arrêter) → envoi sur Discord…');
@@ -12286,7 +12567,8 @@
                 if (!running) startBtn.click();
                 if (!marketWatcherActive) marketBtn.click();
                 if (!trashSellerRunning) trashBtn.click();
-                wmLog('🚀 Master : démarrage des 3 fonctionnalités');
+                if (!flipSellerRunning && flipBtn) flipBtn.click();
+                wmLog('🚀 Master : démarrage des 4 fonctionnalités');
             }
             setTimeout(refreshMasterLabel, 100);
         };
