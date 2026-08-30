@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.2';
+    const WM_VERSION = '2.3.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1469,6 +1469,46 @@
         }
     }
 
+    // Hunter dynamique : en-dessous de cette médiane, aucun achat automatique.
+    // 500 est autorisé ; 499 et moins sont ignorés.
+    const HUNTER_DYNAMIC_MIN_MEDIAN = 500;
+
+    // Une enchère déjà armée par le Hunter dynamique peut survivre à un F5.
+    // On réapplique donc aussi le filtre de médiane lors des RIPOSTES, pas seulement
+    // lors de la première mise. Les auto-bids manuels / prioritaires / ciblés ne sont
+    // volontairement pas concernés.
+    const dynamicMedianBlockLogged = new Set();
+
+    function dynamicHunterContinuationAllowed(auction) {
+        if (!auction?.id) return false;
+
+        const candidate = autoFlipCandidates.get(auction.id);
+        if (!candidate || candidate.source !== 'hunter_dynamic') return true;
+
+        const cardId = auction.card?.id ?? auction.card_id ?? candidate.cardId;
+        const rarity = globalAuctionRarity(auction) || candidate.rarity || '';
+        const entry = getCachedSales(cardId, rarity);
+
+        if (entry && entry.count >= 3 && Number(entry.median) >= HUNTER_DYNAMIC_MIN_MEDIAN) {
+            dynamicMedianBlockLogged.delete(auction.id);
+            return true;
+        }
+
+        // Coupe uniquement la poursuite automatique. On garde autoFlipCandidates :
+        // si notre ancienne mise finit malgré tout par gagner, il faut toujours pouvoir
+        // enregistrer le prix d'achat et envoyer la carte vers le Flip Seller.
+        if (autoBidSet.delete(auction.id)) saveAutoBidSet();
+        setAutoBidMax(auction.id, null);
+
+        if (!dynamicMedianBlockLogged.has(auction.id)) {
+            dynamicMedianBlockLogged.add(auction.id);
+            const med = entry?.median ?? '?';
+            wmLog(`🛑 Hunter dynamique coupé : <b>${auction.card?.wikipedia_title || candidate.title || '?'}</b> [${rarity || '?'}] · médiane <b>${med} 💰</b> &lt; ${HUNTER_DYNAMIC_MIN_MEDIAN} 💰.`);
+        }
+
+        return false;
+    }
+
     // Décide si une enchère doit déclencher un auto-snipe, selon le mode configuré.
     // Retourne { snipe: bool, reason: string, cap: number }.
     // `cap` = le seuil retenu pour CETTE enchère (fixe, ou dérivé de la médiane en dynamique).
@@ -1494,6 +1534,16 @@
                 return {
                     snipe: false,
                     reason: `historique insuffisant${rarity ? ` (${rarity})` : ''}`,
+                    cap: 0
+                };
+            }
+
+            // Filtre économique dur : les petites cartes ne nous intéressent pas,
+            // même si l'enchère courante semble fortement sous-cotée.
+            if (entry.median < HUNTER_DYNAMIC_MIN_MEDIAN) {
+                return {
+                    snipe: false,
+                    reason: `médiane < ${HUNTER_DYNAMIC_MIN_MEDIAN} (${entry.median})`,
                     cap: 0
                 };
             }
@@ -3766,7 +3816,7 @@
         // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
+            return `⚡ Hunter dynamique · méd.≥${HUNTER_DYNAMIC_MIN_MEDIAN} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -4740,6 +4790,7 @@
                 // où j'ai du solde. Idempotent : tant que je suis dépassé et sous le
                 // plafond, on re-tente à chaque scan.
                 if (autoBidSet.has(a.id)
+                    && dynamicHunterContinuationAllowed(a)
                     && automaticBidTimeAllowed(a)
                     && !iAmLeading(a)
                     && !autoBidBlockedByUncertainSelfState(a)
@@ -4801,7 +4852,8 @@
 
                 applyFreshAuctionState(freshBidAuction, { render: false, logExtension: true });
 
-                if (!automaticBidTimeAllowed(freshBidAuction)
+                if (!dynamicHunterContinuationAllowed(freshBidAuction)
+                    || !automaticBidTimeAllowed(freshBidAuction)
                     || iAmLeading(freshBidAuction)
                     || autoBidBlockedByUncertainSelfState(freshBidAuction)) {
                     bidLockSet.delete(a.id);
@@ -6431,6 +6483,7 @@
                 // ⚠️ NE PAS faire `continue` si le plafond est atteint : ça sauterait la MàJ de
                 // leadingBidsMap plus bas → l'outbid serait re-détecté au tick suivant.
                 if (autoBidSet.has(a.id)
+                    && dynamicHunterContinuationAllowed(a)
                     && automaticBidTimeAllowed(a)
                     && wikibidousBalance > 0
                     && !bidLockSet.has(a.id)) {
@@ -6477,7 +6530,8 @@
                                         if (retryFresh) {
                                             applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
 
-                                            if (automaticBidTimeAllowed(retryFresh)
+                                            if (dynamicHunterContinuationAllowed(retryFresh)
+                                                && automaticBidTimeAllowed(retryFresh)
                                                 && !iAmLeading(retryFresh)
                                                 && !autoBidBlockedByUncertainSelfState(retryFresh)) {
 
