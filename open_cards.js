@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.3';
+    const WM_VERSION = '2.3.4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -453,8 +453,9 @@
     const FLIP_MARKUP_KEY = 'wm_flip_markup_pct';
     const FLIP_DURATION_KEY = 'wm_flip_duration_min';
     const FLIP_UNDERCUT_KEY = 'wm_flip_undercut';
+    const FLIP_TAG_CACHE_KEY = 'wm_flip_tag_id_v1';
 
-    let FLIP_TAG_ID = null;
+    let FLIP_TAG_ID = localStorage.getItem(FLIP_TAG_CACHE_KEY) || null;
     let flipSellerRunning = false;
     let flipSellerBusy = false;
 
@@ -579,19 +580,97 @@
         return rec;
     }
 
-    async function ensureFlipTagId() {
-        if (FLIP_TAG_ID) return FLIP_TAG_ID;
+    function rememberFlipTagId(id) {
+        FLIP_TAG_ID = id || null;
+        try {
+            if (FLIP_TAG_ID) localStorage.setItem(FLIP_TAG_CACHE_KEY, FLIP_TAG_ID);
+            else localStorage.removeItem(FLIP_TAG_CACHE_KEY);
+        } catch (e) { }
+        return FLIP_TAG_ID;
+    }
+
+    // Recherche le tag $$$ exactement comme le Trash Seller : d'abord dans les tags du compte,
+    // puis en requête directe par user_id, puis (sous RLS) par nom seul. `force=true` invalide
+    // le cache : utile si le tag a été supprimé/recréé ou créé manuellement après le chargement.
+    async function discoverFlipTagId(force = false) {
+        if (!force && FLIP_TAG_ID) return FLIP_TAG_ID;
+
+        const { token } = getSupabaseAccessToken();
+        const claims = decodeJWT(token);
+        const userId = claims?.sub;
+        if (!userId || !token) {
+            rememberFlipTagId(null);
+            return null;
+        }
+
+        // 1) Liste complète des tags du compte — la plus robuste pour un tag créé manuellement.
         try {
             const tags = await fetchUserTags();
-            const existing = Array.isArray(tags) ? tags.find(t => t && t.name === FLIP_TAG_NAME) : null;
-            if (existing?.id) {
-                FLIP_TAG_ID = existing.id;
-                return FLIP_TAG_ID;
+            const existing = Array.isArray(tags)
+                ? tags.find(t => t && String(t.name || '').trim() === FLIP_TAG_NAME)
+                : null;
+            if (existing?.id) return rememberFlipTagId(existing.id);
+        } catch (e) { }
+
+        // 2) Query ciblée user_id + nom.
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/tags?user_id=eq.${userId}&name=eq.${encodeURIComponent(FLIP_TAG_NAME)}&select=id,name&limit=5`,
+                {
+                    credentials: 'omit',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${token}`,
+                        'Accept': 'application/json'
+                    }
+                }
+            );
+            if (res.ok) {
+                const data = await res.json();
+                const found = Array.isArray(data) ? data.find(t => t?.id) : null;
+                if (found?.id) return rememberFlipTagId(found.id);
             }
         } catch (e) { }
-        const created = await createTrashTag(FLIP_TAG_NAME); // helper générique find-or-create
-        if (created?.ok && created.id) FLIP_TAG_ID = created.id;
-        return FLIP_TAG_ID;
+
+        // 3) Repli par nom seul. La RLS doit déjà limiter aux tags lisibles par ce compte.
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/tags?name=eq.${encodeURIComponent(FLIP_TAG_NAME)}&select=id,name,user_id&limit=20`,
+                {
+                    credentials: 'omit',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${token}`,
+                        'Accept': 'application/json'
+                    }
+                }
+            );
+            if (res.ok) {
+                const data = await res.json();
+                const found = Array.isArray(data)
+                    ? (data.find(t => t?.user_id === userId && t?.id) || data.find(t => t?.id))
+                    : null;
+                if (found?.id) return rememberFlipTagId(found.id);
+            }
+        } catch (e) { }
+
+        rememberFlipTagId(null);
+        return null;
+    }
+
+    async function ensureFlipTagId(force = false) {
+        let id = await discoverFlipTagId(force);
+        if (id) return id;
+
+        // Le besoin de ce tag a été explicitement demandé pour le circuit achat-revente.
+        // S'il n'existe réellement pas, on tente de le créer puis on le redécouvre.
+        const created = await createTrashTag(FLIP_TAG_NAME);
+        if (created?.ok && created.id) return rememberFlipTagId(created.id);
+        if (created?.ok) {
+            id = await discoverFlipTagId(true);
+            if (id) return id;
+        }
+        return null;
     }
 
     function itemObtainedTs(item) {
@@ -667,21 +746,46 @@
 
     async function tagFlipRecord(rec) {
         if (!rec || rec.status === 'sold' || rec.status === 'listed') return false;
-        const tagId = await ensureFlipTagId();
+
+        // Un tag manuel peut avoir été posé depuis le précédent passage.
+        await syncManualFlipTags().catch(() => 0);
+        if (rec.status === 'tagged' && rec.userCardId) return true;
+
+        let tagId = await ensureFlipTagId();
         if (!tagId) {
-            rec.status = 'pending_tag'; rec.lastError = 'tag $$$ introuvable/création impossible'; saveFlipLedger();
+            rec.status = 'pending_tag';
+            rec.lastError = 'tag $$$ introuvable/création impossible';
+            saveFlipLedger();
             return false;
         }
+
         if (!rec.userCardId) rec.userCardId = await findWonUserCardIdForFlip(rec);
         if (!rec.userCardId) {
-            rec.status = 'pending_tag'; rec.lastError = 'exemplaire gagné pas encore visible'; saveFlipLedger();
+            rec.status = 'pending_tag';
+            rec.lastError = 'exemplaire gagné pas encore visible';
+            saveFlipLedger();
             return false;
         }
-        const r = await addTagToUserCard(rec.userCardId, tagId);
+
+        let r = await addTagToUserCard(rec.userCardId, tagId);
+
+        // Si le tag a été supprimé/recréé, l'id mis en cache peut être périmé.
+        // On redécouvre $$$ et on retente UNE fois avec le nouvel id.
         if (!r?.ok) {
-            rec.status = 'pending_tag'; rec.lastError = r?.error || `HTTP ${r?.status || '?'}`; saveFlipLedger();
+            const refreshed = await discoverFlipTagId(true);
+            if (refreshed && refreshed !== tagId) {
+                tagId = refreshed;
+                r = await addTagToUserCard(rec.userCardId, tagId);
+            }
+        }
+
+        if (!r?.ok) {
+            rec.status = 'pending_tag';
+            rec.lastError = r?.error || `HTTP ${r?.status || '?'}`;
+            saveFlipLedger();
             return false;
         }
+
         rec.status = 'tagged';
         rec.tagAppliedAt = Date.now();
         rec.lastError = null;
@@ -714,12 +818,96 @@
         }
     }
 
-    async function fetchFlipTaggedUserCardIds() {
-        const tagId = await ensureFlipTagId();
+    async function fetchFlipTaggedRows(forceRediscover = false) {
+        let tagId = await ensureFlipTagId(forceRediscover);
         if (!tagId) return null;
-        const rows = await supabaseSelect(`user_card_tags?tag_id=eq.${tagId}&select=user_card_id&limit=2000`);
+
+        let rows = await supabaseSelect(
+            `user_card_tags?tag_id=eq.${tagId}&select=user_card_id,user_cards(id,card_id,created_at)&limit=2000`
+        );
+
+        // Si on a un ancien id de tag en cache mais qu'un $$$ a été recréé manuellement,
+        // une lecture vide peut être trompeuse. Avec des flips en attente, on redécouvre une fois.
+        if (Array.isArray(rows) && rows.length === 0 && !forceRediscover
+            && flipLedger.some(r => r && r.status === 'pending_tag')) {
+            const oldId = tagId;
+            tagId = await discoverFlipTagId(true);
+            if (tagId && tagId !== oldId) {
+                rows = await supabaseSelect(
+                    `user_card_tags?tag_id=eq.${tagId}&select=user_card_id,user_cards(id,card_id,created_at)&limit=2000`
+                );
+            }
+        }
+
+        return Array.isArray(rows) ? rows : null;
+    }
+
+    async function fetchFlipTaggedUserCardIds() {
+        const rows = await fetchFlipTaggedRows();
         if (!Array.isArray(rows)) return null;
         return new Set(rows.map(r => r?.user_card_id).filter(Boolean));
+    }
+
+    // Fait le lien entre un tag $$$ posé MANUELLEMENT dans WikiMasters et le registre des
+    // auto-achats. Avant v2.3.4, le seller exigeait status='tagged' dans le ledger et ignorait
+    // donc un tag manuel pourtant bien présent en base.
+    async function syncManualFlipTags() {
+        const rows = await fetchFlipTaggedRows();
+        if (!Array.isArray(rows) || rows.length === 0) return 0;
+
+        const tagged = rows.map(row => {
+            const uc = row?.user_cards || {};
+            return {
+                userCardId: row?.user_card_id || uc?.id || null,
+                cardId: uc?.card_id || null,
+                createdAt: uc?.created_at ? new Date(uc.created_at).getTime() : NaN
+            };
+        }).filter(x => x.userCardId);
+
+        const activeUsed = new Set(
+            flipLedger
+                .filter(r => r && r.userCardId && r.status !== 'sold')
+                .map(r => r.userCardId)
+        );
+
+        let linked = 0;
+        for (const rec of flipLedger) {
+            if (!rec || !['pending_tag', 'tagged'].includes(rec.status)) continue;
+
+            // Cas simple : on connaît déjà l'exemplaire exact et il porte désormais $$$.
+            let hit = rec.userCardId
+                ? tagged.find(x => x.userCardId === rec.userCardId)
+                : null;
+
+            // Sinon on rattache un $$$ manuel de la même carte au flip en attente.
+            if (!hit && rec.cardId) {
+                const target = Number(rec.boughtAt) || Date.now();
+                const pool = tagged
+                    .filter(x => x.cardId === rec.cardId && (!activeUsed.has(x.userCardId) || x.userCardId === rec.userCardId))
+                    .sort((a, b) => {
+                        const da = Number.isFinite(a.createdAt) ? Math.abs(a.createdAt - target) : Number.MAX_SAFE_INTEGER;
+                        const db = Number.isFinite(b.createdAt) ? Math.abs(b.createdAt - target) : Number.MAX_SAFE_INTEGER;
+                        return da - db;
+                    });
+                hit = pool[0] || null;
+            }
+
+            if (!hit) continue;
+
+            const changed = rec.status !== 'tagged' || rec.userCardId !== hit.userCardId;
+            rec.userCardId = hit.userCardId;
+            rec.status = 'tagged';
+            rec.tagAppliedAt = rec.tagAppliedAt || Date.now();
+            rec.lastError = null;
+            activeUsed.add(hit.userCardId);
+            if (changed) {
+                linked++;
+                wmLog(`🏷️ Tag <b>$$$</b> détecté${rec.title ? ` pour <b>${rec.title}</b>` : ''} · exemplaire ${String(hit.userCardId).slice(0, 8)}… → Flip Seller prêt.`);
+            }
+        }
+
+        if (linked) saveFlipLedger();
+        return linked;
     }
 
     async function resolveFlipSellPrice(rec) {
@@ -827,7 +1015,8 @@
             if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${r.soldPrice} · ${r.profit >= 0 ? '+' : ''}${r.profit} 💰</span>`;
             if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${r.listPrice} 💰</span>`;
             if (r.status === 'tagged') return '<span style="color:#fbbf24;">$$$ prêt</span>';
-            return '<span style="color:#888;">tag en attente</span>';
+            const err = r.lastError ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>` : '';
+            return `<span style="color:#888;">tag en attente</span>${err}`;
         };
         el.innerHTML = rows.map(r => `<div style="display:flex;justify-content:space-between;gap:6px;font-size:9px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04);">
             <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;" title="${htmlEsc(r.title || '?')}">${htmlEsc(r.title || '?')} <span style="color:#666;">[${htmlEsc(r.rarity || '?')}]</span></span>
@@ -840,7 +1029,9 @@
         flipSellerBusy = true;
         try {
             while (flipSellerRunning) {
+                await syncManualFlipTags();
                 await retryPendingFlipTags();
+                await syncManualFlipTags();
                 await syncFlipSaleResults();
                 if (!flipSellerRunning) break;
 
@@ -913,6 +1104,36 @@
         };
         console.table(info);
         return info;
+    };
+
+
+    window.wmFlipDiag = async function () {
+        const tagId = await ensureFlipTagId(true);
+        const rows = tagId ? await fetchFlipTaggedRows(true) : null;
+        await syncManualFlipTags().catch(() => 0);
+
+        const diag = {
+            tagNom: FLIP_TAG_NAME,
+            tagId: tagId || null,
+            tagsDollarEnBase: Array.isArray(rows) ? rows.length : null,
+            pendingTag: flipLedger.filter(r => r?.status === 'pending_tag').length,
+            prets: flipLedger.filter(r => r?.status === 'tagged').length,
+            enVente: flipLedger.filter(r => r?.status === 'listed').length
+        };
+        console.table(diag);
+
+        const pending = flipLedger
+            .filter(r => r?.status === 'pending_tag')
+            .map(r => ({
+                carte: r.title,
+                rarete: r.rarity,
+                achat: r.buyPrice,
+                cardId: r.cardId,
+                userCardId: r.userCardId,
+                erreur: r.lastError
+            }));
+        if (pending.length) console.table(pending);
+        return { ...diag, pending };
     };
 
     /* Aucun `fetch()` de ce fichier n'a de timeout par défaut : si une requête reste bloquée
@@ -11143,9 +11364,10 @@
         // Retente régulièrement les tags $$$ même si le Flip Seller n'est pas lancé : le but
         // est que la carte soit marquée dès la victoire, pas seulement au prochain START.
         setInterval(() => {
+            syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
             syncFlipSaleResults().catch(() => { });
-        }, 30000);
+        }, 15000);
 
         /* ════════ HEADER CONTROLS ════════ */
         document.getElementById('wm-close-btn').onclick = () => overlay.classList.remove('open');
