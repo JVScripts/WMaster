@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.4';
+    const WM_VERSION = '2.3.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -526,6 +526,18 @@
         if (Array.isArray(raw)) flipLedger = raw;
     } catch (e) { flipLedger = []; }
 
+    // v2.3.5 : complète sans casser les anciens enregistrements. Ces champs servent à
+    // répartir équitablement les retries de tag et à conserver l'id/rareté d'achat si le
+    // catalogue remplace ensuite la carte (revalorisation/changement de rareté).
+    flipLedger.forEach(r => {
+        if (!r || typeof r !== 'object') return;
+        if (!r.purchaseCardId) r.purchaseCardId = r.cardId || null;
+        if (!r.purchaseRarity) r.purchaseRarity = r.rarity || '';
+        if (!Number.isFinite(Number(r.tagRetryCount))) r.tagRetryCount = 0;
+        if (!Number.isFinite(Number(r.lastTagAttemptAt))) r.lastTagAttemptAt = 0;
+        if (!Number.isFinite(Number(r.nextTagRetryAt))) r.nextTagRetryAt = 0;
+    });
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -556,9 +568,14 @@
                 buyPrice: Number.isFinite(buyPrice) ? buyPrice : 0,
                 boughtAt: Number.isFinite(boughtAt) ? boughtAt : Date.now(),
                 source: candidate?.source || 'autobid',
+                purchaseCardId: w.card?.id || w.card_id || candidate?.cardId || null,
+                purchaseRarity: (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase(),
                 userCardId: null,
                 status: 'pending_tag',
                 tagAppliedAt: null,
+                tagRetryCount: 0,
+                lastTagAttemptAt: 0,
+                nextTagRetryAt: 0,
                 saleAuctionId: null,
                 listPrice: null,
                 listedAt: null,
@@ -575,6 +592,8 @@
             rec.title = rec.title || w.card?.wikipedia_title || candidate?.title || '?';
             rec.rarity = rec.rarity || (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase();
             rec.source = rec.source || candidate?.source || 'autobid';
+            rec.purchaseCardId = rec.purchaseCardId || rec.cardId || w.card?.id || w.card_id || candidate?.cardId || null;
+            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase();
         }
         saveFlipLedger();
         return rec;
@@ -684,14 +703,125 @@
 
     // Retrouve l'exemplaire gagné. /my-collection trié par obtained_at est privilégié car
     // c'est précisément l'ordre d'acquisition visible côté site ; repli Supabase si nécessaire.
-    async function findWonUserCardIdForFlip(rec) {
-        if (!rec?.cardId) return null;
-        const tagId = await ensureFlipTagId();
-        const targetTs = Number(rec.boughtAt) || Date.now();
+    const FLIP_ACQUISITION_MATCH_MS = 48 * 60 * 60 * 1000; // garde-fou anti-vieux doublon
 
+    function chooseOwnedFlipCandidate(rows, rec, tagId, cardMetaById = new Map()) {
+        if (!Array.isArray(rows) || rows.length === 0) return null;
+        const targetTs = Number(rec?.boughtAt) || Date.now();
+        const used = new Set(
+            flipLedger
+                .filter(x => x && x !== rec && x.userCardId && x.status !== 'sold')
+                .map(x => x.userCardId)
+        );
+
+        const normalized = rows
+            .filter(r => r?.id)
+            .map(r => {
+                const ts = itemObtainedTs(r);
+                const tags = r.user_card_tags || [];
+                const alreadyFlip = !!tagId && tags.some(t => t?.tag_id === tagId);
+                const meta = cardMetaById.get(r.card_id) || null;
+                return {
+                    ...r,
+                    _ts: ts,
+                    _delta: Number.isFinite(ts) ? Math.abs(ts - targetTs) : Number.MAX_SAFE_INTEGER,
+                    _alreadyFlip: alreadyFlip,
+                    _rarity: String(meta?.rarity || '').toUpperCase()
+                };
+            });
+
+        // Si on connaît déjà l'exemplaire et qu'il existe encore, il reste prioritaire.
+        if (rec?.userCardId) {
+            const exact = normalized.find(r => r.id === rec.userCardId);
+            if (exact) return exact;
+        }
+
+        // Un $$$ manuel est une preuve explicite : on peut l'accepter même si l'horodatage
+        // d'acquisition est ancien/incomplet.
+        const manuallyTagged = normalized
+            .filter(r => r._alreadyFlip && (!used.has(r.id) || r.id === rec?.userCardId))
+            .sort((a, b) => a._delta - b._delta)[0];
+        if (manuallyTagged) return manuallyTagged;
+
+        // Pour l'auto-tag, on refuse volontairement un ancien doublon : il faut que created_at /
+        // obtained_at soit proche de la victoire. Sinon on attend la propagation de la vraie carte.
+        const close = normalized
+            .filter(r => !used.has(r.id) && Number.isFinite(r._ts) && r._delta <= FLIP_ACQUISITION_MATCH_MS)
+            .sort((a, b) => a._delta - b._delta);
+        return close[0] || null;
+    }
+
+    // Retrouve l'exemplaire gagné de façon robuste.
+    // 1) user_cards exact (source de vérité), 2) si card_id devenu périmé : résolution par titre,
+    // 3) fallback /my-collection. On ne choisit jamais aveuglément un vieux doublon.
+    async function findWonUserCardIdForFlip(rec) {
+        if (!rec || (!rec.cardId && !rec.title)) return null;
+        const uid = currentUserId();
+        if (!uid) return null;
+        const tagId = await ensureFlipTagId().catch(() => null);
+
+        async function ownedRowsForIds(ids) {
+            const clean = [...new Set((ids || []).filter(Boolean))];
+            if (clean.length === 0) return [];
+            const rows = await supabaseSelect(
+                `user_cards?user_id=eq.${uid}&card_id=in.(${clean.join(',')})&select=id,card_id,created_at,user_card_tags(tag_id)&limit=100`
+            );
+            return Array.isArray(rows) ? rows : [];
+        }
+
+        // 1) ID connu au moment de l'achat.
+        if (rec.cardId) {
+            try {
+                const rows = await ownedRowsForIds([rec.cardId]);
+                const hit = chooseOwnedFlipCandidate(rows, rec, tagId);
+                if (hit?.id) return hit.id;
+            } catch (e) { }
+        }
+
+        // 2) Le catalogue WikiMasters peut remplacer un card_id. On retrouve alors les ids
+        // actuels par titre, en préférant la rareté d'achat mais sans l'imposer.
+        if (rec.title && rec.title !== '?') {
+            try {
+                const cardRows = await supabaseSelect(
+                    `cards?wikipedia_title=eq.${encodeURIComponent(rec.title)}&select=id,wikipedia_title,rarity&limit=30`
+                );
+                if (Array.isArray(cardRows) && cardRows.length > 0) {
+                    const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+                    const ordered = [...cardRows].sort((a, b) => {
+                        const ar = String(a?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
+                        const br = String(b?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
+                        return ar - br;
+                    });
+                    const meta = new Map(ordered.filter(c => c?.id).map(c => [c.id, c]));
+                    const rows = await ownedRowsForIds(ordered.map(c => c?.id));
+                    const hit = chooseOwnedFlipCandidate(rows, rec, tagId, meta);
+                    if (hit?.id) {
+                        if (hit.card_id && hit.card_id !== rec.cardId) {
+                            rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                            const old = rec.cardId;
+                            rec.cardId = hit.card_id;
+                            const currentRarity = hit._rarity || String(meta.get(hit.card_id)?.rarity || '').toUpperCase();
+                            if (currentRarity && currentRarity !== rec.rarity) {
+                                rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                                rec.rarity = currentRarity;
+                            }
+                            wmLog(`🔄 Flip Seller : card_id actualisé pour <b>${rec.title}</b>${old ? ` (${String(old).slice(0, 8)}… → ${String(hit.card_id).slice(0, 8)}…)` : ''}.`);
+                        }
+                        return hit.id;
+                    }
+                }
+            } catch (e) { }
+        }
+
+        // 3) Fallback API collection. On accepte card_id OU titre, mais toujours avec une preuve
+        // temporelle proche de l'achat (ou un $$$ déjà présent).
         try {
-            const matches = [];
-            for (let page = 0; page < 4; page++) {
+            const targetTs = Number(rec.boughtAt) || Date.now();
+            const used = new Set(
+                flipLedger.filter(x => x && x !== rec && x.userCardId && x.status !== 'sold').map(x => x.userCardId)
+            );
+            const candidates = [];
+            for (let page = 0; page < 8; page++) {
                 const res = await fetch(
                     `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50&sort=obtained_at`,
                     { credentials: 'include' }
@@ -700,69 +830,70 @@
                 const data = await res.json();
                 const items = data.collection || [];
                 for (const it of items) {
-                    if ((it.card_id || it.card?.id) !== rec.cardId) continue;
-                    if ((it.tags || []).some(t => t.name === FLIP_TAG_NAME)) {
-                        // Si ce record a déjà été tagué avant un reload, c'est probablement lui.
-                        matches.push({ ...it, _alreadyFlip: true });
-                    } else {
-                        matches.push(it);
-                    }
+                    const idMatch = rec.cardId && (it.card_id || it.card?.id) === rec.cardId;
+                    const title = it.card?.wikipedia_title || it.wikipedia_title || it.title || '';
+                    const titleMatch = rec.title && rec.title !== '?' && title === rec.title;
+                    if (!idMatch && !titleMatch) continue;
+                    const ts = itemObtainedTs(it);
+                    const tagged = (it.tags || []).some(t => String(t?.name || '').trim() === FLIP_TAG_NAME);
+                    const delta = Number.isFinite(ts) ? Math.abs(ts - targetTs) : Number.MAX_SAFE_INTEGER;
+                    if (!tagged && (!Number.isFinite(ts) || delta > FLIP_ACQUISITION_MATCH_MS)) continue;
+                    if (it.id && !used.has(it.id)) candidates.push({ it, delta, tagged });
                 }
-                if (matches.length > 0 || items.length < 50) break;
+                if (candidates.length > 0 || items.length < 50) break;
             }
-            if (matches.length > 0) {
-                matches.sort((a, b) => {
-                    const ta = itemObtainedTs(a), tb = itemObtainedTs(b);
-                    const da = Number.isFinite(ta) ? Math.abs(ta - targetTs) : Number.MAX_SAFE_INTEGER;
-                    const db = Number.isFinite(tb) ? Math.abs(tb - targetTs) : Number.MAX_SAFE_INTEGER;
-                    return da - db;
-                });
-                if (matches[0]?.id) return matches[0].id;
+            candidates.sort((a, b) => (Number(b.tagged) - Number(a.tagged)) || (a.delta - b.delta));
+            const hit = candidates[0]?.it;
+            if (hit?.id) {
+                const newCardId = hit.card_id || hit.card?.id || null;
+                if (newCardId && newCardId !== rec.cardId) {
+                    rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                    rec.cardId = newCardId;
+                }
+                return hit.id;
             }
         } catch (e) { }
 
-        const uid = currentUserId();
-        if (!uid) return null;
-        try {
-            const rows = await supabaseSelect(
-                `user_cards?card_id=eq.${rec.cardId}&user_id=eq.${uid}&select=*&order=created_at.desc&limit=20`
-            );
-            if (Array.isArray(rows) && rows.length > 0) {
-                // Évite si possible un exemplaire déjà utilisé par un autre flip actif.
-                const used = new Set(flipLedger.filter(x => x !== rec && x.userCardId && x.status !== 'sold').map(x => x.userCardId));
-                const free = rows.filter(r => !used.has(r.id));
-                const pool = free.length ? free : rows;
-                pool.sort((a, b) => {
-                    const ta = itemObtainedTs(a), tb = itemObtainedTs(b);
-                    const da = Number.isFinite(ta) ? Math.abs(ta - targetTs) : Number.MAX_SAFE_INTEGER;
-                    const db = Number.isFinite(tb) ? Math.abs(tb - targetTs) : Number.MAX_SAFE_INTEGER;
-                    return da - db;
-                });
-                return pool[0]?.id || null;
-            }
-        } catch (e) { }
         return null;
     }
 
+    function scheduleNextFlipTagRetry(rec) {
+        const n = Math.max(1, Number(rec?.tagRetryCount) || 1);
+        const delays = [10_000, 15_000, 30_000, 60_000, 120_000, 300_000];
+        rec.nextTagRetryAt = Date.now() + delays[Math.min(n - 1, delays.length - 1)];
+    }
+
     async function tagFlipRecord(rec) {
-        if (!rec || rec.status === 'sold' || rec.status === 'listed') return false;
+        if (!rec || rec.status === 'sold' || rec.status === 'listed' || !flipLedger.includes(rec)) return false;
+
+        rec.tagRetryCount = Math.max(0, Number(rec.tagRetryCount) || 0) + 1;
+        rec.lastTagAttemptAt = Date.now();
 
         // Un tag manuel peut avoir été posé depuis le précédent passage.
         await syncManualFlipTags().catch(() => 0);
-        if (rec.status === 'tagged' && rec.userCardId) return true;
+        if (!flipLedger.includes(rec)) return false; // supprimé manuellement pendant l'attente réseau
+        if (rec.status === 'tagged' && rec.userCardId) {
+            rec.nextTagRetryAt = 0;
+            saveFlipLedger();
+            return true;
+        }
 
         let tagId = await ensureFlipTagId();
+        if (!flipLedger.includes(rec)) return false;
         if (!tagId) {
             rec.status = 'pending_tag';
             rec.lastError = 'tag $$$ introuvable/création impossible';
+            scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
         }
 
         if (!rec.userCardId) rec.userCardId = await findWonUserCardIdForFlip(rec);
+        if (!flipLedger.includes(rec)) return false;
         if (!rec.userCardId) {
             rec.status = 'pending_tag';
-            rec.lastError = 'exemplaire gagné pas encore visible';
+            rec.lastError = `exemplaire gagné non résolu (tentative ${rec.tagRetryCount})`;
+            scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
         }
@@ -770,7 +901,6 @@
         let r = await addTagToUserCard(rec.userCardId, tagId);
 
         // Si le tag a été supprimé/recréé, l'id mis en cache peut être périmé.
-        // On redécouvre $$$ et on retente UNE fois avec le nouvel id.
         if (!r?.ok) {
             const refreshed = await discoverFlipTagId(true);
             if (refreshed && refreshed !== tagId) {
@@ -782,6 +912,10 @@
         if (!r?.ok) {
             rec.status = 'pending_tag';
             rec.lastError = r?.error || `HTTP ${r?.status || '?'}`;
+            // Un user_card_id périmé peut arriver après une vente/retour ou un changement catalogue.
+            // On le libère pour forcer une nouvelle résolution à la prochaine tentative.
+            if ([404, 409].includes(Number(r?.status))) rec.userCardId = null;
+            scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
         }
@@ -789,6 +923,7 @@
         rec.status = 'tagged';
         rec.tagAppliedAt = Date.now();
         rec.lastError = null;
+        rec.nextTagRetryAt = 0;
         saveFlipLedger();
         wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>$$$</b> posé.`);
         return true;
@@ -811,10 +946,17 @@
     }
 
     async function retryPendingFlipTags() {
-        const pending = flipLedger.filter(r => r && r.status === 'pending_tag').slice(0, 10);
+        const now = Date.now();
+        // v2.3.4 prenait toujours slice(0,10) sur un ledger trié par date : 10 vieux flips
+        // bloqués pouvaient affamer tous les suivants. On prend désormais ceux qui ont été
+        // tentés le moins récemment, avec un petit backoff individuel.
+        const pending = flipLedger
+            .filter(r => r && r.status === 'pending_tag' && Number(r.nextTagRetryAt || 0) <= now)
+            .sort((a, b) => Number(a.lastTagAttemptAt || 0) - Number(b.lastTagAttemptAt || 0))
+            .slice(0, 12);
         for (const rec of pending) {
             await tagFlipRecord(rec).catch(() => false);
-            await new Promise(r => setTimeout(r, 250));
+            await new Promise(r => setTimeout(r, 300));
         }
     }
 
@@ -899,6 +1041,7 @@
             rec.status = 'tagged';
             rec.tagAppliedAt = rec.tagAppliedAt || Date.now();
             rec.lastError = null;
+            rec.nextTagRetryAt = 0;
             activeUsed.add(hit.userCardId);
             if (changed) {
                 linked++;
@@ -910,10 +1053,111 @@
         return linked;
     }
 
+    async function removeFlipTagFromUserCard(userCardId) {
+        if (!userCardId) return { ok: true, skipped: true };
+        const tagId = await ensureFlipTagId().catch(() => null);
+        if (!tagId) return { ok: false, error: 'tag $$$ introuvable' };
+        const { token } = getSupabaseAccessToken();
+        if (!token) return { ok: false, error: 'authentification manquante' };
+        try {
+            const res = await fetch(
+                `${SUPABASE_URL}/user_card_tags?user_card_id=eq.${userCardId}&tag_id=eq.${tagId}`,
+                {
+                    method: 'DELETE', credentials: 'omit',
+                    headers: {
+                        'apikey': SUPABASE_KEY,
+                        'Authorization': `Bearer ${token}`,
+                        'Prefer': 'return=minimal'
+                    }
+                }
+            );
+            return res.ok ? { ok: true } : { ok: false, error: `HTTP ${res.status}` };
+        } catch (e) {
+            return { ok: false, error: e.message || 'exception réseau' };
+        }
+    }
+
+    window.wmDeleteFlipRecord = async function (auctionId) {
+        const rec = flipLedger.find(r => r && r.auctionId === auctionId);
+        if (!rec) return false;
+        const listedNote = rec.status === 'listed'
+            ? '\n\n⚠ Cette carte est actuellement en vente : la suppression retire seulement le suivi Flip Seller et N’ANNULE PAS l’enchère.'
+            : '\n\nLe tag $$$ sera retiré de cet exemplaire si possible.';
+        if (!confirm(`Supprimer « ${rec.title || '?'} » du Flip Seller ?${listedNote}`)) return false;
+
+        // Si la carte est encore dans la collection, retirer $$$ évite de laisser un tag orphelin.
+        if (rec.status !== 'listed' && rec.userCardId) {
+            const untag = await removeFlipTagFromUserCard(rec.userCardId);
+            if (!untag?.ok) {
+                wmLog(`⚠️ Flip Seller : ligne supprimée pour <b>${rec.title}</b>, mais retrait du tag $$$ échoué · ${htmlEsc(untag?.error || '?')}`);
+            }
+        }
+
+        flipLedger = flipLedger.filter(r => r !== rec);
+        autoFlipCandidates.delete(auctionId);
+        saveAutoFlipCandidates();
+        saveFlipLedger();
+        wmLog(`🗑️ Flip Seller : <b>${rec.title}</b> retiré manuellement du suivi.`);
+        return true;
+    };
+
+    function getFlipLiveMarketStats(rec) {
+        if (!rec?.cardId) return null;
+        let stats = null;
+        // Après initialisation v2.2, getCachedSales() pointe déjà sur l'historique local pour
+        // les comptes non-PRO. Le fallback direct rend aussi l'affichage robuste pendant le boot.
+        try { stats = getCachedSales(rec.cardId, rec.rarity); } catch (e) { stats = null; }
+        if (!stats || !Number(stats.count)) {
+            try { stats = getLocalMarketStats(rec.cardId, rec.rarity); } catch (e) { }
+        }
+        if (!stats || !Number(stats.count) || !Number.isFinite(Number(stats.median))) return null;
+        return {
+            median: Number(stats.median),
+            count: Number(stats.count) || 0,
+            last: Number.isFinite(Number(stats.last)) ? Number(stats.last) : null,
+            min: Number.isFinite(Number(stats.min)) ? Number(stats.min) : null,
+            max: Number.isFinite(Number(stats.max)) ? Number(stats.max) : null
+        };
+    }
+
+    function flipMarketRecapHtml(rec) {
+        const stats = getFlipLiveMarketStats(rec);
+        if (!stats) return '<span style="color:#555;">méd. — (aucune vente locale)</span>';
+        const med = stats.median;
+        const reliable = stats.count >= 3;
+        const ref = rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))
+            ? Number(rec.listPrice)
+            : Number(rec.buyPrice || 0);
+        let comparison = '';
+        if (med > 0 && ref > 0) {
+            const pct = Math.round((ref / med - 1) * 100);
+            if (rec.status === 'listed') {
+                const abs = Math.abs(pct);
+                const color = pct > 15 ? '#ef4444' : pct > 5 ? '#fbbf24' : pct < -15 ? '#06b6d4' : '#4ade80';
+                comparison = ` · <span style="color:${color};">vente ${pct >= 0 ? '+' : ''}${pct}% vs méd.</span>`;
+            } else {
+                const color = pct <= -20 ? '#4ade80' : '#aaa';
+                comparison = ` · <span style="color:${color};">achat ${pct >= 0 ? '+' : ''}${pct}% vs méd.</span>`;
+            }
+        }
+        const reliability = reliable ? '' : ' · <span style="color:#fbbf24;">⚠ n&lt;3</span>';
+        const last = stats.last != null ? ` · dern. ${stats.last.toLocaleString('fr-FR')}` : '';
+        return `<span style="color:${reliable ? '#c4b5fd' : '#888'};">méd. <b>${med.toLocaleString('fr-FR')}</b> · n=${stats.count}</span>${last}${comparison}${reliability}`;
+    }
+
+    function flipAgeLabel(rec) {
+        const t = Number(rec?.boughtAt);
+        if (!Number.isFinite(t)) return '';
+        const d = Math.max(0, Date.now() - t);
+        if (d < 60 * 60 * 1000) return `${Math.max(1, Math.floor(d / 60000))} min`;
+        if (d < 24 * 60 * 60 * 1000) return `${Math.floor(d / 3600000)} h`;
+        return `${Math.floor(d / 86400000)} j`;
+    }
+
     async function resolveFlipSellPrice(rec) {
         const buy = Math.max(1, Number(rec?.buyPrice) || 1);
         const floor = Math.max(1, Math.ceil(buy * (1 + getFlipMarkupPct() / 100)));
-        const stats = getCachedSales(rec.cardId, rec.rarity);
+        const stats = getFlipLiveMarketStats(rec);
         let price = floor;
         let basis = `achat +${getFlipMarkupPct()}%`;
         if (stats && stats.count >= 3 && Number(stats.median) > price) {
@@ -935,8 +1179,10 @@
     }
 
     async function listFlipRecord(rec) {
+        if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
         if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') return { ok: false, reason: 'record_invalide' };
         const tagged = await fetchFlipTaggedUserCardIds();
+        if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
         if (tagged && !tagged.has(rec.userCardId)) return { ok: false, reason: 'tag_absent' };
         const priceInfo = await resolveFlipSellPrice(rec);
         const duration = getFlipDurationMin();
@@ -1006,22 +1252,48 @@
             countEl.textContent = `${open} en cours`;
         }
         if (!el) return;
-        const rows = [...flipLedger].sort((a, b) => Number(b.boughtAt || 0) - Number(a.boughtAt || 0)).slice(0, 8);
+
+        const sorted = [...flipLedger].sort((a, b) => Number(b.boughtAt || 0) - Number(a.boughtAt || 0));
+        // Toutes les cartes encore en cours sont affichées (jusqu'à 100 pour garder le DOM léger),
+        // puis les 8 dernières vendues pour conserver un mini historique.
+        const openRows = sorted.filter(r => r && r.status !== 'sold').slice(0, 100);
+        const soldRows = sorted.filter(r => r && r.status === 'sold').slice(0, 8);
+        const rows = [...openRows, ...soldRows];
         if (rows.length === 0) {
             el.innerHTML = '<div style="color:#555;font-size:9px;">Aucun achat-revente automatique pour le moment.</div>';
             return;
         }
+
         const stateLabel = r => {
-            if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${r.soldPrice} · ${r.profit >= 0 ? '+' : ''}${r.profit} 💰</span>`;
-            if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${r.listPrice} 💰</span>`;
+            if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${Number(r.soldPrice || 0).toLocaleString('fr-FR')} · ${r.profit >= 0 ? '+' : ''}${Number(r.profit || 0).toLocaleString('fr-FR')} 💰</span>`;
+            if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${Number(r.listPrice || 0).toLocaleString('fr-FR')} 💰</span>`;
             if (r.status === 'tagged') return '<span style="color:#fbbf24;">$$$ prêt</span>';
             const err = r.lastError ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>` : '';
             return `<span style="color:#888;">tag en attente</span>${err}`;
         };
-        el.innerHTML = rows.map(r => `<div style="display:flex;justify-content:space-between;gap:6px;font-size:9px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04);">
-            <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:55%;" title="${htmlEsc(r.title || '?')}">${htmlEsc(r.title || '?')} <span style="color:#666;">[${htmlEsc(r.rarity || '?')}]</span></span>
-            <span style="white-space:nowrap;color:#aaa;">achat ${Number(r.buyPrice || 0).toLocaleString('fr-FR')} · ${stateLabel(r)}</span>
-        </div>`).join('');
+
+        const hidden = Math.max(0, sorted.filter(r => r && r.status !== 'sold').length - openRows.length);
+        el.innerHTML = `<div style="font-size:8px;color:#555;margin-bottom:4px;">Médiane live = ventes locales carte + rareté sur 30 j · n&lt;3 = indication fragile.</div>` +
+            rows.map(r => {
+                const rarNow = htmlEsc(r.rarity || '?');
+                const boughtRar = String(r.purchaseRarity || '').toUpperCase();
+                const rarityTxt = boughtRar && boughtRar !== String(r.rarity || '').toUpperCase()
+                    ? `[${htmlEsc(boughtRar)}→${rarNow}]`
+                    : `[${rarNow}]`;
+                return `<div style="position:relative;padding:5px 24px 5px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:9px;line-height:1.35;">
+                    <button onclick="window.wmDeleteFlipRecord('${htmlEsc(r.auctionId || '')}')" title="Supprimer cette ligne du Flip Seller"
+                        style="position:absolute;right:0;top:5px;width:19px;height:19px;padding:0;border-radius:4px;border:1px solid rgba(239,68,68,.25);background:rgba(239,68,68,.08);color:#ef4444;cursor:pointer;font-size:11px;line-height:17px;">×</button>
+                    <div style="display:flex;justify-content:space-between;gap:8px;min-width:0;">
+                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;" title="${htmlEsc(r.title || '?')}"><b>${htmlEsc(r.title || '?')}</b> <span style="color:#666;">${rarityTxt}</span></span>
+                        <span style="white-space:nowrap;color:#aaa;">achat ${Number(r.buyPrice || 0).toLocaleString('fr-FR')} · ${stateLabel(r)}</span>
+                    </div>
+                    <div style="margin-top:2px;display:flex;justify-content:space-between;gap:6px;align-items:center;">
+                        <span>${flipMarketRecapHtml(r)}</span>
+                        <span style="color:#555;white-space:nowrap;">âge ${flipAgeLabel(r)}</span>
+                    </div>
+                </div>`;
+            }).join('') +
+            (hidden ? `<div style="font-size:8px;color:#777;margin-top:4px;">+${hidden} autre(s) flip(s) en cours non affiché(s).</div>` : '');
     }
 
     async function runFlipSeller(btn, statusEl) {
@@ -1118,7 +1390,9 @@
             tagsDollarEnBase: Array.isArray(rows) ? rows.length : null,
             pendingTag: flipLedger.filter(r => r?.status === 'pending_tag').length,
             prets: flipLedger.filter(r => r?.status === 'tagged').length,
-            enVente: flipLedger.filter(r => r?.status === 'listed').length
+            enVente: flipLedger.filter(r => r?.status === 'listed').length,
+            retriesTagTotal: flipLedger.reduce((s, r) => s + Number(r?.tagRetryCount || 0), 0),
+            pendingRetryEligibles: flipLedger.filter(r => r?.status === 'pending_tag' && Number(r?.nextTagRetryAt || 0) <= Date.now()).length
         };
         console.table(diag);
 
@@ -10695,8 +10969,8 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>$$$</b>. Prix de revente = au moins achat + marge ; si médiane fiable plus haute, elle est visée.</div>
-                    <div id="wm-flip-history" style="margin-bottom:7px;"></div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>$$$</b>. Chaque ligne affiche la médiane marché live et peut être retirée manuellement avec ×.</div>
+                    <div id="wm-flip-history" style="margin-bottom:7px;max-height:300px;overflow-y:auto;padding-right:2px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                         <div class="wm-lbl" style="margin:0;">Log</div>
@@ -11367,7 +11641,11 @@
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
             syncFlipSaleResults().catch(() => { });
+            renderFlipHistory(); // médiane / écart marché / âge rafraîchis en continu
         }, 15000);
+        // L'affichage seul est très léger : entre deux cycles réseau, l'âge et les médianes déjà
+        // reçues se rafraîchissent toutes les 5 s sans déclencher de requête supplémentaire.
+        setInterval(() => renderFlipHistory(), 5000);
 
         /* ════════ HEADER CONTROLS ════════ */
         document.getElementById('wm-close-btn').onclick = () => overlay.classList.remove('open');
