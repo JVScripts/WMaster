@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.9';
+    const WM_VERSION = '2.5.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -698,6 +698,35 @@
         }
     } catch (e) { }
 
+    // v2.5.0 : les validations `user_cards` des versions 2.4.7–2.4.9 étaient
+    // impossibles sur le schéma actuel (HTTP 400). On relance immédiatement ces lignes
+    // avec /api/my-collection comme seule source de propriété.
+    try {
+        const k = 'wm_flip_v250_collection_truth_reset_done';
+        if (!localStorage.getItem(k)) {
+            invalidateFlipOwnedCollectionSnapshot();
+            flipLedger.forEach(r => {
+                if (!r || r.status === 'sold') return;
+                const err = String(r.lastError || '').toLowerCase();
+                if (
+                    r.status === 'pending_tag' ||
+                    err.includes('user_cards') ||
+                    err.includes('row-level security') ||
+                    err.includes('rls') ||
+                    err.includes('propriété') ||
+                    err.includes('absente de la collection')
+                ) {
+                    r.userCardId = null;
+                    if (r.status !== 'listed') r.status = 'pending_tag';
+                    r.nextTagRetryAt = 0;
+                    r.lastTagAttemptAt = 0;
+                    r.lastError = 'migration v2.5.0 · résolution via collection';
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -1003,7 +1032,9 @@
         if (!it) return null;
         const card = it.card || {};
         return {
-            userCardId: it.id || it.user_card_id || null,
+            // /api/my-collection expose l'exemplaire possédé ; sur WikiMasters `id`
+            // est le user_card_id. Si un champ explicite existe, on le préfère.
+            userCardId: it.user_card_id || it.id || null,
             cardId: it.card_id || card.id || null,
             title: card.wikipedia_title || it.wikipedia_title || it.title || '',
             rarity: String(it.snapshot_rarity || card.rarity || it.rarity || '').toUpperCase(),
@@ -1021,30 +1052,165 @@
     }
 
 
-    // v2.4.7 — source de vérité absolue pour un exemplaire Flip :
-    // la ligne doit exister dans user_cards ET appartenir au user_id courant.
-    // On ne fait plus confiance à `item.id` de /api/my-collection sans validation :
-    // un mauvais id provoquait ensuite la RLS "new row violates row-level security".
+    // v2.5.0 — Source de vérité de propriété : /api/my-collection.
+    // Les accès REST directs à `user_cards` renvoient HTTP 400 sur le schéma actuel.
+    // L'API authentifiée du site renvoie précisément les exemplaires possédés et `item.id`
+    // correspond au user_card_id utilisé pour user_card_tags.
+    let _flipOwnedCollectionCache = null;
+    let _flipOwnedCollectionCacheAt = 0;
+    let _flipOwnedCollectionPromise = null;
+    const FLIP_OWNED_COLLECTION_CACHE_MS = 15_000;
+    const FLIP_OWNED_COLLECTION_MAX_PAGES = 500;
+
+    async function fetchFlipOwnedCollectionSnapshot(force = false) {
+        const now = Date.now();
+        if (
+            !force &&
+            Array.isArray(_flipOwnedCollectionCache) &&
+            now - _flipOwnedCollectionCacheAt < FLIP_OWNED_COLLECTION_CACHE_MS
+        ) {
+            return _flipOwnedCollectionCache;
+        }
+
+        if (!force && _flipOwnedCollectionPromise) {
+            return await _flipOwnedCollectionPromise;
+        }
+
+        _flipOwnedCollectionPromise = (async () => {
+            const out = [];
+            let totalPages = null;
+
+            for (let page = 0; page < FLIP_OWNED_COLLECTION_MAX_PAGES; page++) {
+                const data = await fetchFlipCollectionPage(page, 'obtained_at');
+                if (!data) break;
+
+                const items = data.items || [];
+                if (page === 0 && Number.isFinite(Number(data.total))) {
+                    totalPages = Math.ceil(Number(data.total) / 50);
+                }
+
+                for (const it of items) {
+                    const m = flipCollectionItemMeta(it);
+                    if (m?.userCardId) out.push(m);
+                }
+
+                if (items.length < 50) break;
+                if (totalPages != null && page + 1 >= totalPages) break;
+
+                // Ne pas saturer le serveur lors d'une grande collection.
+                if (page > 0 && page % 10 === 0) {
+                    await new Promise(r => setTimeout(r, 60));
+                }
+            }
+
+            _flipOwnedCollectionCache = out;
+            _flipOwnedCollectionCacheAt = Date.now();
+            return out;
+        })();
+
+        try {
+            return await _flipOwnedCollectionPromise;
+        } finally {
+            _flipOwnedCollectionPromise = null;
+        }
+    }
+
+    function invalidateFlipOwnedCollectionSnapshot() {
+        _flipOwnedCollectionCacheAt = 0;
+        _flipOwnedCollectionCache = null;
+    }
+
     async function verifyOwnedFlipUserCardId(userCardId) {
         if (!userCardId) return null;
-        const uid = currentUserId();
-        if (!uid) return null;
 
-        const rows = await supabaseSelect(
-            `user_cards?id=eq.${userCardId}&user_id=eq.${uid}&select=id,card_id,created_at&limit=1`
-        );
-        return Array.isArray(rows) && rows[0]?.id ? rows[0] : null;
+        let rows = await fetchFlipOwnedCollectionSnapshot(false);
+        let hit = Array.isArray(rows)
+            ? rows.find(m => m?.userCardId === userCardId)
+            : null;
+
+        // Un retour de vente peut avoir eu lieu juste après le snapshot.
+        if (!hit) {
+            rows = await fetchFlipOwnedCollectionSnapshot(true);
+            hit = Array.isArray(rows)
+                ? rows.find(m => m?.userCardId === userCardId)
+                : null;
+        }
+
+        if (!hit) return null;
+
+        return {
+            id: hit.userCardId,
+            card_id: hit.cardId || null,
+            created_at: Number.isFinite(hit.obtainedTs)
+                ? new Date(hit.obtainedTs).toISOString()
+                : null,
+            _flipMeta: hit
+        };
     }
 
     async function ownedFlipRowsForCardId(cardId) {
         if (!cardId) return [];
-        const uid = currentUserId();
-        if (!uid) return [];
 
-        const rows = await supabaseSelect(
-            `user_cards?user_id=eq.${uid}&card_id=eq.${cardId}&select=id,card_id,created_at&limit=100`
-        );
-        return Array.isArray(rows) ? rows.filter(r => r?.id) : [];
+        let rows = await fetchFlipOwnedCollectionSnapshot(false);
+        let matches = Array.isArray(rows)
+            ? rows.filter(m => m?.cardId === cardId)
+            : [];
+
+        if (matches.length === 0) {
+            rows = await fetchFlipOwnedCollectionSnapshot(true);
+            matches = Array.isArray(rows)
+                ? rows.filter(m => m?.cardId === cardId)
+                : [];
+        }
+
+        return matches.map(m => ({
+            id: m.userCardId,
+            card_id: m.cardId,
+            created_at: Number.isFinite(m.obtainedTs)
+                ? new Date(m.obtainedTs).toISOString()
+                : null,
+            _flipMeta: m
+        }));
+    }
+
+    function chooseOwnedFlipMeta(rec, metas, used) {
+        if (!rec || !Array.isArray(metas) || metas.length === 0) return null;
+
+        const wantedTitle = String(rec.title || '').trim();
+        const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+        const targetTs = Number(rec.boughtAt) || Date.now();
+
+        const candidates = metas
+            .filter(m => m?.userCardId && !used.has(m.userCardId))
+            .map(m => {
+                const idMatch = !!rec.cardId && m.cardId === rec.cardId;
+                const titleMatch =
+                    !!wantedTitle && wantedTitle !== '?' && m.title === wantedTitle;
+                const rarityMatch =
+                    !wantedRarity || !m.rarity || m.rarity === wantedRarity;
+
+                if (!idMatch && !titleMatch) return null;
+                if (titleMatch && !rarityMatch) return null;
+
+                const delta = Number.isFinite(m.obtainedTs)
+                    ? Math.abs(m.obtainedTs - targetTs)
+                    : Number.MAX_SAFE_INTEGER;
+
+                let score = 0;
+                if (idMatch) score += 1000;
+                if (titleMatch) score += 500;
+                if (rarityMatch) score += 150;
+                if (itemHasFlipTag(m)) score += 2000;
+                if (Number.isFinite(delta)) {
+                    score += Math.max(0, 200 - Math.floor(delta / 3600000));
+                }
+
+                return { m, score, delta };
+            })
+            .filter(Boolean)
+            .sort((a, b) => b.score - a.score || a.delta - b.delta);
+
+        return candidates[0]?.m || null;
     }
 
     async function resolveAuthoritativeFlipUserCardId(rec, candidateId = null) {
@@ -1056,69 +1222,45 @@
                 .map(x => x.userCardId)
         );
 
-        // 1) Candidat déjà trouvé par l'API collection : on ne l'accepte que s'il appartient
-        // réellement au compte dans user_cards.
-        if (candidateId) {
-            const owned = await verifyOwnedFlipUserCardId(candidateId).catch(() => null);
-            if (owned?.id && !used.has(owned.id)) {
-                if (owned.card_id && owned.card_id !== rec.cardId) {
+        let metas = await fetchFlipOwnedCollectionSnapshot(false);
+
+        // 1) Candidat exact provenant de /api/my-collection ou du ledger.
+        if (candidateId && Array.isArray(metas)) {
+            const exact = metas.find(m => m?.userCardId === candidateId);
+            if (exact && !used.has(exact.userCardId)) {
+                if (exact.cardId && exact.cardId !== rec.cardId) {
                     rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
-                    rec.cardId = owned.card_id;
+                    rec.cardId = exact.cardId;
                 }
-                return owned.id;
+                if (exact.rarity && exact.rarity !== rec.rarity) {
+                    rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                    rec.rarity = exact.rarity;
+                }
+                return exact.userCardId;
             }
         }
 
-        // 2) card_id connu : récupère directement MES exemplaires.
-        if (rec.cardId) {
-            const rows = await ownedFlipRowsForCardId(rec.cardId).catch(() => []);
-            const free = rows
-                .filter(r => !used.has(r.id))
-                .sort((a, b) => {
-                    const ta = new Date(a.created_at || 0).getTime();
-                    const tb = new Date(b.created_at || 0).getTime();
-                    return tb - ta; // récent d'abord, sans que la date soit une condition bloquante
-                })[0];
-            if (free?.id) return free.id;
+        // 2) Recherche par card_id ou titre + rareté dans la collection actuelle.
+        let best = chooseOwnedFlipMeta(rec, metas, used);
+
+        // 3) Si absent du cache, un retour collection vient peut-être d'arriver.
+        if (!best) {
+            metas = await fetchFlipOwnedCollectionSnapshot(true);
+            best = chooseOwnedFlipMeta(rec, metas, used);
         }
 
-        // 3) Le card_id a peut-être changé : résout le catalogue par titre + rareté,
-        // puis cherche MES user_cards sur ces nouveaux IDs.
-        const title = String(rec.title || '').trim();
-        const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+        if (!best?.userCardId) return null;
 
-        if (title && title !== '?') {
-            const cards = await supabaseSelect(
-                `cards?wikipedia_title=eq.${encodeURIComponent(title)}&select=id,wikipedia_title,rarity&limit=30`
-            ).catch(() => null);
-
-            if (Array.isArray(cards)) {
-                const ordered = [...cards].sort((a, b) => {
-                    const ar = String(a?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
-                    const br = String(b?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
-                    return ar - br;
-                });
-
-                for (const card of ordered) {
-                    if (!card?.id) continue;
-                    const rows = await ownedFlipRowsForCardId(card.id).catch(() => []);
-                    const free = rows.find(r => !used.has(r.id));
-                    if (!free?.id) continue;
-
-                    rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
-                    rec.cardId = card.id;
-
-                    const rr = String(card.rarity || '').toUpperCase();
-                    if (rr && rr !== rec.rarity) {
-                        rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                        rec.rarity = rr;
-                    }
-                    return free.id;
-                }
-            }
+        if (best.cardId && best.cardId !== rec.cardId) {
+            rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+            rec.cardId = best.cardId;
+        }
+        if (best.rarity && best.rarity !== rec.rarity) {
+            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+            rec.rarity = best.rarity;
         }
 
-        return null;
+        return best.userCardId;
     }
 
     async function findWonUserCardIdForFlip(rec) {
@@ -1193,27 +1335,19 @@
 
             const authoritative = await resolveAuthoritativeFlipUserCardId(rec, best.userCardId);
             if (authoritative) {
-                if (authoritative !== best.userCardId) {
-                    wmLog(
-                        `🧭 Flip Seller : id collection corrigé → <b>${rec.title}</b> · ` +
-                        `${String(best.userCardId).slice(0, 8)}… → ${String(authoritative).slice(0, 8)}…`
-                    );
-                }
-                wmLog(`🔎 Flip Seller : exemplaire vérifié propriétaire → <b>${rec.title}</b> · ${String(authoritative).slice(0, 8)}…`);
+                wmLog(
+                    `🔎 Flip Seller : exemplaire confirmé dans /my-collection → ` +
+                    `<b>${rec.title}</b> · ${String(authoritative).slice(0, 8)}…`
+                );
                 return authoritative;
             }
-
-            wmLog(
-                `⚠️ Flip Seller : l'id collection ${String(best.userCardId).slice(0, 8)}… ` +
-                `pour <b>${rec.title}</b> n'est pas une ligne user_cards possédée → ignoré.`
-            );
         }
 
-        // 2) Fallback autoritaire : user_cards de CE compte par card_id puis titre/rareté.
+        // 2) Fallback autoritaire : collection actuelle par card_id ou titre/rareté.
         const authoritative = await resolveAuthoritativeFlipUserCardId(rec, null);
         if (authoritative) {
             wmLog(
-                `🔎 Flip Seller : exemplaire résolu via user_cards propriétaire → ` +
+                `🔎 Flip Seller : exemplaire résolu via collection actuelle → ` +
                 `<b>${rec.title}</b> · ${String(authoritative).slice(0, 8)}…`
             );
             return authoritative;
@@ -1380,19 +1514,6 @@
 
         if (!rec.userCardId) rec.userCardId = await findWonUserCardIdForFlip(rec);
 
-        // v2.4.6 : dernier recours = même résolveur que le Trash Seller.
-        // Il interroge directement MES user_cards par card_id, avec retries, puis /my-collection.
-        // On ne l'utilise qu'après l'échec du résolveur Flip plus strict.
-        if (!rec.userCardId && rec.cardId) {
-            rec.userCardId = await findCurrentUserCardId(rec.cardId, rec.title).catch(() => null);
-            if (rec.userCardId) {
-                wmLog(
-                    `🔎 Flip Seller : exemplaire résolu via fallback Trash → ` +
-                    `<b>${rec.title}</b> · ${String(rec.userCardId).slice(0, 8)}…`
-                );
-            }
-        }
-
         if (!flipLedger.includes(rec)) return false;
         if (!rec.userCardId) {
             const external = await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
@@ -1425,7 +1546,7 @@
             if (external?.handled) return false;
 
             rec.status = 'pending_tag';
-            rec.lastError = 'exemplaire trouvé puis absent de user_cards · attente réconciliation';
+            rec.lastError = 'exemplaire trouvé puis absent de la collection · attente réconciliation';
             rec.nextTagRetryAt = Date.now() + 10_000;
             saveFlipLedger();
             return false;
@@ -1569,28 +1690,9 @@
             if (items.length < 50) break;
         }
 
-        // Source n°2 : pour les rares ids non trouvés dans les pages récentes, requête EXACTE
-        // id=eq.UUID une par une. Aucun opérateur in() n'est utilisé dans ce circuit.
-        for (const userCardId of ids) {
-            if (metaById.has(userCardId)) continue;
-            try {
-                const rows = await supabaseSelect(
-                    `user_cards?id=eq.${userCardId}&select=id,card_id,created_at&limit=1`
-                );
-                const uc = Array.isArray(rows) ? rows[0] : null;
-                if (uc?.id) {
-                    metaById.set(userCardId, {
-                        userCardId: uc.id,
-                        cardId: uc.card_id || null,
-                        title: '',
-                        rarity: '',
-                        obtainedTs: uc.created_at ? new Date(uc.created_at).getTime() : NaN,
-                        tags: [],
-                        raw: uc
-                    });
-                }
-            } catch (e) { }
-        }
+        // Aucun fallback `user_cards`: cette table renvoie HTTP 400 via REST sur le schéma
+        // actuel. Pour fetchFlipTaggedUserCardIds(), les liens user_card_tags suffisent déjà.
+        // Les métadonnées absentes resteront null et pourront être enrichies via collection.
 
         return ids.map(userCardId => {
             const m = metaById.get(userCardId) || null;
@@ -2239,7 +2341,7 @@
             return {
                 ok: false,
                 status: 403,
-                error: 'user_card_id non possédé selon user_cards'
+                error: 'user_card_id absent de /api/my-collection'
             };
         }
 
@@ -2546,6 +2648,27 @@
         }
     }
 
+    window.wmFlipCollectionDiag = async function () {
+        const rows = await fetchFlipOwnedCollectionSnapshot(true);
+        const sample = Array.isArray(rows) ? rows.slice(0, 5).map(m => ({
+            userCardId: m.userCardId,
+            cardId: m.cardId,
+            carte: m.title,
+            rarete: m.rarity,
+            tags: (m.tags || []).map(t => t?.name).filter(Boolean).join(', ')
+        })) : [];
+
+        const result = {
+            version: WM_VERSION,
+            sourcePropriete: '/api/my-collection',
+            userCardsRestUtiliseParFlip: false,
+            exemplairesCollection: Array.isArray(rows) ? rows.length : null
+        };
+        console.table(result);
+        if (sample.length) console.table(sample);
+        return { ...result, sample };
+    };
+
     window.wmFlipReconcileStates = async function () {
         const out = [];
         for (const rec of flipLedger.filter(r => r && !['sold'].includes(r.status))) {
@@ -2689,7 +2812,7 @@
                 ? new Date(flipTagValidatedAt).toLocaleString('fr-FR')
                 : null,
             lectureTagSansJointure: Array.isArray(rows),
-            resolutionFlipSource: 'my-collection + scan profond + Supabase eq',
+            resolutionFlipSource: '/api/my-collection uniquement pour propriété',
             listingFlipSource: 'UI native collection',
             tagsVenteEnBase: Array.isArray(rows) ? rows.length : null,
             tagsVenteMappesCarte: Array.isArray(rows)
@@ -10605,176 +10728,62 @@
     async function findCurrentUserCardId(cardId, cardTitle) {
         if (!cardId) return null;
 
-        const { token } = getSupabaseAccessToken();
-        const claims = decodeJWT(token);
-        const userId = claims?.sub;
-        if (!userId || !token) {
-            wmLog(`⚠️ findUserCardId : JWT/userId manquant`);
-            return null;
-        }
-
         const MAX_ATTEMPTS = 4;
-        const DELAYS_MS = [0, 2000, 4000, 8000]; // 0s, +2s, +4s, +8s = ~14s max
+        const DELAYS_MS = [0, 2000, 4000, 8000];
+
         for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
             if (DELAYS_MS[attempt] > 0) {
                 await new Promise(r => setTimeout(r, DELAYS_MS[attempt]));
             }
 
-            // 1) Tentative principale : user_cards table via Supabase REST
             try {
-                const url = `${SUPABASE_URL}/user_cards?card_id=eq.${cardId}&user_id=eq.${userId}&select=id,user_card_tags(tag_id)&limit=20`;
-                const res = await fetch(url, {
-                    credentials: 'omit',
-                    headers: {
-                        'apikey': SUPABASE_KEY,
-                        'Authorization': `Bearer ${token}`,
-                        'Accept': 'application/json'
-                    }
-                });
-                if (res.ok) {
-                    const items = await res.json();
-                    if (Array.isArray(items) && items.length > 0) {
-                        // Préférer un exemplaire sans le tag Trash (= celui qui vient de revenir)
-                        const untagged = items.find(i =>
-                            !(i.user_card_tags || []).some(t => t.tag_id === TRASH_TAG_ID)
+                // Source autorisée et stable : collection authentifiée.
+                // `item.id` = user_card_id ; aucune lecture REST directe de user_cards.
+                const MAX_PAGES = 80; // 4 000 acquisitions récentes par tentative
+                for (let page = 0; page < MAX_PAGES; page++) {
+                    const res = await fetch(
+                        `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50&sort=obtained_at`,
+                        { credentials: 'include' }
+                    );
+                    if (!res.ok) break;
+
+                    const data = await res.json();
+                    const items = Array.isArray(data?.collection) ? data.collection : [];
+                    if (items.length === 0) break;
+
+                    const matches = items.filter(i =>
+                        (i.card_id || i.card?.id) === cardId
+                    );
+
+                    if (matches.length > 0) {
+                        // Pour Trash, préfère l'exemplaire qui ne porte pas déjà le tag Trash.
+                        const untagged = matches.find(i =>
+                            !(i.tags || []).some(t => t?.id === TRASH_TAG_ID || t?.tag_id === TRASH_TAG_ID)
                         );
-                        const found = untagged?.id || items[0]?.id;
+                        const picked = untagged || matches[0];
+                        const found = picked?.user_card_id || picked?.id || null;
+
                         if (found) {
-                            const retryNote = attempt > 0 ? ` <span style="color:#888;font-size:9px;">(tentative ${attempt + 1}/${MAX_ATTEMPTS})</span>` : '';
-                            wmLog(`🔎 user_card_id résolu via Supabase : <b>${cardTitle || cardId.slice(0, 8)}</b> · ${items.length} exemplaire(s), ${untagged ? 'sans tag' : 'déjà taggué'} → ${found.slice(0, 8)}…${retryNote}`);
+                            const retryNote = attempt > 0
+                                ? ` <span style="color:#888;font-size:9px;">(tentative ${attempt + 1}/${MAX_ATTEMPTS})</span>`
+                                : '';
+                            wmLog(
+                                `🔎 user_card_id résolu via collection : ` +
+                                `<b>${cardTitle || cardId.slice(0, 8)}</b> → ${String(found).slice(0, 8)}…${retryNote}`
+                            );
                             return found;
                         }
                     }
-                    // Items vide → la carte n'est pas (encore) revenue. On retry après délai.
-                } else {
-                    const body = await res.text().catch(() => '');
-                    wmLog(`⚠️ findUserCardId Supabase HTTP ${res.status} · ${body.slice(0, 100)}`);
-                    // Erreur réseau/auth : on continue les retries
+
+                    if (items.length < 50) break;
                 }
             } catch (e) {
-                wmLog(`⚠️ findUserCardId Supabase exception : ${e.message}`);
+                wmLog(`⚠️ findUserCardId collection : ${e.message}`);
             }
         }
 
-        // 2) Fallback final : scan de /api/my-collection (peut ne pas exposer le bon id)
-        try {
-            for (let page = 0; page < 5; page++) {
-                const res = await fetch(
-                    `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50&sort=obtained_at`,
-                    { credentials: 'include' }
-                );
-                if (!res.ok) break;
-                const data = await res.json();
-                const items = data.collection || [];
-                if (items.length === 0) break;
-                const matches = items.filter(i => (i.card_id || i.card?.id) === cardId);
-                const untagged = matches.find(i => !(i.tags || []).some(t => t.name === getSellTagName()));
-                if (untagged?.id) return untagged.id;
-                if (matches[0]?.id) return matches[0].id;
-                if (items.length < 50) break;
-            }
-        } catch (e) { }
-
-        wmLog(`🔍 Aucun exemplaire trouvé pour <b>${cardTitle || cardId.slice(0, 8)}</b> après ${MAX_ATTEMPTS} tentatives Supabase`);
         return null;
     }
-
-    // Extrait le JWT utilisateur depuis localStorage ou les cookies Supabase
-    // (supabase-ssr stocke en cookie, parfois chunké en .0 .1, parfois préfixé "base64-")
-    function getSupabaseAccessToken() {
-        const key = `sb-${SUPABASE_REF}-auth-token`;
-
-        // 1) localStorage (clients Supabase classiques)
-        try {
-            const raw = localStorage.getItem(key);
-            if (raw) {
-                const obj = JSON.parse(raw);
-                if (obj?.access_token) return { token: obj.access_token, source: 'localStorage' };
-                if (Array.isArray(obj) && obj[0]) return { token: obj[0], source: 'localStorage[0]' };
-            }
-        } catch (e) { }
-
-        // 2) Cookies (supabase-ssr) — éventuellement chunkés en .0 .1 .2…
-        try {
-            const cookies = document.cookie.split(';').map(c => c.trim());
-            const chunks = {};
-            let single = null;
-            for (const c of cookies) {
-                const eq = c.indexOf('=');
-                if (eq === -1) continue;
-                const name = c.slice(0, eq);
-                const value = c.slice(eq + 1);
-                if (name === key) { single = value; continue; }
-                const m = name.match(new RegExp(`^${key}\\.(\\d+)$`));
-                if (m) chunks[parseInt(m[1])] = value;
-            }
-            let raw = single;
-            if (!raw && Object.keys(chunks).length > 0) {
-                raw = Object.keys(chunks).sort((a, b) => a - b).map(k => chunks[k]).join('');
-            }
-            if (raw) {
-                raw = decodeURIComponent(raw);
-                if (raw.startsWith('base64-')) raw = atob(raw.slice(7));
-                const obj = JSON.parse(raw);
-                if (obj?.access_token) return { token: obj.access_token, source: 'cookie' };
-                if (Array.isArray(obj) && obj[0]) return { token: obj[0], source: 'cookie[0]' };
-            }
-        } catch (e) { }
-
-        return { token: null, source: null };
-    }
-
-    /* ── Introspection du schéma Supabase ──
-       Le site est bâti sur Supabase et le bot y est déjà authentifié (tags, user_cards, cards).
-       Depuis que /api/marketplace/mine a été réduit à des compteurs, les ventes doivent être
-       lues directement en base. PostgREST publie un descriptif OpenAPI à la racine de /rest/v1
-       listant TOUTES les tables exposées et leurs colonnes : une seule requête donne la réponse
-       exacte, au lieu de bombarder le serveur de noms de tables inventés.
-       Console : wmDiscoverTables()  — ou wmDiscoverTables('auction') pour filtrer. */
-    window.wmDiscoverTables = async function (filter) {
-        const { token } = getSupabaseAccessToken();
-        let spec;
-        try {
-            const res = await fetch(`${SUPABASE_URL}/`, {
-                credentials: 'omit',
-                headers: {
-                    'apikey': SUPABASE_KEY,
-                    'Authorization': `Bearer ${token || SUPABASE_KEY}`,
-                    'Accept': 'application/openapi+json'
-                }
-            });
-            if (!res.ok) { wmLog(`🔬 Introspection Supabase : <b>HTTP ${res.status}</b>${token ? '' : ' (aucun token utilisateur trouvé — es-tu connecté au site ?)'}`); return null; }
-            spec = await res.json();
-        } catch (e) {
-            wmLog(`🔬 Introspection Supabase échouée : ${e.message}`);
-            return null;
-        }
-        const defs = spec.definitions || (spec.components && spec.components.schemas) || {};
-        const tables = Object.keys(defs);
-        if (tables.length === 0) { wmLog(`🔬 Supabase : aucune table exposée dans le descriptif.`); return spec; }
-        const rx = filter ? new RegExp(filter, 'i') : /auction|market|sale|sell|listing|bid|trade/i;
-        const hits = tables.filter(t => rx.test(t));
-        wmLog(`🔬 <b>Supabase</b> : ${tables.length} table(s) exposée(s) · correspondances : <b style="color:#4ade80;">${hits.join(', ') || 'aucune'}</b>`);
-        for (const t of hits.slice(0, 6)) {
-            const cols = Object.keys((defs[t] && defs[t].properties) || {});
-            wmLog(`🔬 <b>${t}</b> → <span style="color:#888;font-size:9px;">${cols.join(', ') || '(colonnes inconnues)'}</span>`);
-        }
-        if (hits.length === 0) {
-            wmLog(`🔬 Toutes les tables : <span style="color:#888;font-size:9px;">${tables.join(', ')}</span>`);
-        }
-        return spec; // consultable dans la console
-    };
-
-    /* ══════════ VENTES & ACHATS LUS DIRECTEMENT EN BASE ══════════
-       L'API REST du site ne renvoie plus que des compteurs. Les données vivent dans Supabase :
-         auctions(id, seller_id, card_id, base_amount, current_bid, current_bidder_id, end_at,
-                  status, winner_id, final_price, settled_at, snapshot_rarity,
-                  listing_base_amount, …)
-       On les relit directement, puis on les remet dans la FORME que le reste du code attend
-       déjà (card:{…}, current_bidder:{username}) — ainsi renderActiveSales, updateBidsSumDisplay
-       et l'annulation de vente continuent de fonctionner sans être réécrits. */
-    const AUCTION_COLS = 'id,seller_id,card_id,base_amount,current_bid,current_bidder_id,' +
-        'end_at,status,winner_id,final_price,settled_at,created_at,snapshot_rarity,listing_base_amount';
 
     async function supabaseSelect(path) {
         const { token } = getSupabaseAccessToken();
