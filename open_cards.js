@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.5.0';
+    const WM_VERSION = '2.5.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -727,6 +727,25 @@
         }
     } catch (e) { }
 
+    // v2.5.1 : v2.5.0 s'arrêtait à 50 cartes lorsque l'API renvoyait `total=50`.
+    // Relance immédiatement les flips introuvables avec la vraie pagination.
+    try {
+        const k = 'wm_flip_v251_pagination_retry_done';
+        if (!localStorage.getItem(k)) {
+            invalidateFlipOwnedCollectionSnapshot();
+            flipLedger.forEach(r => {
+                if (!r || r.status !== 'pending_tag') return;
+                r.nextTagRetryAt = 0;
+                r.lastTagAttemptAt = 0;
+                if (String(r.lastError || '').includes('introuvable') ||
+                    String(r.lastError || '').includes('absente')) {
+                    r.lastError = 'v2.5.1 · nouvelle recherche collection paginée';
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -1017,10 +1036,19 @@
                     continue;
                 }
                 const data = await res.json();
-                return {
-                    items: Array.isArray(data?.collection) ? data.collection : [],
-                    total: Number.isFinite(Number(data?.total)) ? Number(data.total) : null
-                };
+                const items = Array.isArray(data?.collection) ? data.collection : [];
+                const rawTotal = Number(data?.total);
+
+                // v2.5.1 : sur certaines variantes de /api/my-collection, `total`
+                // vaut simplement 50 (= taille de page) même lorsque d'autres pages existent.
+                // Une page pleine + total <= taille de page est donc ambiguë : on IGNORE
+                // ce total et on continue par pagination dynamique jusqu'à une vraie fin.
+                const total = (
+                    Number.isFinite(rawTotal) &&
+                    rawTotal > items.length
+                ) ? rawTotal : null;
+
+                return { items, total };
             } catch (e) {
                 await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
             }
@@ -1059,8 +1087,9 @@
     let _flipOwnedCollectionCache = null;
     let _flipOwnedCollectionCacheAt = 0;
     let _flipOwnedCollectionPromise = null;
-    const FLIP_OWNED_COLLECTION_CACHE_MS = 15_000;
-    const FLIP_OWNED_COLLECTION_MAX_PAGES = 500;
+    let _flipOwnedCollectionPagesRead = 0;
+    let _flipOwnedCollectionTruncated = false;
+    const FLIP_OWNED_COLLECTION_CACHE_MS = 30_000;
 
     async function fetchFlipOwnedCollectionSnapshot(force = false) {
         const now = Date.now();
@@ -1077,34 +1106,82 @@
         }
 
         _flipOwnedCollectionPromise = (async () => {
-            const out = [];
-            let totalPages = null;
+            const byUserCardId = new Map();
+            const seenPageFingerprints = new Set();
+            let pagesRead = 0;
+            let truncated = false;
 
-            for (let page = 0; page < FLIP_OWNED_COLLECTION_MAX_PAGES; page++) {
-                const data = await fetchFlipCollectionPage(page, 'obtained_at');
-                if (!data) break;
+            // Le snapshot sert surtout à répondre vite aux recherches de propriété.
+            // Jusqu'à 50 000 exemplaires ici ; la résolution ciblée profonde peut aller
+            // plus loin si nécessaire.
+            const MAX_PAGES = 1000;
+            const BATCH = 8;
 
-                const items = data.items || [];
-                if (page === 0 && Number.isFinite(Number(data.total))) {
-                    totalPages = Math.ceil(Number(data.total) / 50);
+            for (let startPage = 0; startPage < MAX_PAGES; startPage += BATCH) {
+                const pages = [];
+                for (let p = startPage; p < Math.min(startPage + BATCH, MAX_PAGES); p++) {
+                    pages.push(p);
                 }
 
-                for (const it of items) {
-                    const m = flipCollectionItemMeta(it);
-                    if (m?.userCardId) out.push(m);
+                const batch = await Promise.all(
+                    pages.map(p => fetchFlipCollectionPage(p, 'obtained_at').catch(() => null))
+                );
+
+                let reachedEnd = false;
+                let addedThisBatch = 0;
+
+                for (let i = 0; i < batch.length; i++) {
+                    const data = batch[i];
+                    if (!data) continue;
+
+                    const items = data.items || [];
+                    pagesRead++;
+
+                    if (items.length === 0) {
+                        reachedEnd = true;
+                        continue;
+                    }
+
+                    // Si le serveur ignore `page`, la même première/dernière paire réapparaît.
+                    // On s'arrête au lieu de boucler des centaines de fois.
+                    const firstId = items[0]?.user_card_id || items[0]?.id || '';
+                    const lastId = items[items.length - 1]?.user_card_id || items[items.length - 1]?.id || '';
+                    const fp = `${items.length}|${firstId}|${lastId}`;
+                    if (seenPageFingerprints.has(fp)) {
+                        reachedEnd = true;
+                        continue;
+                    }
+                    seenPageFingerprints.add(fp);
+
+                    for (const it of items) {
+                        const m = flipCollectionItemMeta(it);
+                        if (!m?.userCardId) continue;
+                        if (!byUserCardId.has(m.userCardId)) addedThisBatch++;
+                        byUserCardId.set(m.userCardId, m);
+                    }
+
+                    // Seule preuve fiable de dernière page : page plus courte que la limite.
+                    if (items.length < 50) reachedEnd = true;
                 }
 
-                if (items.length < 50) break;
-                if (totalPages != null && page + 1 >= totalPages) break;
+                if (reachedEnd) break;
 
-                // Ne pas saturer le serveur lors d'une grande collection.
-                if (page > 0 && page % 10 === 0) {
-                    await new Promise(r => setTimeout(r, 60));
-                }
+                // Autre garde-fou : pages valides mais absolument aucun nouvel exemplaire.
+                if (addedThisBatch === 0 && startPage > 0) break;
+
+                await new Promise(r => setTimeout(r, 35));
             }
 
+            if (pagesRead >= MAX_PAGES) {
+                truncated = true;
+            }
+
+            const out = [...byUserCardId.values()];
             _flipOwnedCollectionCache = out;
             _flipOwnedCollectionCacheAt = Date.now();
+            _flipOwnedCollectionPagesRead = pagesRead;
+            _flipOwnedCollectionTruncated = truncated;
+
             return out;
         })();
 
@@ -1364,7 +1441,6 @@
     let flipDeepResolveLastAt = 0;
     let flipDeepResolveRunning = false;
     const FLIP_DEEP_RESOLVE_COOLDOWN_MS = 2 * 60 * 1000;
-    const FLIP_DEEP_RESOLVE_MAX_PAGES = 300; // jusqu'à 15 000 exemplaires récents, arrêt anticipé
 
     async function deepResolvePendingFlipRecords(force = false) {
         if (flipDeepResolveRunning) return 0;
@@ -1389,33 +1465,49 @@
             );
 
             const unresolved = new Set(targets);
+            const seenPageFingerprints = new Set();
             let resolved = 0;
-            let totalPages = null;
-            const BATCH = 5;
 
-            for (let start = 0;
-                start < FLIP_DEEP_RESOLVE_MAX_PAGES && unresolved.size > 0;
-                start += BATCH) {
+            // Jusqu'à 100 000 acquisitions si nécessaire. Ce scan ne démarre que pour
+            // quelques flips réellement bloqués et s'arrête dès qu'ils sont tous trouvés.
+            const MAX_PAGES = 2000;
+            const BATCH = 10;
+            let reachedEnd = false;
 
+            for (
+                let startPage = 0;
+                startPage < MAX_PAGES && unresolved.size > 0 && !reachedEnd;
+                startPage += BATCH
+            ) {
                 const pages = [];
-                for (let p = start; p < start + BATCH && p < FLIP_DEEP_RESOLVE_MAX_PAGES; p++) {
-                    if (totalPages != null && p >= totalPages) break;
+                for (let p = startPage; p < Math.min(startPage + BATCH, MAX_PAGES); p++) {
                     pages.push(p);
                 }
-                if (pages.length === 0) break;
 
                 const batch = await Promise.all(
                     pages.map(p => fetchFlipCollectionPage(p, 'obtained_at').catch(() => null))
                 );
 
-                let sawAny = false;
+                let addedAny = false;
+
                 for (const data of batch) {
                     if (!data) continue;
+
                     const items = data.items || [];
-                    if (data.total != null && totalPages == null) {
-                        totalPages = Math.ceil(data.total / 50);
+                    if (items.length === 0) {
+                        reachedEnd = true;
+                        continue;
                     }
-                    if (items.length > 0) sawAny = true;
+
+                    const firstId = items[0]?.user_card_id || items[0]?.id || '';
+                    const lastId = items[items.length - 1]?.user_card_id || items[items.length - 1]?.id || '';
+                    const fp = `${items.length}|${firstId}|${lastId}`;
+                    if (seenPageFingerprints.has(fp)) {
+                        reachedEnd = true;
+                        continue;
+                    }
+                    seenPageFingerprints.add(fp);
+                    addedAny = true;
 
                     for (const it of items) {
                         const m = flipCollectionItemMeta(it);
@@ -1423,11 +1515,19 @@
 
                         for (const rec of [...unresolved]) {
                             const wantedTitle = String(rec.title || '').trim();
-                            const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+                            const wantedRarity = String(
+                                rec.rarity || rec.purchaseRarity || ''
+                            ).toUpperCase();
 
                             const idMatch = !!rec.cardId && m.cardId === rec.cardId;
-                            const titleMatch = !!wantedTitle && wantedTitle !== '?' && m.title === wantedTitle;
-                            const rarityMatch = !wantedRarity || !m.rarity || m.rarity === wantedRarity;
+                            const titleMatch =
+                                !!wantedTitle &&
+                                wantedTitle !== '?' &&
+                                m.title === wantedTitle;
+                            const rarityMatch =
+                                !wantedRarity ||
+                                !m.rarity ||
+                                m.rarity === wantedRarity;
 
                             if (!idMatch && !(titleMatch && rarityMatch)) continue;
 
@@ -1440,38 +1540,48 @@
                                 rec.rarity = m.rarity;
                             }
 
-                            const authoritativeId =
-                                await resolveAuthoritativeFlipUserCardId(rec, m.userCardId).catch(() => null);
-                            if (!authoritativeId) continue;
-
-                            rec.userCardId = authoritativeId;
-                            rec.lastError = 'exemplaire propriétaire retrouvé · tag à poser';
+                            // L'item vient directement de /api/my-collection : il est possédé.
+                            rec.userCardId = m.userCardId;
+                            rec.lastError = 'exemplaire retrouvé par scan profond collection · tag à poser';
                             rec.nextTagRetryAt = 0;
 
-                            used.add(authoritativeId);
+                            used.add(m.userCardId);
                             unresolved.delete(rec);
                             resolved++;
 
                             wmLog(
                                 `🔎 Flip Seller : scan profond → <b>${rec.title}</b> ` +
-                                `résolu/validé (${String(authoritativeId).slice(0, 8)}…).`
+                                `retrouvé page collection (${String(m.userCardId).slice(0, 8)}…).`
                             );
                             break;
                         }
                     }
+
+                    if (items.length < 50) reachedEnd = true;
+                    if (unresolved.size === 0) break;
                 }
 
-                if (!sawAny) break;
-                if (totalPages != null && start + BATCH >= totalPages) break;
-                await new Promise(r => setTimeout(r, 80));
+                if (!addedAny && startPage > 0) break;
+
+                if (startPage > 0 && startPage % 100 === 0) {
+                    console.info(
+                        `[WikiMasters][Flip] scan profond: ${startPage} pages, ` +
+                        `${resolved} résolu(s), ${unresolved.size} restant(s).`
+                    );
+                }
+
+                await new Promise(r => setTimeout(r, 40));
             }
 
-            if (resolved > 0) saveFlipLedger();
+            if (resolved > 0) {
+                invalidateFlipOwnedCollectionSnapshot();
+                saveFlipLedger();
+            }
 
             if (unresolved.size > 0) {
                 console.info(
                     `[WikiMasters][Flip] scan profond: ${resolved} résolu(s), ` +
-                    `${unresolved.size} encore introuvable(s).`
+                    `${unresolved.size} encore introuvable(s) après pagination réelle.`
                 );
             }
 
@@ -2648,6 +2758,22 @@
         }
     }
 
+    window.wmAuthDiag = function () {
+        const auth = getSupabaseAccessToken();
+        const claims = decodeJWT(auth?.token || null);
+        const result = {
+            version: WM_VERSION,
+            tokenTrouve: !!auth?.token,
+            source: auth?.source || null,
+            userIdTrouve: claims?.sub || null,
+            expiration: claims?.exp
+                ? new Date(Number(claims.exp) * 1000).toLocaleString('fr-FR')
+                : null
+        };
+        console.table(result);
+        return result;
+    };
+
     window.wmFlipCollectionDiag = async function () {
         const rows = await fetchFlipOwnedCollectionSnapshot(true);
         const sample = Array.isArray(rows) ? rows.slice(0, 5).map(m => ({
@@ -2662,7 +2788,9 @@
             version: WM_VERSION,
             sourcePropriete: '/api/my-collection',
             userCardsRestUtiliseParFlip: false,
-            exemplairesCollection: Array.isArray(rows) ? rows.length : null
+            exemplairesCollection: Array.isArray(rows) ? rows.length : null,
+            pagesCollectionLues: _flipOwnedCollectionPagesRead,
+            scanTronqueAuMax: _flipOwnedCollectionTruncated
         };
         console.table(result);
         if (sample.length) console.table(sample);
@@ -10454,6 +10582,83 @@
     const SUPABASE_REF = "cyrxjeppjqsxxjayfrur";
     const SUPABASE_URL = `https://${SUPABASE_REF}.supabase.co/rest/v1`;
     const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN5cnhqZXBwanFzeHhqYXlmcnVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4ODAzMzksImV4cCI6MjA4OTQ1NjMzOX0.BZluyXygNxuQGDPxFX1zG5i-cqp10CVK-8GGtuak4Rg";
+
+
+    // v2.5.2 — Auth Supabase partagée.
+    // Cette fonction avait été supprimée accidentellement en v2.5.0 lors du remplacement
+    // de findCurrentUserCardId(), ce qui cassait Market Watcher, historique local,
+    // syncWonAuctions, tags et toutes les lectures RLS.
+    //
+    // Elle vit désormais près des constantes Supabase, indépendamment de Trash/Flip.
+    function getSupabaseAccessToken() {
+        const key = `sb-${SUPABASE_REF}-auth-token`;
+
+        // 1) localStorage — clients Supabase classiques
+        try {
+            const raw = localStorage.getItem(key);
+            if (raw) {
+                const obj = JSON.parse(raw);
+                if (obj?.access_token) {
+                    return { token: obj.access_token, source: 'localStorage' };
+                }
+                if (Array.isArray(obj) && obj[0]) {
+                    return { token: obj[0], source: 'localStorage[0]' };
+                }
+            }
+        } catch (e) { }
+
+        // 2) Cookies supabase-ssr, éventuellement chunkés .0 .1 .2...
+        try {
+            const cookies = document.cookie.split(';').map(c => c.trim());
+            const chunks = {};
+            let single = null;
+
+            for (const c of cookies) {
+                const eq = c.indexOf('=');
+                if (eq === -1) continue;
+
+                const name = c.slice(0, eq);
+                const value = c.slice(eq + 1);
+
+                if (name === key) {
+                    single = value;
+                    continue;
+                }
+
+                const m = name.match(new RegExp(`^${key}\\.(\\d+)$`));
+                if (m) chunks[parseInt(m[1], 10)] = value;
+            }
+
+            let raw = single;
+            if (!raw && Object.keys(chunks).length > 0) {
+                raw = Object.keys(chunks)
+                    .map(Number)
+                    .sort((a, b) => a - b)
+                    .map(k => chunks[k])
+                    .join('');
+            }
+
+            if (raw) {
+                raw = decodeURIComponent(raw);
+
+                if (raw.startsWith('base64-')) {
+                    raw = atob(raw.slice(7));
+                }
+
+                const obj = JSON.parse(raw);
+
+                if (obj?.access_token) {
+                    return { token: obj.access_token, source: 'cookie' };
+                }
+                if (Array.isArray(obj) && obj[0]) {
+                    return { token: obj[0], source: 'cookie[0]' };
+                }
+            }
+        } catch (e) { }
+
+        return { token: null, source: null };
+    }
+
     // Tag Trash : découvert dynamiquement par compte (par-utilisateur sur wiki-masters)
     const TRASH_TAG_CACHE_KEY = 'wm_trash_tag_id';
     let TRASH_TAG_ID = localStorage.getItem(TRASH_TAG_CACHE_KEY) || null;
@@ -10786,7 +10991,8 @@
     }
 
     async function supabaseSelect(path) {
-        const { token } = getSupabaseAccessToken();
+        const auth = getSupabaseAccessToken();
+        const token = auth?.token || null;
         if (!token) return null; // sans JWT utilisateur la RLS ne renverra rien d'utile
         try {
             const res = await fetchWithTimeout(`${SUPABASE_URL}/${path}`, {
@@ -10803,8 +11009,12 @@
     }
 
     function currentUserId() {
-        const { token } = getSupabaseAccessToken();
-        return decodeJWT(token)?.sub || null;
+        try {
+            const auth = getSupabaseAccessToken();
+            return decodeJWT(auth?.token || null)?.sub || null;
+        } catch (e) {
+            return null;
+        }
     }
 
     // Résolution id → pseudo. La table des profils n'est pas connue d'avance (le code
