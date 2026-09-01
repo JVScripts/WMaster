@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.1';
+    const WM_VERSION = '2.4.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11381,6 +11381,30 @@
                     </div>
                     <div id="wm-keywords-panel" style="display:none;margin-bottom:8px;"></div>
                     <div class="wm-sep"></div>
+
+                    <!-- v2.4.3 : médiane à la volée directement dans l'interface -->
+                    <div style="margin-bottom:8px;padding:7px;border:1px solid rgba(168,85,247,.22);border-radius:6px;background:rgba(168,85,247,.035);">
+                        <div class="wm-lbl" style="margin:0 0 5px;color:#c4b5fd;">📊 Médiane rapide</div>
+                        <div style="display:flex;gap:5px;align-items:center;">
+                            <input id="wm-median-lookup" type="text" autocomplete="off" spellcheck="false"
+                                placeholder="Nom de la carte…"
+                                style="flex:1;min-width:0;padding:4px 7px;border-radius:4px;border:1px solid rgba(168,85,247,.35);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                            <select id="wm-median-rarity"
+                                style="width:58px;padding:4px 3px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                                <option value="">Toutes</option>
+                                <option value="L">L</option>
+                                <option value="UR">UR</option>
+                                <option value="SR">SR</option>
+                                <option value="R">R</option>
+                                <option value="PC">PC</option>
+                                <option value="C">C</option>
+                            </select>
+                            <button id="wm-median-btn"
+                                style="padding:4px 8px;border-radius:4px;border:1px solid rgba(168,85,247,.45);background:rgba(168,85,247,.10);color:#d8b4fe;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">Médiane</button>
+                        </div>
+                        <div id="wm-median-result" style="margin-top:5px;min-height:13px;font-size:10px;color:#777;line-height:1.45;">Tape une carte puis Entrée.</div>
+                    </div>
+
                     <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
                         <input id="wm-market-search" type="text" autocomplete="off" spellcheck="false"
                             placeholder="🔎 Filtrer les annonces (titre, mot-clé…)"
@@ -11978,6 +12002,58 @@
                 // Les lignes dépliées à la main n'ont de sens qu'en compact.
                 if (marketView !== 'compact') marketExpandedIds.clear();
                 if (lastHitsCache.length > 0) renderMarketHits(marketAlertEl, lastHitsCache, []);
+            };
+        }
+
+        // v2.4.3 — Médiane rapide directement dans le Market Watcher.
+        const medianLookupInput = document.getElementById('wm-median-lookup');
+        const medianRaritySelect = document.getElementById('wm-median-rarity');
+        const medianLookupBtn = document.getElementById('wm-median-btn');
+        const medianLookupResult = document.getElementById('wm-median-result');
+
+        async function runMedianLookupUi() {
+            if (!medianLookupInput || !medianLookupResult) return;
+            const q = String(medianLookupInput.value || '').trim();
+            const rarity = String(medianRaritySelect?.value || '').trim().toUpperCase();
+
+            if (!q) {
+                medianLookupResult.innerHTML = '<span style="color:#777;">Tape le nom d’une carte.</span>';
+                medianLookupInput.focus();
+                return;
+            }
+
+            if (medianLookupBtn) {
+                medianLookupBtn.disabled = true;
+                medianLookupBtn.textContent = '…';
+            }
+            medianLookupResult.innerHTML = '<span style="color:#777;">Recherche…</span>';
+
+            try {
+                const rows = await window.wmMedian(q, rarity, true);
+                medianLookupResult.innerHTML = quickMedianRowsHtml(rows, q);
+            } catch (e) {
+                medianLookupResult.innerHTML =
+                    `<span style="color:#ef4444;">Erreur : ${htmlEsc(e?.message || String(e))}</span>`;
+            } finally {
+                if (medianLookupBtn) {
+                    medianLookupBtn.disabled = false;
+                    medianLookupBtn.textContent = 'Médiane';
+                }
+            }
+        }
+
+        if (medianLookupBtn) medianLookupBtn.onclick = runMedianLookupUi;
+        if (medianLookupInput) {
+            medianLookupInput.onkeydown = (e) => {
+                if (e.key === 'Enter') {
+                    e.preventDefault();
+                    runMedianLookupUi();
+                }
+            };
+        }
+        if (medianRaritySelect) {
+            medianRaritySelect.onchange = () => {
+                if (String(medianLookupInput?.value || '').trim()) runMedianLookupUi();
             };
         }
 
@@ -17397,6 +17473,195 @@
     /* ============================================================
         OUTILS CONSOLE
         ============================================================ */
+
+
+    /* ============================================================
+       RECHERCHE MÉDIANE À LA VOLÉE
+       Console :
+         await wmMedian("Jupiter")
+         await wmMedian("Jupiter", "UR")
+       ============================================================ */
+
+    async function findCardsByTitleForMedian(title) {
+        const q = String(title || '').trim();
+        if (!q) return [];
+
+        const found = new Map();
+
+        // 1) Cache marketplace déjà chargé : zéro requête supplémentaire.
+        try {
+            const pools = [
+                ...(Array.isArray(lastAllMarketAuctions) ? lastAllMarketAuctions : []),
+                ...(Array.isArray(lastHitsCache) ? lastHitsCache : [])
+            ];
+            for (const a of pools) {
+                const c = a?.card || a;
+                const cardId = c?.id || a?.card_id;
+                const t = String(c?.wikipedia_title || '').trim();
+                if (!cardId || !t) continue;
+                if (t.toLocaleLowerCase('fr-FR').includes(q.toLocaleLowerCase('fr-FR'))) {
+                    const rarity = String(a?.snapshot_rarity || c?.rarity || '').toUpperCase();
+                    found.set(`${cardId}|${rarity}`, {
+                        cardId,
+                        title: t,
+                        rarity
+                    });
+                }
+            }
+        } catch (e) { }
+
+        // 2) Catalogue Supabase pour pouvoir chercher une carte même absente du market actuel.
+        try {
+            const escaped = q.replace(/[%_*]/g, s => '\\' + s);
+            const rows = await supabaseSelect(
+                `cards?wikipedia_title=ilike.*${encodeURIComponent(escaped)}*&select=id,wikipedia_title,rarity&limit=50`
+            );
+            if (Array.isArray(rows)) {
+                for (const c of rows) {
+                    if (!c?.id) continue;
+                    const rarity = String(c?.rarity || '').toUpperCase();
+                    found.set(`${c.id}|${rarity}`, {
+                        cardId: c.id,
+                        title: c.wikipedia_title || q,
+                        rarity
+                    });
+                }
+            }
+        } catch (e) { }
+
+        // Exact titre d'abord, puis correspondances partielles.
+        const arr = [...found.values()];
+        const ql = q.toLocaleLowerCase('fr-FR');
+        return arr.sort((a, b) => {
+            const ae = String(a.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
+            const be = String(b.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
+            if (ae !== be) return ae - be;
+            return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
+        });
+    }
+
+    function quickMedianRowsHtml(rows, query = '') {
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return `<span style="color:#f59e0b;">Aucune donnée pour « ${htmlEsc(query)} ».</span>`;
+        }
+
+        return rows.slice(0, 8).map(r => {
+            const count = Number(r?.ventes || 0);
+            const med = Number(r?.mediane);
+            const last = Number(r?.derniere);
+            const reliable = count >= 3 && Number.isFinite(med) && med > 0;
+
+            if (!Number.isFinite(med) || med <= 0 || count <= 0) {
+                return `<div style="padding:2px 0;border-top:1px solid rgba(255,255,255,.035);">
+                    <b style="color:#ddd;">${htmlEsc(r?.carte || '?')}</b>
+                    <span style="color:#777;"> [${htmlEsc(r?.rarete || '?')}] · aucune vente locale</span>
+                </div>`;
+            }
+
+            // Même règle que le Hunter dynamique v2.3.9 : 75 %, arrondi à la dizaine inférieure.
+            const capHunter = Math.max(10, Math.floor((med * 0.75) / 10) * 10);
+            const reliability = reliable
+                ? `<span style="color:#4ade80;">n=${count}</span>`
+                : `<span style="color:#fbbf24;">n=${count} ⚠ peu fiable</span>`;
+            const lastHtml = Number.isFinite(last) && last > 0
+                ? ` · dern. <b style="color:#aaa;">${last.toLocaleString('fr-FR')}</b>`
+                : '';
+
+            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);">
+                <div>
+                    <b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b>
+                    <span style="color:#c4b5fd;"> [${htmlEsc(r?.rarete || '?')}]</span>
+                </div>
+                <div style="color:#888;">
+                    méd. <b style="color:#d8b4fe;">${med.toLocaleString('fr-FR')}</b>
+                    · ${reliability}${lastHtml}
+                    · cap Hunter <b style="color:#4ade80;">${capHunter.toLocaleString('fr-FR')}</b>
+                </div>
+            </div>`;
+        }).join('');
+    }
+
+    window.wmMedian = async function (title, rarity = '', silent = false) {
+        const q = String(title || '').trim();
+        const wantedRarity = String(rarity || '').trim().toUpperCase();
+
+        if (!q) {
+            console.warn('Usage : await wmMedian("Jupiter") ou await wmMedian("Jupiter", "UR")');
+            return [];
+        }
+
+        const cards = await findCardsByTitleForMedian(q);
+        const filtered = wantedRarity
+            ? cards.filter(c => String(c.rarity || '').toUpperCase() === wantedRarity)
+            : cards;
+
+        if (filtered.length === 0) {
+            if (!silent) {
+                console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}"${wantedRarity ? ` [${wantedRarity}]` : ''}.`);
+            }
+            return [];
+        }
+
+        const results = [];
+        const dedup = new Set();
+
+        for (const c of filtered) {
+            const key = `${c.cardId}|${String(c.rarity || '').toUpperCase()}`;
+            if (dedup.has(key)) continue;
+            dedup.add(key);
+
+            let stats = null;
+            try {
+                stats = getLocalMarketStats(c.cardId, c.rarity);
+            } catch (e) { }
+
+            const count = Number(stats?.count || 0);
+            const med = Number(stats?.median || 0);
+
+            results.push({
+                carte: c.title,
+                rarete: c.rarity || '?',
+                mediane: count > 0 && Number.isFinite(med) ? med : null,
+                ventes: count,
+                derniere: Number.isFinite(Number(stats?.last)) ? Number(stats.last) : null,
+                min: Number.isFinite(Number(stats?.min)) ? Number(stats.min) : null,
+                max: Number.isFinite(Number(stats?.max)) ? Number(stats.max) : null,
+                fiable: count >= 3 ? 'oui' : 'non'
+            });
+        }
+
+        // Exact title only when possible, to avoid noise from partial matches.
+        const ql = q.toLocaleLowerCase('fr-FR');
+        const exact = results.filter(r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql);
+        const shown = exact.length ? exact : results.slice(0, 20);
+
+        if (!silent) console.table(shown);
+
+        const reliable = shown.filter(r => r.ventes >= 3 && Number.isFinite(Number(r.mediane)));
+        if (!silent && reliable.length === 1) {
+            const r = reliable[0];
+            wmLog(
+                `📊 Médiane à la volée : <b>${r.carte}</b> [${r.rarete}] → ` +
+                `<b>${Number(r.mediane).toLocaleString('fr-FR')} 💰</b> ` +
+                `<span style="color:#888;">(${r.ventes} ventes locales)</span>`
+            );
+        } else if (!silent && reliable.length > 1) {
+            wmLog(
+                `📊 Médiane à la volée : <b>${q}</b> → ` +
+                reliable.map(r => `[${r.rarete}] ${Number(r.mediane).toLocaleString('fr-FR')} 💰 (n=${r.ventes})`).join(' · ')
+            );
+        } else if (!silent) {
+            wmLog(
+                `📊 Médiane à la volée : <b>${q}</b> → données insuffisantes ` +
+                `<span style="color:#888;">(minimum conseillé : 3 ventes)</span>`
+            );
+        }
+
+        return shown;
+    };
+
+    // Alias court si tu veux aller très vite dans la console.
+    window.med = window.wmMedian;
 
     window.wmLocalHistoryInfo =
         function () {
