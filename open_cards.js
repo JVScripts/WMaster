@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.0';
+    const WM_VERSION = '2.4.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -586,6 +586,18 @@
         }
     } catch (e) { }
 
+
+    // v2.4.1 : remet immédiatement les anciens pending dans la file après installation.
+    try {
+        const k = 'wm_flip_v241_retry_reset_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (r?.status === 'pending_tag') r.nextTagRetryAt = 0;
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -1036,6 +1048,128 @@
         return null;
     }
 
+
+    // v2.4.1 — résolution profonde MUTUALISÉE des flips encore introuvables.
+    // Le Pack Opener peut créer >1500 exemplaires en peu de temps : limiter chaque recherche
+    // aux 30 premières pages "obtained_at" laisse alors sortir des achats pourtant récents.
+    // On fait ici UNE passe commune pour tous les pending, toutes les 2 min au maximum.
+    let flipDeepResolveLastAt = 0;
+    let flipDeepResolveRunning = false;
+    const FLIP_DEEP_RESOLVE_COOLDOWN_MS = 2 * 60 * 1000;
+    const FLIP_DEEP_RESOLVE_MAX_PAGES = 300; // jusqu'à 15 000 exemplaires récents, arrêt anticipé
+
+    async function deepResolvePendingFlipRecords(force = false) {
+        if (flipDeepResolveRunning) return 0;
+
+        const targets = flipLedger.filter(r =>
+            r && r.status === 'pending_tag' && !r.userCardId &&
+            Number(r.tagRetryCount || 0) >= 3
+        );
+        if (targets.length === 0) return 0;
+
+        const now = Date.now();
+        if (!force && now - flipDeepResolveLastAt < FLIP_DEEP_RESOLVE_COOLDOWN_MS) return 0;
+
+        flipDeepResolveRunning = true;
+        flipDeepResolveLastAt = now;
+
+        try {
+            const used = new Set(
+                flipLedger
+                    .filter(x => x && x.userCardId && x.status !== 'sold')
+                    .map(x => x.userCardId)
+            );
+
+            const unresolved = new Set(targets);
+            let resolved = 0;
+            let totalPages = null;
+            const BATCH = 5;
+
+            for (let start = 0;
+                start < FLIP_DEEP_RESOLVE_MAX_PAGES && unresolved.size > 0;
+                start += BATCH) {
+
+                const pages = [];
+                for (let p = start; p < start + BATCH && p < FLIP_DEEP_RESOLVE_MAX_PAGES; p++) {
+                    if (totalPages != null && p >= totalPages) break;
+                    pages.push(p);
+                }
+                if (pages.length === 0) break;
+
+                const batch = await Promise.all(
+                    pages.map(p => fetchFlipCollectionPage(p, 'obtained_at').catch(() => null))
+                );
+
+                let sawAny = false;
+                for (const data of batch) {
+                    if (!data) continue;
+                    const items = data.items || [];
+                    if (data.total != null && totalPages == null) {
+                        totalPages = Math.ceil(data.total / 50);
+                    }
+                    if (items.length > 0) sawAny = true;
+
+                    for (const it of items) {
+                        const m = flipCollectionItemMeta(it);
+                        if (!m?.userCardId || used.has(m.userCardId)) continue;
+
+                        for (const rec of [...unresolved]) {
+                            const wantedTitle = String(rec.title || '').trim();
+                            const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+
+                            const idMatch = !!rec.cardId && m.cardId === rec.cardId;
+                            const titleMatch = !!wantedTitle && wantedTitle !== '?' && m.title === wantedTitle;
+                            const rarityMatch = !wantedRarity || !m.rarity || m.rarity === wantedRarity;
+
+                            if (!idMatch && !(titleMatch && rarityMatch)) continue;
+
+                            rec.userCardId = m.userCardId;
+
+                            if (m.cardId && m.cardId !== rec.cardId) {
+                                rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                                rec.cardId = m.cardId;
+                            }
+                            if (m.rarity && m.rarity !== rec.rarity) {
+                                rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                                rec.rarity = m.rarity;
+                            }
+
+                            rec.lastError = 'exemplaire retrouvé par scan profond · tag à poser';
+                            rec.nextTagRetryAt = 0;
+
+                            used.add(m.userCardId);
+                            unresolved.delete(rec);
+                            resolved++;
+
+                            wmLog(
+                                `🔎 Flip Seller : scan profond → <b>${rec.title}</b> ` +
+                                `résolu (${String(m.userCardId).slice(0, 8)}…).`
+                            );
+                            break;
+                        }
+                    }
+                }
+
+                if (!sawAny) break;
+                if (totalPages != null && start + BATCH >= totalPages) break;
+                await new Promise(r => setTimeout(r, 80));
+            }
+
+            if (resolved > 0) saveFlipLedger();
+
+            if (unresolved.size > 0) {
+                console.info(
+                    `[WikiMasters][Flip] scan profond: ${resolved} résolu(s), ` +
+                    `${unresolved.size} encore introuvable(s).`
+                );
+            }
+
+            return resolved;
+        } finally {
+            flipDeepResolveRunning = false;
+        }
+    }
+
     function scheduleNextFlipTagRetry(rec) {
         const n = Math.max(1, Number(rec?.tagRetryCount) || 1);
         const delays = [10_000, 15_000, 30_000, 60_000, 120_000, 300_000];
@@ -1125,6 +1259,8 @@
     }
 
     async function retryPendingFlipTags() {
+        await deepResolvePendingFlipRecords(false).catch(() => 0);
+
         const now = Date.now();
         // v2.3.4 prenait toujours slice(0,10) sur un ledger trié par date : 10 vieux flips
         // bloqués pouvaient affamer tous les suivants. On prend désormais ceux qui ont été
@@ -1434,36 +1570,61 @@
 
     async function listFlipRecord(rec) {
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
-        if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') return { ok: false, reason: 'record_invalide' };
+        if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') {
+            return { ok: false, reason: 'record_invalide' };
+        }
+
         const tagged = await fetchFlipTaggedUserCardIds();
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
-        if (tagged && !tagged.has(rec.userCardId)) return { ok: false, reason: 'tag_absent' };
+        if (tagged && !tagged.has(rec.userCardId)) {
+            return { ok: false, reason: 'tag_absent' };
+        }
+
         const priceInfo = await resolveFlipSellPrice(rec);
         const duration = getFlipDurationMin();
-        try {
-            const res = await fetch(MARKET_API_BASE, {
-                method: 'POST', credentials: 'include',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    card_id: rec.cardId,
-                    user_card_id: rec.userCardId,
-                    base_amount: priceInfo.price,
-                    duration_minutes: duration
-                })
-            });
-            const data = await res.json().catch(() => ({}));
-            if (!res.ok) return { ok: false, reason: data?.error || `HTTP ${res.status}` };
-            rec.status = 'listed';
-            rec.saleAuctionId = data.auction_id || null;
-            rec.listPrice = priceInfo.price;
-            rec.listedAt = Date.now();
-            rec.lastError = null;
-            saveFlipLedger();
-            wmLog(`💸 Flip Seller : <b>${rec.title}</b> [${rec.rarity}] · acheté ${rec.buyPrice} → listé <b>${priceInfo.price} 💰</b> (${priceInfo.basis}, ${duration} min).`);
-            return { ok: true, auctionId: rec.saleAuctionId, priceInfo };
-        } catch (e) {
-            return { ok: false, reason: e.message || 'exception réseau' };
+
+        // v2.4.1 : même chemin fiable que le Trash Seller.
+        // Le POST direct /api/marketplace est déjà documenté plus bas comme rejeté par le site
+        // avec "Vous ne possédez pas cette carte", alors que les contrôles React natifs passent.
+        const ui = await sellCardViaUI(
+            rec.cardId,
+            rec.title,
+            rec.rarity,
+            priceInfo.price,
+            duration
+        );
+
+        if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
+
+        if (!ui?.ok) {
+            const reasonMap = {
+                wrong_page: 'reste sur /collection pour permettre la vente via l’interface',
+                card_not_found: 'carte introuvable dans la collection',
+                no_search_input: 'barre de recherche collection introuvable',
+                no_sell_button: 'bouton "Mettre aux enchères" introuvable',
+                no_launch_button: 'bouton "Lancer l’enchère" introuvable',
+                modal_still_open: 'mise en vente refusée par le site'
+            };
+            return { ok: false, reason: reasonMap[ui?.reason] || ui?.reason || 'échec UI' };
         }
+
+        rec.status = 'listed';
+        rec.saleAuctionId = ui.auctionId || null;
+        rec.listPrice = priceInfo.price;
+        rec.listedAt = Date.now();
+        rec.lastError = rec.saleAuctionId
+            ? null
+            : 'listé via UI · id enchère non capturé, suivi à confirmer';
+
+        saveFlipLedger();
+
+        wmLog(
+            `💸 Flip Seller : <b>${rec.title}</b> [${rec.rarity}] · ` +
+            `acheté ${rec.buyPrice} → listé <b>${priceInfo.price} 💰</b> ` +
+            `(${priceInfo.basis}, ${duration} min) via UI native.`
+        );
+
+        return { ok: true, auctionId: rec.saleAuctionId, priceInfo };
     }
 
     async function syncFlipSaleResults() {
@@ -1633,6 +1794,15 @@
     };
 
 
+    window.wmFlipDeepResolve = async function () {
+        const n = await deepResolvePendingFlipRecords(true);
+        await retryPendingFlipTags().catch(() => { });
+        await syncManualFlipTags().catch(() => { });
+        renderFlipHistory();
+        console.log(`[WikiMasters][Flip] résolution profonde forcée : ${n} exemplaire(s) retrouvé(s).`);
+        return n;
+    };
+
     window.wmFlipDiag = async function () {
         const tagId = await ensureFlipTagId(true);
         const rows = tagId ? await fetchFlipTaggedRows(true) : null;
@@ -1646,7 +1816,8 @@
                 ? new Date(flipTagValidatedAt).toLocaleString('fr-FR')
                 : null,
             lectureTagSansJointure: Array.isArray(rows),
-            resolutionFlipSource: 'my-collection → Supabase eq',
+            resolutionFlipSource: 'my-collection + scan profond + Supabase eq',
+            listingFlipSource: 'UI native collection',
             tagsVenteEnBase: Array.isArray(rows) ? rows.length : null,
             tagsVenteMappesCarte: Array.isArray(rows)
                 ? rows.filter(r => r?.user_cards?.card_id || r?._flipMeta?.cardId).length
@@ -8162,6 +8333,29 @@
         return [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text) || null;
     }
 
+    function findCollectionTileByTitleAndRarity(title, rarity) {
+        const leaves = [...document.querySelectorAll('*')]
+            .filter(el => el.children.length === 0 && el.textContent.trim() === title);
+
+        const tiles = [];
+        for (const leaf of leaves) {
+            let candidate = leaf;
+            while (candidate && !candidate.classList.contains('cursor-pointer')) {
+                candidate = candidate.parentElement;
+            }
+            if (candidate && !tiles.includes(candidate)) tiles.push(candidate);
+        }
+
+        if (tiles.length <= 1) return tiles[0] || null;
+
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (!rr) return tiles[0];
+
+        const escaped = rr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const token = new RegExp(`(^|[^A-Z])${escaped}([^A-Z]|$)`, 'i');
+        return tiles.find(t => token.test(String(t.textContent || '').toUpperCase())) || tiles[0];
+    }
+
     // Sondage périodique de l'API directe : le contournement DOM est lent et dépend d'une
     // barre de recherche peu fiable côté site — si wiki-masters corrige un jour le bug serveur
     // (cause jamais identifiée, cf. commentaire de sellCardViaUI), on veut repasser sur l'API
@@ -8220,11 +8414,7 @@
         let tile = null;
         for (let i = 0; i < 20 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
-            const titleEl = findLeafByExactText(title);
-            if (!titleEl) continue;
-            let candidate = titleEl;
-            while (candidate && !candidate.classList.contains('cursor-pointer')) candidate = candidate.parentElement;
-            if (candidate) tile = candidate;
+            tile = findCollectionTileByTitleAndRarity(title, rarity);
         }
         if (!tile) return { ok: false, reason: 'card_not_found' };
         tile.click();
@@ -8255,15 +8445,21 @@
         // (impossible de lire le message d'erreur exact depuis ce flux, contrairement au POST).
         if (document.body.contains(launchBtn)) return { ok: false, reason: 'modal_still_open' };
 
+        let createdAuctionId = _lastUiListingAuctionId;
+        if (!createdAuctionId) {
+            const m = location.pathname.match(/\/marketplace\/([0-9a-f-]{20,})/i);
+            if (m) createdAuctionId = m[1];
+        }
+
         // Revient sur /collection (sinon la carte suivante ne retrouverait plus la barre de
         // recherche). Pas bloquant si ça échoue : la prochaine sellCardViaUI() retentera via
         // ensureOnCollectionPage() avant de conclure à un vrai blocage.
         await ensureOnCollectionPage();
 
         const nextSearchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
-        if (nextSearchInput) setReactInputValue(nextSearchInput, ''); // nettoie pour la prochaine carte
+        if (nextSearchInput) setReactInputValue(nextSearchInput, '');
 
-        return { ok: true, auctionId: _lastUiListingAuctionId };
+        return { ok: true, auctionId: createdAuctionId || null };
     }
     /* ══════════ ANTI-BOUCLE TRASH SELLER ══════════ */
 
