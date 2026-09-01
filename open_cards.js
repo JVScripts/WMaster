@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.4';
+    const WM_VERSION = '2.4.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -554,6 +554,7 @@
         if (!Number.isFinite(Number(r.tagRetryCount))) r.tagRetryCount = 0;
         if (!Number.isFinite(Number(r.lastTagAttemptAt))) r.lastTagAttemptAt = 0;
         if (!Number.isFinite(Number(r.nextTagRetryAt))) r.nextTagRetryAt = 0;
+        if (typeof r.returningFromUnsold !== 'boolean') r.returningFromUnsold = false;
     });
 
     // v2.3.8 : le bug de relation PostgREST pouvait avoir envoyé les pending dans un long
@@ -586,6 +587,22 @@
         }
     } catch (e) { }
 
+
+    // v2.4.5 : anciennes entrées « invendue — retag en attente » deviennent explicitement
+    // des retours d'invendus et sont retentées immédiatement avec le nouveau chemin Trash-like.
+    try {
+        const k = 'wm_flip_v245_unsold_retag_migration';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (r?.status === 'pending_tag' && /invendue/i.test(String(r.lastError || ''))) {
+                    r.returningFromUnsold = true;
+                    r.nextTagRetryAt = 0;
+                    r.userCardId = null;
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
 
     // v2.4.1 : remet immédiatement les anciens pending dans la file après installation.
     try {
@@ -1205,7 +1222,9 @@
         if (!flipLedger.includes(rec)) return false;
         if (!rec.userCardId) {
             rec.status = 'pending_tag';
-            rec.lastError = `exemplaire gagné non résolu (tentative ${rec.tagRetryCount})`;
+            rec.lastError = rec.returningFromUnsold
+                ? `invendue · attente retour collection (tentative ${rec.tagRetryCount})`
+                : `exemplaire gagné non résolu (tentative ${rec.tagRetryCount})`;
             scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
@@ -1237,6 +1256,7 @@
         rec.tagAppliedAt = Date.now();
         rec.lastError = null;
         rec.nextTagRetryAt = 0;
+        rec.returningFromUnsold = false;
         saveFlipLedger();
         wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>vente</b> posé.`);
         return true;
@@ -1631,6 +1651,104 @@
         return { ok: true, auctionId: rec.saleAuctionId, priceInfo };
     }
 
+    // v2.4.5 — Remet le tag `vente` sur un flip revenu invendu dans la collection.
+    // Même principe que reapplyTrashTag() : upsert idempotent + retries réseau.
+    // IMPORTANT : après une mise en vente, l'ancien userCardId peut être périmé. L'appelant
+    // doit donc retrouver l'exemplaire ACTUEL via findCurrentUserCardId() avant de venir ici.
+    async function reapplyFlipSaleTag(userCardId, attempt = 1) {
+        if (!userCardId) return { ok: false, status: 0, error: 'user_card_id manquant' };
+
+        let tagId = await ensureFlipTagId();
+        if (!tagId) {
+            return { ok: false, status: 0, error: 'tag vente introuvable' };
+        }
+
+        const MAX_ATTEMPTS = 6;
+        let result = await addTagToUserCard(userCardId, tagId);
+        if (result?.ok) return result;
+
+        // Si le tag a été supprimé/recréé pendant l'enchère, force une redécouverte puis
+        // retente une fois avec le nouvel id avant de basculer sur le backoff externe.
+        const refreshed = await discoverFlipTagId(true).catch(() => null);
+        if (refreshed && refreshed !== tagId) {
+            tagId = refreshed;
+            result = await addTagToUserCard(userCardId, tagId);
+            if (result?.ok) return result;
+        }
+
+        if (attempt < MAX_ATTEMPTS && [0, 429, 500, 502, 503, 504].includes(Number(result?.status || 0))) {
+            const backoff = Math.min(1000 * Math.pow(2, attempt - 1), 8000);
+            wmLog(
+                `⚠️ Re-tag vente HTTP ${result?.status || 'réseau'}, ` +
+                `retry ${attempt}/${MAX_ATTEMPTS - 1} dans ${(backoff / 1000).toFixed(0)}s…`
+            );
+            await new Promise(r => setTimeout(r, backoff));
+            return reapplyFlipSaleTag(userCardId, attempt + 1);
+        }
+
+        return result || { ok: false, status: 0, error: 'échec inconnu' };
+    }
+
+    // Une enchère Flip vient de finir sans acheteur : on attend le retour réel dans la
+    // collection, on récupère le NOUVEL user_card_id puis on remet immédiatement `vente`.
+    async function restoreUnsoldFlipToSaleTag(rec) {
+        if (!rec || !flipLedger.includes(rec)) return false;
+
+        // L'ID d'avant la mise en vente n'est plus une référence fiable après le retour.
+        rec.status = 'pending_tag';
+        rec.userCardId = null;
+        rec.returningFromUnsold = true;
+        rec.lastError = 'invendue · attente retour collection';
+        rec.nextTagRetryAt = 0;
+        saveFlipLedger();
+
+        let targetId = null;
+
+        // Même méthode que le Trash Seller : source de vérité user_cards, avec ses retries.
+        if (rec.cardId) {
+            targetId = await findCurrentUserCardId(rec.cardId, rec.title).catch(() => null);
+        }
+
+        // Filet Flip plus riche si le card_id a changé entre-temps.
+        if (!targetId) {
+            targetId = await findWonUserCardIdForFlip(rec).catch(() => null);
+        }
+
+        if (!flipLedger.includes(rec)) return false;
+
+        if (!targetId) {
+            rec.lastError = 'invendue · carte pas encore revenue dans la collection';
+            rec.nextTagRetryAt = Date.now() + 10_000;
+            saveFlipLedger();
+            return false;
+        }
+
+        rec.userCardId = targetId;
+        const tagged = await reapplyFlipSaleTag(targetId);
+        if (!flipLedger.includes(rec)) return false;
+
+        if (!tagged?.ok) {
+            rec.status = 'pending_tag';
+            rec.lastError = `invendue · re-tag vente échoué · ${tagged?.error || `HTTP ${tagged?.status || '?'}`}`;
+            rec.nextTagRetryAt = Date.now() + 15_000;
+            saveFlipLedger();
+            return false;
+        }
+
+        rec.status = 'tagged';
+        rec.tagAppliedAt = Date.now();
+        rec.lastError = null;
+        rec.nextTagRetryAt = 0;
+        rec.returningFromUnsold = false;
+        saveFlipLedger();
+
+        wmLog(
+            `🏷️ Flip invendu revenu : tag <b>vente</b> remis sur <b>${rec.title}</b> ` +
+            `· prêt à relister${rec.relists ? ` · relist #${rec.relists}` : ''}.`
+        );
+        return true;
+    }
+
     async function syncFlipSaleResults() {
         const listed = flipLedger.filter(r => r && r.status === 'listed' && r.saleAuctionId);
         if (listed.length === 0) return;
@@ -1651,14 +1769,23 @@
                 wmLog(`💰 Flip vendu : <b>${rec.title}</b> · achat ${rec.buyPrice} → vente <b>${fp} 💰</b> · résultat <b style="color:${rec.profit >= 0 ? '#4ade80' : '#ef4444'};">${rec.profit >= 0 ? '+' : ''}${rec.profit} 💰</b>.`);
                 continue;
             }
-            // Enchère terminée sans acheteur : la carte revient, son ancien lien de tag peut
-            // avoir disparu avec la mise en vente. On la remet dans le circuit vente.
-            rec.status = 'pending_tag';
+            // Enchère terminée sans acheteur : WikiMasters retire le tag lors du listing.
+            // On oublie l'ancien auction/user_card_id, puis on retrouve l'exemplaire revenu et
+            // on remet immédiatement le tag `vente` — même logique que le Trash Seller.
             rec.saleAuctionId = null;
-            rec.userCardId = null;
             rec.relists = Number(rec.relists || 0) + 1;
-            rec.lastError = 'invendue — retag en attente';
             changed = true;
+
+            // Ne bloque pas toute la boucle si le retour collection prend quelques secondes.
+            // restoreUnsoldFlipToSaleTag() sauvegarde elle-même chaque état intermédiaire.
+            await restoreUnsoldFlipToSaleTag(rec).catch(e => {
+                rec.status = 'pending_tag';
+                rec.userCardId = null;
+                rec.returningFromUnsold = true;
+                rec.lastError = `invendue · exception re-tag · ${e?.message || e}`;
+                rec.nextTagRetryAt = Date.now() + 15_000;
+                saveFlipLedger();
+            });
         }
         if (changed) saveFlipLedger();
     }
@@ -1808,7 +1935,8 @@
             limiteServeur: Number.isFinite(serverMax) ? serverMax : null,
             limiteEffective: effective,
             slotsLibres: Math.max(0, effective - st.count),
-            flipsPrets: flipLedger.filter(r => r?.status === 'tagged' && r.userCardId).length
+            flipsPrets: flipLedger.filter(r => r?.status === 'tagged' && r.userCardId).length,
+            invendusEnAttenteRetag: flipLedger.filter(r => r?.status === 'pending_tag' && r.returningFromUnsold).length
         };
         console.table(result);
         return result;
