@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.9';
+    const WM_VERSION = '2.4.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -571,6 +571,21 @@
         }
     } catch (e) { }
 
+    // v2.4.0 : les anciens retries peuvent être en backoff à cause des HTTP 400 v2.3.x.
+    // On les rend éligibles immédiatement UNE fois après installation.
+    try {
+        const k = 'wm_flip_v240_retry_reset_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (r?.status === 'pending_tag') {
+                    r.nextTagRetryAt = 0;
+                    r.lastTagAttemptAt = 0;
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -846,112 +861,177 @@
     // Retrouve l'exemplaire gagné de façon robuste.
     // 1) user_cards exact (source de vérité), 2) si card_id devenu périmé : résolution par titre,
     // 3) fallback /my-collection. On ne choisit jamais aveuglément un vieux doublon.
+    // v2.4.0 — Source principale du Flip Seller : API collection du site.
+    // Elle expose déjà l'exemplaire (item.id), card_id, card, obtained_at et tags sans dépendre
+    // des relations PostgREST. Les lectures Supabase ne servent plus qu'en dernier recours.
+    async function fetchFlipCollectionPage(page, sort = 'obtained_at') {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+                const res = await fetch(
+                    `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50&sort=${encodeURIComponent(sort)}`,
+                    { credentials: 'include' }
+                );
+                if (!res.ok) {
+                    await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
+                    continue;
+                }
+                const data = await res.json();
+                return {
+                    items: Array.isArray(data?.collection) ? data.collection : [],
+                    total: Number.isFinite(Number(data?.total)) ? Number(data.total) : null
+                };
+            } catch (e) {
+                await new Promise(r => setTimeout(r, 350 * (attempt + 1)));
+            }
+        }
+        return null;
+    }
+
+    function flipCollectionItemMeta(it) {
+        if (!it) return null;
+        const card = it.card || {};
+        return {
+            userCardId: it.id || it.user_card_id || null,
+            cardId: it.card_id || card.id || null,
+            title: card.wikipedia_title || it.wikipedia_title || it.title || '',
+            rarity: String(it.snapshot_rarity || card.rarity || it.rarity || '').toUpperCase(),
+            obtainedTs: itemObtainedTs(it),
+            tags: Array.isArray(it.tags) ? it.tags : [],
+            raw: it
+        };
+    }
+
+    function itemHasFlipTag(meta) {
+        const wanted = FLIP_TAG_NAME.toLocaleLowerCase('fr-FR');
+        return !!meta && meta.tags.some(t =>
+            String(t?.name || '').trim().toLocaleLowerCase('fr-FR') === wanted
+        );
+    }
+
     async function findWonUserCardIdForFlip(rec) {
         if (!rec || (!rec.cardId && !rec.title)) return null;
+
+        const used = new Set(
+            flipLedger
+                .filter(x => x && x !== rec && x.userCardId && x.status !== 'sold')
+                .map(x => x.userCardId)
+        );
+        const wantedTitle = String(rec.title || '').trim();
+        const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+        const targetTs = Number(rec.boughtAt) || Date.now();
+
+        // 1) API /my-collection triée par acquisition récente.
+        // 30 pages = 1 500 derniers exemplaires, mais on s'arrête dès qu'on a un bon match.
+        // Pour un auto-achat, la carte gagnée doit normalement être très proche du début.
+        let best = null;
+        let bestScore = -Infinity;
+        const MAX_RECENT_PAGES = 30;
+        for (let page = 0; page < MAX_RECENT_PAGES; page++) {
+            const data = await fetchFlipCollectionPage(page, 'obtained_at');
+            if (!data) break;
+            const items = data.items || [];
+            if (items.length === 0) break;
+
+            for (const it of items) {
+                const m = flipCollectionItemMeta(it);
+                if (!m?.userCardId || used.has(m.userCardId)) continue;
+
+                const idMatch = !!rec.cardId && m.cardId === rec.cardId;
+                const titleMatch = !!wantedTitle && wantedTitle !== '?' && m.title === wantedTitle;
+                if (!idMatch && !titleMatch) continue;
+
+                const rarityMatch = !wantedRarity || !m.rarity || m.rarity === wantedRarity;
+                const tagged = itemHasFlipTag(m);
+                const delta = Number.isFinite(m.obtainedTs)
+                    ? Math.abs(m.obtainedTs - targetTs)
+                    : Number.MAX_SAFE_INTEGER;
+
+                let score = 0;
+                if (idMatch) score += 1000;
+                if (titleMatch) score += 500;
+                if (rarityMatch) score += 150;
+                if (tagged) score += 2000; // tag manuel = preuve explicite
+                if (Number.isFinite(delta)) score += Math.max(0, 120 - Math.floor(delta / 3600000));
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = m;
+                }
+            }
+
+            // Un match exact déjà tagué est définitif. Sinon, comme obtained_at est décroissant,
+            // un match exact trouvé dans les toutes premières pages est largement suffisant.
+            if (best && itemHasFlipTag(best)) break;
+            if (best && page >= 2 && best.cardId === rec.cardId) break;
+            if (items.length < 50) break;
+        }
+
+        if (best?.userCardId) {
+            if (best.cardId && best.cardId !== rec.cardId) {
+                rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                const old = rec.cardId;
+                rec.cardId = best.cardId;
+                if (best.rarity && best.rarity !== rec.rarity) {
+                    rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                    rec.rarity = best.rarity;
+                }
+                wmLog(`🔄 Flip Seller : card_id actualisé pour <b>${rec.title}</b>${old ? ` (${String(old).slice(0, 8)}… → ${String(best.cardId).slice(0, 8)}…)` : ''}.`);
+            }
+            wmLog(`🔎 Flip Seller : exemplaire résolu via collection → <b>${rec.title}</b> · ${String(best.userCardId).slice(0, 8)}…`);
+            return best.userCardId;
+        }
+
+        // 2) Fallback Supabase SANS opérateur in() et SANS relation imbriquée.
+        // Une seule valeur card_id par requête évite le HTTP 400 observé sur in.(uuid,...).
         const uid = currentUserId();
-        if (!uid) return null;
-        const tagId = await ensureFlipTagId().catch(() => null);
-
-        async function ownedRowsForIds(ids) {
-            const clean = [...new Set((ids || []).filter(Boolean))];
-            if (clean.length === 0) return [];
-
-            // IMPORTANT v2.3.8 : pas d'embed `user_card_tags(tag_id)`.
-            // Les relations PostgREST ne sont pas toutes exposées sur WikiMasters.
-            const rows = await supabaseSelect(
-                `user_cards?user_id=eq.${uid}&card_id=in.(${clean.join(',')})&select=id,card_id,created_at&limit=250`
-            );
-            if (!Array.isArray(rows)) return [];
-            return await enrichFlipUserCardsWithTags(rows);
-        }
-
-        // 1) ID connu au moment de l'achat.
-        if (rec.cardId) {
+        if (uid && rec.cardId) {
             try {
-                const rows = await ownedRowsForIds([rec.cardId]);
-                const hit = chooseOwnedFlipCandidate(rows, rec, tagId);
-                if (hit?.id) return hit.id;
-            } catch (e) { }
-        }
-
-        // 2) Le catalogue WikiMasters peut remplacer un card_id. On retrouve alors les ids
-        // actuels par titre, en préférant la rareté d'achat mais sans l'imposer.
-        if (rec.title && rec.title !== '?') {
-            try {
-                const cardRows = await supabaseSelect(
-                    `cards?wikipedia_title=eq.${encodeURIComponent(rec.title)}&select=id,wikipedia_title,rarity&limit=30`
+                const rows = await supabaseSelect(
+                    `user_cards?user_id=eq.${uid}&card_id=eq.${rec.cardId}&select=id,card_id,created_at&limit=20`
                 );
-                if (Array.isArray(cardRows) && cardRows.length > 0) {
-                    const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
-                    const ordered = [...cardRows].sort((a, b) => {
-                        const ar = String(a?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
-                        const br = String(b?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
-                        return ar - br;
-                    });
-                    const meta = new Map(ordered.filter(c => c?.id).map(c => [c.id, c]));
-                    const rows = await ownedRowsForIds(ordered.map(c => c?.id));
-                    const hit = chooseOwnedFlipCandidate(rows, rec, tagId, meta);
-                    if (hit?.id) {
-                        if (hit.card_id && hit.card_id !== rec.cardId) {
-                            rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
-                            const old = rec.cardId;
-                            rec.cardId = hit.card_id;
-                            const currentRarity = hit._rarity || String(meta.get(hit.card_id)?.rarity || '').toUpperCase();
-                            if (currentRarity && currentRarity !== rec.rarity) {
-                                rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                                rec.rarity = currentRarity;
-                            }
-                            wmLog(`🔄 Flip Seller : card_id actualisé pour <b>${rec.title}</b>${old ? ` (${String(old).slice(0, 8)}… → ${String(hit.card_id).slice(0, 8)}…)` : ''}.`);
-                        }
-                        return hit.id;
+                if (Array.isArray(rows)) {
+                    const free = rows.find(r => r?.id && !used.has(r.id));
+                    if (free?.id) {
+                        wmLog(`🔎 Flip Seller : exemplaire résolu via Supabase eq → <b>${rec.title}</b> · ${String(free.id).slice(0, 8)}…`);
+                        return free.id;
                     }
                 }
             } catch (e) { }
         }
 
-        // 3) Fallback API collection. On accepte card_id OU titre, mais toujours avec une preuve
-        // temporelle proche de l'achat (ou un tag vente déjà présent).
-        try {
-            const targetTs = Number(rec.boughtAt) || Date.now();
-            const used = new Set(
-                flipLedger.filter(x => x && x !== rec && x.userCardId && x.status !== 'sold').map(x => x.userCardId)
-            );
-            const candidates = [];
-            for (let page = 0; page < 8; page++) {
-                const res = await fetch(
-                    `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50&sort=obtained_at`,
-                    { credentials: 'include' }
+        // 3) Si le card_id a changé, résoudre le catalogue par titre puis tester les ids UN PAR UN.
+        if (uid && wantedTitle && wantedTitle !== '?') {
+            try {
+                const cardRows = await supabaseSelect(
+                    `cards?wikipedia_title=eq.${encodeURIComponent(wantedTitle)}&select=id,wikipedia_title,rarity&limit=20`
                 );
-                if (!res.ok) break;
-                const data = await res.json();
-                const items = data.collection || [];
-                for (const it of items) {
-                    const idMatch = rec.cardId && (it.card_id || it.card?.id) === rec.cardId;
-                    const title = it.card?.wikipedia_title || it.wikipedia_title || it.title || '';
-                    const titleMatch = rec.title && rec.title !== '?' && title === rec.title;
-                    if (!idMatch && !titleMatch) continue;
-                    const ts = itemObtainedTs(it);
-                    const tagged = (it.tags || []).some(t =>
-                        String(t?.name || '').trim().toLocaleLowerCase('fr-FR')
-                        === FLIP_TAG_NAME.toLocaleLowerCase('fr-FR')
-                    );
-                    const delta = Number.isFinite(ts) ? Math.abs(ts - targetTs) : Number.MAX_SAFE_INTEGER;
-                    if (!tagged && (!Number.isFinite(ts) || delta > FLIP_ACQUISITION_MATCH_MS)) continue;
-                    if (it.id && !used.has(it.id)) candidates.push({ it, delta, tagged });
+                if (Array.isArray(cardRows)) {
+                    const ordered = [...cardRows].sort((a, b) => {
+                        const ar = String(a?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
+                        const br = String(b?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
+                        return ar - br;
+                    });
+                    for (const card of ordered.slice(0, 8)) {
+                        if (!card?.id) continue;
+                        const rows = await supabaseSelect(
+                            `user_cards?user_id=eq.${uid}&card_id=eq.${card.id}&select=id,card_id,created_at&limit=20`
+                        );
+                        if (!Array.isArray(rows)) continue;
+                        const free = rows.find(r => r?.id && !used.has(r.id));
+                        if (!free?.id) continue;
+                        rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                        rec.cardId = card.id;
+                        const rr = String(card.rarity || '').toUpperCase();
+                        if (rr) {
+                            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                            rec.rarity = rr;
+                        }
+                        wmLog(`🔎 Flip Seller : exemplaire résolu par titre → <b>${rec.title}</b> · ${String(free.id).slice(0, 8)}…`);
+                        return free.id;
+                    }
                 }
-                if (candidates.length > 0 || items.length < 50) break;
-            }
-            candidates.sort((a, b) => (Number(b.tagged) - Number(a.tagged)) || (a.delta - b.delta));
-            const hit = candidates[0]?.it;
-            if (hit?.id) {
-                const newCardId = hit.card_id || hit.card?.id || null;
-                if (newCardId && newCardId !== rec.cardId) {
-                    rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
-                    rec.cardId = newCardId;
-                }
-                return hit.id;
-            }
-        } catch (e) { }
+            } catch (e) { }
+        }
 
         return null;
     }
@@ -1063,48 +1143,84 @@
         let tagId = await ensureFlipTagId(forceRediscover);
         if (!tagId) return null;
 
-        async function readForTag(id) {
-            // Étape 1 : les liaisons du tag. Cette requête simple est déjà utilisée ailleurs
-            // dans le script et ne dépend d'aucune relation PostgREST.
-            const links = await supabaseSelect(
+        async function readLinks(id) {
+            return await supabaseSelect(
                 `user_card_tags?tag_id=eq.${id}&select=user_card_id&limit=2000`
             );
-            if (!Array.isArray(links)) return null;
-
-            const ids = [...new Set(links.map(r => r?.user_card_id).filter(Boolean))];
-            if (ids.length === 0) return [];
-
-            // Étape 2 : métadonnées des user_cards par leur ID, en petits lots pour ne pas
-            // produire une URL gigantesque. Même si un lot échoue, on conserve les liens :
-            // un userCardId exact reste exploitable.
-            const cardById = new Map();
-            const CHUNK = 100;
-            for (let i = 0; i < ids.length; i += CHUNK) {
-                const chunk = ids.slice(i, i + CHUNK);
-                const cards = await supabaseSelect(
-                    `user_cards?id=in.(${chunk.join(',')})&select=id,card_id,created_at&limit=${chunk.length}`
-                );
-                if (!Array.isArray(cards)) continue;
-                for (const uc of cards) if (uc?.id) cardById.set(uc.id, uc);
-            }
-
-            return ids.map(userCardId => ({
-                user_card_id: userCardId,
-                user_cards: cardById.get(userCardId) || null
-            }));
         }
 
-        let rows = await readForTag(tagId);
+        let links = await readLinks(tagId);
+        if (!Array.isArray(links)) return null;
 
-        // Tag supprimé/recréé ou cache périmé : redécouverte puis un seul nouvel essai.
-        if (Array.isArray(rows) && rows.length === 0 && !forceRediscover
+        // Tag supprimé/recréé : si rien ne remonte alors que des flips attendent, redécouverte.
+        if (links.length === 0 && !forceRediscover
             && flipLedger.some(r => r && r.status === 'pending_tag')) {
             const oldId = tagId;
             tagId = await discoverFlipTagId(true);
-            if (tagId && tagId !== oldId) rows = await readForTag(tagId);
+            if (tagId && tagId !== oldId) {
+                links = await readLinks(tagId);
+                if (!Array.isArray(links)) return null;
+            }
         }
 
-        return Array.isArray(rows) ? rows : null;
+        const ids = [...new Set(links.map(r => r?.user_card_id).filter(Boolean))];
+        if (ids.length === 0) return [];
+
+        const wanted = new Set(ids);
+        const metaById = new Map();
+
+        // Source n°1 : /api/my-collection. On cherche les user_card_id porteurs du tag dans
+        // l'ordre des acquisitions. Pas de `user_cards?id=in.(...)` : c'était le HTTP 400 v2.3.9.
+        const MAX_PAGES = 40; // 2 000 exemplaires récents ; arrêt anticipé dès que tous sont trouvés
+        for (let page = 0; page < MAX_PAGES && metaById.size < wanted.size; page++) {
+            const data = await fetchFlipCollectionPage(page, 'obtained_at');
+            if (!data) break;
+            const items = data.items || [];
+            if (items.length === 0) break;
+            for (const it of items) {
+                const m = flipCollectionItemMeta(it);
+                if (m?.userCardId && wanted.has(m.userCardId)) metaById.set(m.userCardId, m);
+            }
+            if (items.length < 50) break;
+        }
+
+        // Source n°2 : pour les rares ids non trouvés dans les pages récentes, requête EXACTE
+        // id=eq.UUID une par une. Aucun opérateur in() n'est utilisé dans ce circuit.
+        for (const userCardId of ids) {
+            if (metaById.has(userCardId)) continue;
+            try {
+                const rows = await supabaseSelect(
+                    `user_cards?id=eq.${userCardId}&select=id,card_id,created_at&limit=1`
+                );
+                const uc = Array.isArray(rows) ? rows[0] : null;
+                if (uc?.id) {
+                    metaById.set(userCardId, {
+                        userCardId: uc.id,
+                        cardId: uc.card_id || null,
+                        title: '',
+                        rarity: '',
+                        obtainedTs: uc.created_at ? new Date(uc.created_at).getTime() : NaN,
+                        tags: [],
+                        raw: uc
+                    });
+                }
+            } catch (e) { }
+        }
+
+        return ids.map(userCardId => {
+            const m = metaById.get(userCardId) || null;
+            return {
+                user_card_id: userCardId,
+                user_cards: m ? {
+                    id: m.userCardId,
+                    card_id: m.cardId,
+                    created_at: Number.isFinite(m.obtainedTs)
+                        ? new Date(m.obtainedTs).toISOString()
+                        : null
+                } : null,
+                _flipMeta: m
+            };
+        });
     }
 
     async function fetchFlipTaggedUserCardIds() {
@@ -1122,10 +1238,15 @@
 
         const tagged = rows.map(row => {
             const uc = row?.user_cards || {};
+            const meta = row?._flipMeta || {};
             return {
-                userCardId: row?.user_card_id || uc?.id || null,
-                cardId: uc?.card_id || null,
-                createdAt: uc?.created_at ? new Date(uc.created_at).getTime() : NaN
+                userCardId: row?.user_card_id || uc?.id || meta?.userCardId || null,
+                cardId: uc?.card_id || meta?.cardId || null,
+                title: meta?.title || '',
+                rarity: String(meta?.rarity || '').toUpperCase(),
+                createdAt: uc?.created_at
+                    ? new Date(uc.created_at).getTime()
+                    : (Number.isFinite(meta?.obtainedTs) ? meta.obtainedTs : NaN)
             };
         }).filter(x => x.userCardId);
 
@@ -1145,10 +1266,20 @@
                 : null;
 
             // Sinon on rattache un tag vente manuel de la même carte au flip en attente.
-            if (!hit && rec.cardId) {
+            // card_id d'abord ; si le catalogue a changé, le titre/rareté de /my-collection sert de secours.
+            if (!hit) {
                 const target = Number(rec.boughtAt) || Date.now();
+                const wantedTitle = String(rec.title || '');
+                const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
                 const pool = tagged
-                    .filter(x => x.cardId === rec.cardId && (!activeUsed.has(x.userCardId) || x.userCardId === rec.userCardId))
+                    .filter(x => {
+                        if (activeUsed.has(x.userCardId) && x.userCardId !== rec.userCardId) return false;
+                        if (rec.cardId && x.cardId === rec.cardId) return true;
+                        if (wantedTitle && wantedTitle !== '?' && x.title === wantedTitle) {
+                            return !wantedRarity || !x.rarity || x.rarity === wantedRarity;
+                        }
+                        return false;
+                    })
                     .sort((a, b) => {
                         const da = Number.isFinite(a.createdAt) ? Math.abs(a.createdAt - target) : Number.MAX_SAFE_INTEGER;
                         const db = Number.isFinite(b.createdAt) ? Math.abs(b.createdAt - target) : Number.MAX_SAFE_INTEGER;
@@ -1515,7 +1646,11 @@
                 ? new Date(flipTagValidatedAt).toLocaleString('fr-FR')
                 : null,
             lectureTagSansJointure: Array.isArray(rows),
+            resolutionFlipSource: 'my-collection → Supabase eq',
             tagsVenteEnBase: Array.isArray(rows) ? rows.length : null,
+            tagsVenteMappesCarte: Array.isArray(rows)
+                ? rows.filter(r => r?.user_cards?.card_id || r?._flipMeta?.cardId).length
+                : null,
             pendingTag: flipLedger.filter(r => r?.status === 'pending_tag').length,
             prets: flipLedger.filter(r => r?.status === 'tagged').length,
             enVente: flipLedger.filter(r => r?.status === 'listed').length,
