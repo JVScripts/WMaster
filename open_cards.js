@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.6';
+    const WM_VERSION = '2.4.8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -637,6 +637,47 @@
         }
     } catch (e) { }
 
+    // v2.4.7 : les anciennes versions pouvaient stocker `item.id` de /my-collection
+    // comme user_card_id sans validation. On force UNE revalidation/résolution de toutes
+    // les lignes actives pour éliminer ces IDs avant le prochain tag/re-tag.
+    try {
+        const k = 'wm_flip_v247_owned_id_reset_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (!r || ['sold', 'listed'].includes(r.status)) return;
+                r.userCardId = null;
+                if (r.status === 'tagged') r.status = 'pending_tag';
+                r.nextTagRetryAt = 0;
+                r.lastTagAttemptAt = 0;
+                r.lastError = 'migration v2.4.7 · revalidation propriétaire';
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
+    // v2.4.8 : anciennes lignes passées à tort en pending pendant qu'elles étaient
+    // hors collection (vente active/règlement) → réconciliation immédiate au démarrage.
+    try {
+        const k = 'wm_flip_v248_state_reconcile_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (!r || r.status !== 'pending_tag') return;
+                const err = String(r.lastError || '').toLowerCase();
+                if (
+                    err.includes('row-level security') ||
+                    err.includes('rls') ||
+                    err.includes('non possédé') ||
+                    err.includes('tag vente absent') ||
+                    err.includes('migration v2.4.7')
+                ) {
+                    r.nextTagRetryAt = 0;
+                    r.lastTagAttemptAt = 0;
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -959,6 +1000,107 @@
         );
     }
 
+
+    // v2.4.7 — source de vérité absolue pour un exemplaire Flip :
+    // la ligne doit exister dans user_cards ET appartenir au user_id courant.
+    // On ne fait plus confiance à `item.id` de /api/my-collection sans validation :
+    // un mauvais id provoquait ensuite la RLS "new row violates row-level security".
+    async function verifyOwnedFlipUserCardId(userCardId) {
+        if (!userCardId) return null;
+        const uid = currentUserId();
+        if (!uid) return null;
+
+        const rows = await supabaseSelect(
+            `user_cards?id=eq.${userCardId}&user_id=eq.${uid}&select=id,card_id,created_at&limit=1`
+        );
+        return Array.isArray(rows) && rows[0]?.id ? rows[0] : null;
+    }
+
+    async function ownedFlipRowsForCardId(cardId) {
+        if (!cardId) return [];
+        const uid = currentUserId();
+        if (!uid) return [];
+
+        const rows = await supabaseSelect(
+            `user_cards?user_id=eq.${uid}&card_id=eq.${cardId}&select=id,card_id,created_at&limit=100`
+        );
+        return Array.isArray(rows) ? rows.filter(r => r?.id) : [];
+    }
+
+    async function resolveAuthoritativeFlipUserCardId(rec, candidateId = null) {
+        if (!rec) return null;
+
+        const used = new Set(
+            flipLedger
+                .filter(x => x && x !== rec && x.userCardId && x.status !== 'sold')
+                .map(x => x.userCardId)
+        );
+
+        // 1) Candidat déjà trouvé par l'API collection : on ne l'accepte que s'il appartient
+        // réellement au compte dans user_cards.
+        if (candidateId) {
+            const owned = await verifyOwnedFlipUserCardId(candidateId).catch(() => null);
+            if (owned?.id && !used.has(owned.id)) {
+                if (owned.card_id && owned.card_id !== rec.cardId) {
+                    rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                    rec.cardId = owned.card_id;
+                }
+                return owned.id;
+            }
+        }
+
+        // 2) card_id connu : récupère directement MES exemplaires.
+        if (rec.cardId) {
+            const rows = await ownedFlipRowsForCardId(rec.cardId).catch(() => []);
+            const free = rows
+                .filter(r => !used.has(r.id))
+                .sort((a, b) => {
+                    const ta = new Date(a.created_at || 0).getTime();
+                    const tb = new Date(b.created_at || 0).getTime();
+                    return tb - ta; // récent d'abord, sans que la date soit une condition bloquante
+                })[0];
+            if (free?.id) return free.id;
+        }
+
+        // 3) Le card_id a peut-être changé : résout le catalogue par titre + rareté,
+        // puis cherche MES user_cards sur ces nouveaux IDs.
+        const title = String(rec.title || '').trim();
+        const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+
+        if (title && title !== '?') {
+            const cards = await supabaseSelect(
+                `cards?wikipedia_title=eq.${encodeURIComponent(title)}&select=id,wikipedia_title,rarity&limit=30`
+            ).catch(() => null);
+
+            if (Array.isArray(cards)) {
+                const ordered = [...cards].sort((a, b) => {
+                    const ar = String(a?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
+                    const br = String(b?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
+                    return ar - br;
+                });
+
+                for (const card of ordered) {
+                    if (!card?.id) continue;
+                    const rows = await ownedFlipRowsForCardId(card.id).catch(() => []);
+                    const free = rows.find(r => !used.has(r.id));
+                    if (!free?.id) continue;
+
+                    rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                    rec.cardId = card.id;
+
+                    const rr = String(card.rarity || '').toUpperCase();
+                    if (rr && rr !== rec.rarity) {
+                        rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                        rec.rarity = rr;
+                    }
+                    return free.id;
+                }
+            }
+        }
+
+        return null;
+    }
+
     async function findWonUserCardIdForFlip(rec) {
         if (!rec || (!rec.cardId && !rec.title)) return null;
 
@@ -1028,60 +1170,33 @@
                 }
                 wmLog(`🔄 Flip Seller : card_id actualisé pour <b>${rec.title}</b>${old ? ` (${String(old).slice(0, 8)}… → ${String(best.cardId).slice(0, 8)}…)` : ''}.`);
             }
-            wmLog(`🔎 Flip Seller : exemplaire résolu via collection → <b>${rec.title}</b> · ${String(best.userCardId).slice(0, 8)}…`);
-            return best.userCardId;
+
+            const authoritative = await resolveAuthoritativeFlipUserCardId(rec, best.userCardId);
+            if (authoritative) {
+                if (authoritative !== best.userCardId) {
+                    wmLog(
+                        `🧭 Flip Seller : id collection corrigé → <b>${rec.title}</b> · ` +
+                        `${String(best.userCardId).slice(0, 8)}… → ${String(authoritative).slice(0, 8)}…`
+                    );
+                }
+                wmLog(`🔎 Flip Seller : exemplaire vérifié propriétaire → <b>${rec.title}</b> · ${String(authoritative).slice(0, 8)}…`);
+                return authoritative;
+            }
+
+            wmLog(
+                `⚠️ Flip Seller : l'id collection ${String(best.userCardId).slice(0, 8)}… ` +
+                `pour <b>${rec.title}</b> n'est pas une ligne user_cards possédée → ignoré.`
+            );
         }
 
-        // 2) Fallback Supabase SANS opérateur in() et SANS relation imbriquée.
-        // Une seule valeur card_id par requête évite le HTTP 400 observé sur in.(uuid,...).
-        const uid = currentUserId();
-        if (uid && rec.cardId) {
-            try {
-                const rows = await supabaseSelect(
-                    `user_cards?user_id=eq.${uid}&card_id=eq.${rec.cardId}&select=id,card_id,created_at&limit=20`
-                );
-                if (Array.isArray(rows)) {
-                    const free = rows.find(r => r?.id && !used.has(r.id));
-                    if (free?.id) {
-                        wmLog(`🔎 Flip Seller : exemplaire résolu via Supabase eq → <b>${rec.title}</b> · ${String(free.id).slice(0, 8)}…`);
-                        return free.id;
-                    }
-                }
-            } catch (e) { }
-        }
-
-        // 3) Si le card_id a changé, résoudre le catalogue par titre puis tester les ids UN PAR UN.
-        if (uid && wantedTitle && wantedTitle !== '?') {
-            try {
-                const cardRows = await supabaseSelect(
-                    `cards?wikipedia_title=eq.${encodeURIComponent(wantedTitle)}&select=id,wikipedia_title,rarity&limit=20`
-                );
-                if (Array.isArray(cardRows)) {
-                    const ordered = [...cardRows].sort((a, b) => {
-                        const ar = String(a?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
-                        const br = String(b?.rarity || '').toUpperCase() === wantedRarity ? 0 : 1;
-                        return ar - br;
-                    });
-                    for (const card of ordered.slice(0, 8)) {
-                        if (!card?.id) continue;
-                        const rows = await supabaseSelect(
-                            `user_cards?user_id=eq.${uid}&card_id=eq.${card.id}&select=id,card_id,created_at&limit=20`
-                        );
-                        if (!Array.isArray(rows)) continue;
-                        const free = rows.find(r => r?.id && !used.has(r.id));
-                        if (!free?.id) continue;
-                        rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
-                        rec.cardId = card.id;
-                        const rr = String(card.rarity || '').toUpperCase();
-                        if (rr) {
-                            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                            rec.rarity = rr;
-                        }
-                        wmLog(`🔎 Flip Seller : exemplaire résolu par titre → <b>${rec.title}</b> · ${String(free.id).slice(0, 8)}…`);
-                        return free.id;
-                    }
-                }
-            } catch (e) { }
+        // 2) Fallback autoritaire : user_cards de CE compte par card_id puis titre/rareté.
+        const authoritative = await resolveAuthoritativeFlipUserCardId(rec, null);
+        if (authoritative) {
+            wmLog(
+                `🔎 Flip Seller : exemplaire résolu via user_cards propriétaire → ` +
+                `<b>${rec.title}</b> · ${String(authoritative).slice(0, 8)}…`
+            );
+            return authoritative;
         }
 
         return null;
@@ -1162,8 +1277,6 @@
 
                             if (!idMatch && !(titleMatch && rarityMatch)) continue;
 
-                            rec.userCardId = m.userCardId;
-
                             if (m.cardId && m.cardId !== rec.cardId) {
                                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                                 rec.cardId = m.cardId;
@@ -1173,16 +1286,21 @@
                                 rec.rarity = m.rarity;
                             }
 
-                            rec.lastError = 'exemplaire retrouvé par scan profond · tag à poser';
+                            const authoritativeId =
+                                await resolveAuthoritativeFlipUserCardId(rec, m.userCardId).catch(() => null);
+                            if (!authoritativeId) continue;
+
+                            rec.userCardId = authoritativeId;
+                            rec.lastError = 'exemplaire propriétaire retrouvé · tag à poser';
                             rec.nextTagRetryAt = 0;
 
-                            used.add(m.userCardId);
+                            used.add(authoritativeId);
                             unresolved.delete(rec);
                             resolved++;
 
                             wmLog(
                                 `🔎 Flip Seller : scan profond → <b>${rec.title}</b> ` +
-                                `résolu (${String(m.userCardId).slice(0, 8)}…).`
+                                `résolu/validé (${String(authoritativeId).slice(0, 8)}…).`
                             );
                             break;
                         }
@@ -1257,13 +1375,49 @@
 
         if (!flipLedger.includes(rec)) return false;
         if (!rec.userCardId) {
+            const external = await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
+
+            // Si une vente active/vendue/ambiguë a été retrouvée, le cycle a été corrigé :
+            // surtout ne pas poursuivre vers un INSERT de tag.
+            if (external?.handled) return false;
+
+            // provenUnsold=true signifie seulement que l'enchère exacte est finie sans acheteur.
+            // La carte doit ENCORE réapparaître dans user_cards avant de pouvoir être taguée.
             rec.status = 'pending_tag';
-            rec.lastError = rec.returningFromUnsold
+            rec.lastError = rec.returningFromUnsold || external?.provenUnsold
                 ? `invendue · attente retour collection (tentative ${rec.tagRetryCount})`
                 : `exemplaire gagné non résolu (tentative ${rec.tagRetryCount})`;
             scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
+        }
+
+        // Dernière barrière v2.4.7 : jamais d'INSERT user_card_tags sur un id non vérifié.
+        const verifiedUserCardId =
+            await resolveAuthoritativeFlipUserCardId(rec, rec.userCardId).catch(() => null);
+
+        if (!verifiedUserCardId) {
+            rec.userCardId = null;
+
+            // Elle a pu quitter la collection entre la résolution et ce check parce qu'elle
+            // est déjà en vente / vendue. Vérifie l'état avant de la remettre en pending tag.
+            const external = await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
+            if (external?.handled) return false;
+
+            rec.status = 'pending_tag';
+            rec.lastError = 'exemplaire trouvé puis absent de user_cards · attente réconciliation';
+            rec.nextTagRetryAt = Date.now() + 10_000;
+            saveFlipLedger();
+            return false;
+        }
+
+        if (verifiedUserCardId !== rec.userCardId) {
+            wmLog(
+                `🧭 Flip Seller : user_card_id corrigé avant tag → <b>${rec.title}</b> · ` +
+                `${String(rec.userCardId).slice(0, 8)}… → ${String(verifiedUserCardId).slice(0, 8)}…`
+            );
+            rec.userCardId = verifiedUserCardId;
+            saveFlipLedger();
         }
 
         let r = await addTagToUserCard(rec.userCardId, tagId);
@@ -1280,10 +1434,29 @@
         if (!r?.ok) {
             rec.status = 'pending_tag';
             rec.lastError = r?.error || `HTTP ${r?.status || '?'}`;
-            // Un user_card_id périmé peut arriver après une vente/retour ou un changement catalogue.
-            // On le libère pour forcer une nouvelle résolution à la prochaine tentative.
-            if ([404, 409].includes(Number(r?.status))) rec.userCardId = null;
-            scheduleNextFlipTagRetry(rec);
+
+            const errText = String(r?.error || '').toLowerCase();
+            const ownershipFailure =
+                errText.includes('row-level security') ||
+                errText.includes('non possédé') ||
+                [401, 403, 404, 409].includes(Number(r?.status));
+
+            // Une RLS ici signifie que l'id choisi n'est pas autorisé pour ce compte :
+            // surtout ne pas le réutiliser 30 fois.
+            if (ownershipFailure) {
+                rec.userCardId = null;
+
+                // v2.4.8 : RLS peut simplement signifier que la carte n'est PLUS à nous
+                // parce qu'elle est en vente/vendue. Réconcilie avant toute nouvelle résolution.
+                const external = await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
+                if (external?.handled) return false;
+
+                rec.lastError = `user_card_id rejeté par propriété/RLS · attente retour réel en collection`;
+                rec.nextTagRetryAt = Date.now() + 10_000;
+            } else {
+                scheduleNextFlipTagRetry(rec);
+            }
+
             saveFlipLedger();
             return false;
         }
@@ -1624,6 +1797,181 @@
         return { price: Math.max(1, Math.round(price)), floor, basis, stats };
     }
 
+
+    // v2.4.8 — délai de grâce après end_at : winner_id/final_price peuvent être écrits
+    // quelques secondes après la fin visible. Avant, le Flip Seller déclarait parfois
+    // "invendue" trop tôt et essayait de re-taguer une carte encore hors collection.
+    const FLIP_SETTLEMENT_GRACE_MS = 30_000;
+
+    async function findActiveSellerAuctionForFlip(rec) {
+        if (!rec?.cardId) return null;
+        const uid = currentUserId();
+        if (!uid) return null;
+
+        const nowIso = encodeURIComponent(new Date(serverNow()).toISOString());
+        const rows = await supabaseSelect(
+            `auctions?seller_id=eq.${uid}&card_id=eq.${rec.cardId}` +
+            `&end_at=gt.${nowIso}` +
+            `&select=id,card_id,status,end_at,base_amount,listing_base_amount,current_bid,created_at` +
+            `&order=end_at.asc&limit=20`
+        );
+        if (!Array.isArray(rows) || rows.length === 0) return null;
+
+        const active = rows.filter(r => isActiveSellingStatus(r?.status));
+        if (active.length === 0) return null;
+
+        // Si on connaît le prix auquel CE flip a été listé, on préfère la ligne correspondante.
+        const wantedPrice = Number(rec.listPrice);
+        if (Number.isFinite(wantedPrice) && wantedPrice > 0) {
+            const exact = active.filter(r =>
+                Number(r.listing_base_amount ?? r.base_amount) === wantedPrice
+            );
+            if (exact.length === 1) return exact[0];
+        }
+
+        // Une seule enchère de cette card_id à nous = attribution sûre.
+        if (active.length === 1) return active[0];
+
+        // Plusieurs doublons identiques en vente : ne pas deviner.
+        return { ambiguous: true, count: active.length };
+    }
+
+    async function findRecentSoldSellerAuctionForFlip(rec) {
+        if (!rec?.cardId || !Number.isFinite(Number(rec.listedAt))) return null;
+        const uid = currentUserId();
+        if (!uid) return null;
+
+        // Fenêtre légèrement antérieure au clic UI pour absorber l'écart horloge/navigation.
+        const since = Math.max(0, Number(rec.listedAt) - 2 * 60 * 1000);
+        const sinceIso = encodeURIComponent(new Date(since).toISOString());
+
+        const rows = await supabaseSelect(
+            `auctions?seller_id=eq.${uid}&card_id=eq.${rec.cardId}` +
+            `&winner_id=not.is.null&created_at=gte.${sinceIso}` +
+            `&select=id,card_id,winner_id,final_price,settled_at,created_at,base_amount,listing_base_amount,end_at,status` +
+            `&order=settled_at.desc&limit=20`
+        );
+        if (!Array.isArray(rows) || rows.length === 0) return null;
+
+        const wantedPrice = Number(rec.listPrice);
+        let candidates = rows.filter(r => {
+            const created = new Date(r.created_at || 0).getTime();
+            return Number.isFinite(created) && created >= since;
+        });
+
+        if (Number.isFinite(wantedPrice) && wantedPrice > 0) {
+            const samePrice = candidates.filter(r =>
+                Number(r.listing_base_amount ?? r.base_amount) === wantedPrice
+            );
+            if (samePrice.length > 0) candidates = samePrice;
+        }
+
+        // On ne conclut "vendu" sans auctionId exact que si l'attribution est unique.
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    async function reconcileFlipAbsentFromCollection(rec) {
+        if (!rec || !flipLedger.includes(rec)) return { handled: false };
+
+        // 1) Si on connaît l'enchère exacte, elle reste la source de vérité absolue.
+        if (rec.saleAuctionId) {
+            const map = await fetchAuctionsByIds([rec.saleAuctionId]).catch(() => null);
+            const row = map instanceof Map ? map.get(rec.saleAuctionId) : null;
+
+            if (row) {
+                if (auctionRowStillActive(row)) {
+                    rec.status = 'listed';
+                    rec.userCardId = null;
+                    rec.lastError = null;
+                    saveFlipLedger();
+                    return { handled: true, state: 'listed', auctionId: rec.saleAuctionId };
+                }
+
+                const fp = Number(row.final_price);
+                if (row.winner_id && Number.isFinite(fp) && fp > 0) {
+                    rec.status = 'sold';
+                    rec.soldPrice = fp;
+                    rec.soldAt = row.settled_at ? new Date(row.settled_at).getTime() : Date.now();
+                    rec.profit = fp - Number(rec.buyPrice || 0);
+                    rec.userCardId = null;
+                    rec.lastError = null;
+                    saveFlipLedger();
+                    return { handled: true, state: 'sold', auctionId: rec.saleAuctionId };
+                }
+
+                const rowEnd = new Date(row.end_at || NaN).getTime();
+                if (
+                    Number.isFinite(rowEnd) &&
+                    serverNow() < rowEnd + FLIP_SETTLEMENT_GRACE_MS
+                ) {
+                    rec.status = 'listed';
+                    rec.userCardId = null;
+                    rec.lastError = 'enchère terminée · règlement en cours';
+                    saveFlipLedger();
+                    return { handled: true, state: 'settling', auctionId: rec.saleAuctionId };
+                }
+
+                // Exactement cette enchère est finie sans gagnant : c'est le SEUL cas où
+                // l'on autorise ensuite la recherche de retour collection / re-tag.
+                return { handled: false, provenUnsold: true };
+            }
+        }
+
+        // 2) auctionId perdu : cherche d'abord une vente encore active de cette card_id.
+        const active = await findActiveSellerAuctionForFlip(rec).catch(() => null);
+        if (active?.id) {
+            rec.status = 'listed';
+            rec.saleAuctionId = active.id;
+            rec.userCardId = null;
+            rec.listPrice = rec.listPrice || Number(active.listing_base_amount ?? active.base_amount) || null;
+            rec.lastError = null;
+            saveFlipLedger();
+
+            wmLog(
+                `🧭 Flip Seller : <b>${rec.title}</b> absente de la collection → ` +
+                `enchère active retrouvée (${String(active.id).slice(0, 8)}…).`
+            );
+            return { handled: true, state: 'listed', auctionId: active.id };
+        }
+        if (active?.ambiguous) {
+            rec.userCardId = null;
+            rec.lastError = `absente de la collection · ${active.count} ventes actives possibles · aucun re-tag`;
+            rec.nextTagRetryAt = Date.now() + 15_000;
+            saveFlipLedger();
+            return { handled: true, state: 'ambiguous_active' };
+        }
+
+        // 3) Si on avait effectivement listé ce flip, une vente conclue unique peut être
+        // retrouvée même si l'auctionId n'avait pas été capturé.
+        const sold = await findRecentSoldSellerAuctionForFlip(rec).catch(() => null);
+        if (sold?.id && sold.winner_id) {
+            const fp = Number(sold.final_price);
+            rec.status = 'sold';
+            rec.saleAuctionId = sold.id;
+            rec.soldPrice = Number.isFinite(fp) ? fp : null;
+            rec.soldAt = sold.settled_at ? new Date(sold.settled_at).getTime() : Date.now();
+            rec.profit = Number.isFinite(fp) ? fp - Number(rec.buyPrice || 0) : null;
+            rec.userCardId = null;
+            rec.lastError = null;
+            saveFlipLedger();
+
+            wmLog(
+                `💰 Flip Seller : vente retrouvée après coup → <b>${rec.title}</b>` +
+                `${Number.isFinite(fp) ? ` · ${fp} 💰` : ''}.`
+            );
+            return { handled: true, state: 'sold', auctionId: sold.id };
+        }
+
+        // 4) Absente + état non prouvé : surtout PAS de tag. On attend de revoir la carte
+        // dans user_cards, ou qu'une enchère/sale devienne identifiable au prochain passage.
+        rec.userCardId = null;
+        rec.status = 'pending_tag';
+        rec.lastError = 'absente de la collection · vérification vente/retour en cours';
+        rec.nextTagRetryAt = Date.now() + 10_000;
+        saveFlipLedger();
+        return { handled: true, state: 'absent_unknown' };
+    }
+
     // v2.4.6 — Répare une ligne `vente prêt` dont WikiMasters a retiré le tag.
     // Cas fréquent après retour/annulation/état intermédiaire : le ledger dit tagged mais
     // user_card_tags ne contient plus `vente`. Sans réparation, runFlipSeller l'excluait
@@ -1633,9 +1981,17 @@
             return false;
         }
 
-        let targetId = rec.userCardId || null;
+        let targetId = await resolveAuthoritativeFlipUserCardId(
+            rec,
+            rec.userCardId || null
+        ).catch(() => null);
 
-        // 1) Tente d'abord l'exemplaire déjà connu.
+        if (targetId && targetId !== rec.userCardId) {
+            rec.userCardId = targetId;
+            saveFlipLedger();
+        }
+
+        // 1) Tente d'abord l'exemplaire vérifié propriétaire.
         if (targetId) {
             const r = await reapplyFlipSaleTag(targetId);
             if (r?.ok) {
@@ -1656,8 +2012,8 @@
         }
 
         // 2) Même méthode robuste que le retour d'un invendu / Trash Seller.
-        if (!targetId && rec.cardId) {
-            targetId = await findCurrentUserCardId(rec.cardId, rec.title).catch(() => null);
+        if (!targetId) {
+            targetId = await resolveAuthoritativeFlipUserCardId(rec, null).catch(() => null);
         }
         if (!targetId) {
             targetId = await findWonUserCardIdForFlip(rec).catch(() => null);
@@ -1666,11 +2022,9 @@
         if (!flipLedger.includes(rec)) return false;
 
         if (!targetId) {
-            rec.status = 'pending_tag';
-            rec.userCardId = null;
-            rec.lastError = 'tag vente absent · exemplaire actuel introuvable';
-            rec.nextTagRetryAt = Date.now() + 10_000;
-            saveFlipLedger();
+            // Une carte absente peut simplement être encore en vente ou déjà vendue.
+            // On n'essaie jamais de re-taguer tant que son retour n'est pas prouvé.
+            await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
             return false;
         }
 
@@ -1800,6 +2154,17 @@
     async function reapplyFlipSaleTag(userCardId, attempt = 1) {
         if (!userCardId) return { ok: false, status: 0, error: 'user_card_id manquant' };
 
+        const owned = await verifyOwnedFlipUserCardId(userCardId).catch(() => null);
+        if (!owned?.id) {
+            return {
+                ok: false,
+                status: 403,
+                error: 'user_card_id non possédé selon user_cards'
+            };
+        }
+
+        userCardId = owned.id;
+
         let tagId = await ensureFlipTagId();
         if (!tagId) {
             return { ok: false, status: 0, error: 'tag vente introuvable' };
@@ -1844,12 +2209,7 @@
         rec.nextTagRetryAt = 0;
         saveFlipLedger();
 
-        let targetId = null;
-
-        // Même méthode que le Trash Seller : source de vérité user_cards, avec ses retries.
-        if (rec.cardId) {
-            targetId = await findCurrentUserCardId(rec.cardId, rec.title).catch(() => null);
-        }
+        let targetId = await resolveAuthoritativeFlipUserCardId(rec, null).catch(() => null);
 
         // Filet Flip plus riche si le card_id a changé entre-temps.
         if (!targetId) {
@@ -1859,7 +2219,7 @@
         if (!flipLedger.includes(rec)) return false;
 
         if (!targetId) {
-            rec.lastError = 'invendue · carte pas encore revenue dans la collection';
+            rec.lastError = 'invendue confirmée · carte pas encore revenue dans la collection';
             rec.nextTagRetryAt = Date.now() + 10_000;
             saveFlipLedger();
             return false;
@@ -1911,9 +2271,45 @@
                 wmLog(`💰 Flip vendu : <b>${rec.title}</b> · achat ${rec.buyPrice} → vente <b>${fp} 💰</b> · résultat <b style="color:${rec.profit >= 0 ? '#4ade80' : '#ef4444'};">${rec.profit >= 0 ? '+' : ''}${rec.profit} 💰</b>.`);
                 continue;
             }
-            // Enchère terminée sans acheteur : WikiMasters retire le tag lors du listing.
+
+            // Ne jamais conclure "invendue" immédiatement à T=0 : winner_id/final_price
+            // peuvent arriver quelques secondes après end_at.
+            const rowEndTs = new Date(row.end_at || NaN).getTime();
+            if (
+                Number.isFinite(rowEndTs) &&
+                serverNow() < rowEndTs + FLIP_SETTLEMENT_GRACE_MS
+            ) {
+                rec.lastError = 'enchère terminée · règlement en cours';
+                changed = true;
+                continue;
+            }
+
+            // Enchère terminée sans acheteur APRÈS délai de grâce :
+            // WikiMasters retire le tag lors du listing.
             // On oublie l'ancien auction/user_card_id, puis on retrouve l'exemplaire revenu et
             // on remet immédiatement le tag `vente` — même logique que le Trash Seller.
+            // Dernière relecture exacte après la grâce : évite qu'un snapshot ancien
+            // sans winner/final_price déclenche un faux invendu.
+            const confirmMap = await fetchAuctionsByIds([rec.saleAuctionId]).catch(() => null);
+            const confirmRow = confirmMap instanceof Map ? confirmMap.get(rec.saleAuctionId) : null;
+            const confirmFp = Number(confirmRow?.final_price);
+
+            if (confirmRow?.winner_id && Number.isFinite(confirmFp) && confirmFp > 0) {
+                rec.status = 'sold';
+                rec.soldPrice = confirmFp;
+                rec.soldAt = confirmRow.settled_at ? new Date(confirmRow.settled_at).getTime() : Date.now();
+                rec.profit = confirmFp - Number(rec.buyPrice || 0);
+                rec.lastError = null;
+                changed = true;
+                wmLog(`💰 Flip vendu (confirmation tardive) : <b>${rec.title}</b> → <b>${confirmFp} 💰</b>.`);
+                continue;
+            }
+
+            if (confirmRow && auctionRowStillActive(confirmRow)) {
+                rec.lastError = null;
+                continue;
+            }
+
             rec.saleAuctionId = null;
             rec.relists = Number(rec.relists || 0) + 1;
             changed = true;
@@ -2069,6 +2465,57 @@
             flipSellerBusy = false;
         }
     }
+
+    window.wmFlipReconcileStates = async function () {
+        const out = [];
+        for (const rec of flipLedger.filter(r => r && !['sold'].includes(r.status))) {
+            const owned = await resolveAuthoritativeFlipUserCardId(rec, rec.userCardId || null).catch(() => null);
+
+            if (owned) {
+                out.push({
+                    carte: rec.title,
+                    avant: rec.status,
+                    collection: 'oui',
+                    action: 'aucune / tag possible'
+                });
+                continue;
+            }
+
+            const before = rec.status;
+            const state = await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
+            out.push({
+                carte: rec.title,
+                avant: before,
+                collection: 'non',
+                action: state?.state || (state?.provenUnsold ? 'invendue confirmée / attente retour' : 'indéterminé')
+            });
+        }
+        console.table(out);
+        return out;
+    };
+
+    window.wmFlipOwnershipDiag = async function () {
+        const rows = [];
+        for (const rec of flipLedger.filter(r => r && r.status !== 'sold')) {
+            const cached = rec.userCardId
+                ? await verifyOwnedFlipUserCardId(rec.userCardId).catch(() => null)
+                : null;
+            const ownedByCard = rec.cardId
+                ? await ownedFlipRowsForCardId(rec.cardId).catch(() => [])
+                : [];
+            rows.push({
+                carte: rec.title,
+                rarete: rec.rarity,
+                statut: rec.status,
+                userCardIdCache: rec.userCardId || null,
+                cachePossede: !!cached,
+                exemplairesPossedesCardId: ownedByCard.length,
+                cardId: rec.cardId
+            });
+        }
+        console.table(rows);
+        return rows;
+    };
 
     window.wmFlipRepairTags = async function () {
         let ids = await fetchFlipTaggedUserCardIds();
