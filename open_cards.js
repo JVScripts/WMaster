@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.5.2';
+    const WM_VERSION = '2.5.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2757,6 +2757,20 @@
             flipSellerBusy = false;
         }
     }
+
+    window.wmCoreDiag = function () {
+        const result = {
+            version: WM_VERSION,
+            authHelper: typeof getSupabaseAccessToken === 'function',
+            auctionCols: typeof AUCTION_COLS === 'string' && AUCTION_COLS.includes('id'),
+            queryAuctions: typeof queryAuctions === 'function',
+            fetchAuctionsByIds: typeof fetchAuctionsByIds === 'function',
+            supabaseSelect: typeof supabaseSelect === 'function',
+            currentUserId: typeof currentUserId === 'function'
+        };
+        console.table(result);
+        return result;
+    };
 
     window.wmAuthDiag = function () {
         const auth = getSupabaseAccessToken();
@@ -10989,6 +11003,87 @@
 
         return null;
     }
+
+
+    /* ══════════ VENTES & ACHATS LUS DIRECTEMENT EN BASE ══════════
+       v2.5.3 — constante commune restaurée.
+       Elle avait disparu avec getSupabaseAccessToken() lors du refactor v2.5.0,
+       alors que queryAuctions()/fetchAuctionsByIds() l'utilisent encore. */
+    const AUCTION_COLS =
+        'id,seller_id,card_id,base_amount,current_bid,current_bidder_id,' +
+        'end_at,status,winner_id,final_price,settled_at,created_at,' +
+        'snapshot_rarity,listing_base_amount';
+
+    /* Introspection Supabase — outil diagnostic historique restauré lui aussi.
+       Console : await wmDiscoverTables() ou await wmDiscoverTables('auction') */
+    window.wmDiscoverTables = async function (filter) {
+        const auth = getSupabaseAccessToken();
+        const token = auth?.token || null;
+        let spec;
+
+        try {
+            const res = await fetch(`${SUPABASE_URL}/`, {
+                credentials: 'omit',
+                headers: {
+                    'apikey': SUPABASE_KEY,
+                    'Authorization': `Bearer ${token || SUPABASE_KEY}`,
+                    'Accept': 'application/openapi+json'
+                }
+            });
+
+            if (!res.ok) {
+                wmLog(
+                    `🔬 Introspection Supabase : <b>HTTP ${res.status}</b>` +
+                    `${token ? '' : ' (aucun token utilisateur trouvé — es-tu connecté au site ?)'}`
+                );
+                return null;
+            }
+
+            spec = await res.json();
+        } catch (e) {
+            wmLog(`🔬 Introspection Supabase échouée : ${e.message}`);
+            return null;
+        }
+
+        const defs =
+            spec?.definitions ||
+            spec?.components?.schemas ||
+            {};
+
+        const tables = Object.keys(defs);
+        if (tables.length === 0) {
+            wmLog('🔬 Supabase : aucune table exposée dans le descriptif.');
+            return spec;
+        }
+
+        const rx = filter
+            ? new RegExp(filter, 'i')
+            : /auction|market|sale|sell|listing|bid|trade/i;
+
+        const hits = tables.filter(t => rx.test(t));
+
+        wmLog(
+            `🔬 <b>Supabase</b> : ${tables.length} table(s) exposée(s) · ` +
+            `correspondances : <b style="color:#4ade80;">${hits.join(', ') || 'aucune'}</b>`
+        );
+
+        for (const t of hits.slice(0, 6)) {
+            const cols = Object.keys(defs?.[t]?.properties || {});
+            wmLog(
+                `🔬 <b>${t}</b> → ` +
+                `<span style="color:#888;font-size:9px;">${cols.join(', ') || '(colonnes inconnues)'}</span>`
+            );
+        }
+
+        if (hits.length === 0) {
+            wmLog(
+                `🔬 Toutes les tables : ` +
+                `<span style="color:#888;font-size:9px;">${tables.join(', ')}</span>`
+            );
+        }
+
+        return spec;
+    };
 
     async function supabaseSelect(path) {
         const auth = getSupabaseAccessToken();
