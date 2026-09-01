@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.3';
+    const WM_VERSION = '2.4.4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1611,6 +1611,10 @@
         rec.status = 'listed';
         rec.saleAuctionId = ui.auctionId || null;
         rec.listPrice = priceInfo.price;
+
+        // Une nouvelle vente vient d'être créée : le prochain calcul des slots doit relire
+        // immédiatement l'état au lieu de réutiliser le cache précédent.
+        invalidateSalesDetail();
         rec.listedAt = Date.now();
         rec.lastError = rec.saleAuctionId
             ? null
@@ -1682,7 +1686,12 @@
         const stateLabel = r => {
             if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${Number(r.soldPrice || 0).toLocaleString('fr-FR')} · ${r.profit >= 0 ? '+' : ''}${Number(r.profit || 0).toLocaleString('fr-FR')} 💰</span>`;
             if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${Number(r.listPrice || 0).toLocaleString('fr-FR')} 💰</span>`;
-            if (r.status === 'tagged') return '<span style="color:#fbbf24;">vente prêt</span>';
+            if (r.status === 'tagged') {
+                const err = r.lastError
+                    ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>`
+                    : '';
+                return `<span style="color:#fbbf24;">vente prêt</span>${err}`;
+            }
             const err = r.lastError ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>` : '';
             return `<span style="color:#888;">tag en attente</span>${err}`;
         };
@@ -1741,13 +1750,14 @@
                 }
                 const maxActive = effectiveMaxActive(state.max);
                 const slots = Math.max(0, maxActive - state.count);
+                const slotSource = state.countSource === 'db' ? 'base' : '/mine';
                 if (ready.length === 0) {
-                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives</span>`;
+                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
                 if (slots === 0) {
-                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives</span>`;
+                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -1769,12 +1779,40 @@
                 }
                 if (statusEl) statusEl.innerHTML = `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} échec(s)</span>` : ''}`;
                 renderFlipHistory();
-                await new Promise(r => setTimeout(r, 10000));
+
+                // Si des flips sont encore prêts, on ne dort pas 10 s inutilement :
+                // on recalcule immédiatement les slots avec l'état frais.
+                const stillReady = flipLedger.some(r => r && r.status === 'tagged' && r.userCardId);
+                await new Promise(r => setTimeout(r, stillReady ? 1500 : 10000));
             }
         } finally {
             flipSellerBusy = false;
         }
     }
+
+    window.wmFlipSlots = async function () {
+        const st = await fetchSellingState();
+        if (!st) {
+            console.warn('[WikiMasters][Flip] état des ventes indisponible');
+            return null;
+        }
+        const localMax = Number(getSetting('maxActiveSales'));
+        const serverMax = Number(st.max);
+        const effective = effectiveMaxActive(st.max);
+        const result = {
+            version: WM_VERSION,
+            ventesActives: st.count,
+            sourceCompteur: st.countSource || '?',
+            compteurMineBrut: st.rawCount,
+            limiteLocale: localMax,
+            limiteServeur: Number.isFinite(serverMax) ? serverMax : null,
+            limiteEffective: effective,
+            slotsLibres: Math.max(0, effective - st.count),
+            flipsPrets: flipLedger.filter(r => r?.status === 'tagged' && r.userCardId).length
+        };
+        console.table(result);
+        return result;
+    };
 
     window.wmFlipInfo = function () {
         const info = {
@@ -8073,31 +8111,70 @@
     // rouvrirait sa propre requête Supabase.
     let _detailCache = null;
     let _detailCacheAt = 0;
+    let _detailCacheSource = null; // 'db' | 'history'
     const DETAIL_CACHE_MS = 10000;
-    function invalidateSalesDetail() { _detailCacheAt = 0; }
-    async function activeSalesDetail(expectedCount) {
-        if (_detailCache && Date.now() - _detailCacheAt < DETAIL_CACHE_MS) return _detailCache;
-        // Source primaire : la base. Filet : rejouer nos propres auctionId.
-        const list = await fetchActiveSalesFromDb()
-            || await rebuildActiveSalesFromHistory(expectedCount)
-            || [];
-        _detailCache = list;
-        _detailCacheAt = Date.now();
-        return list;
+
+    function invalidateSalesDetail() {
+        _detailCacheAt = 0;
+        _detailCacheSource = null;
     }
+
+    async function activeSalesDetail(expectedCount) {
+        if (_detailCache && Date.now() - _detailCacheAt < DETAIL_CACHE_MS) {
+            return { list: _detailCache, source: _detailCacheSource };
+        }
+
+        // Source primaire : table auctions du vendeur.
+        const db = await fetchActiveSalesFromDb();
+        if (Array.isArray(db)) {
+            _detailCache = db;
+            _detailCacheSource = 'db';
+            _detailCacheAt = Date.now();
+            return { list: db, source: 'db' };
+        }
+
+        // Filet seulement si la base n'est pas lisible.
+        const rebuilt = await rebuildActiveSalesFromHistory(expectedCount) || [];
+        _detailCache = rebuilt;
+        _detailCacheSource = 'history';
+        _detailCacheAt = Date.now();
+        return { list: rebuilt, source: 'history' };
+    }
+
+    let _sellingCountMismatchLoggedAt = 0;
 
     async function fetchSellingState() {
         const data = await fetchMine();
         if (!data) return null;
+
         const st = mineSellingState(data);
-        // Le détail est complété ICI, dans l'accesseur, et non chez l'appelant : il y a sept
-        // points d'appel, et n'en équiper qu'un faisait clignoter l'affichage — chaque tick du
-        // Trash Seller réécrivait la liste avec le [] de /mine, effacé puis restauré 30 s plus
-        // tard par le rafraîchissement périodique.
-        if (st.list.length === 0 && st.count > 0) {
-            st.list = await activeSalesDetail(st.count);
+        st.rawCount = st.count;
+        st.countSource = 'mine';
+
+        // v2.4.4 : la liste DB est une photographie des enchères de CE vendeur dont end_at
+        // est réellement futur. Quand elle est accessible, son LENGTH est plus utile que
+        // sellingCount de /mine, qui peut rester gonflé quelques instants par des règlements.
+        const detail = await activeSalesDetail(st.count);
+
+        if (detail?.source === 'db') {
+            st.list = detail.list;
+            st.detailed = true;
+            st.count = detail.list.length;
+            st.countSource = 'db';
+
+            if (st.rawCount !== st.count && Date.now() - _sellingCountMismatchLoggedAt > 60000) {
+                _sellingCountMismatchLoggedAt = Date.now();
+                wmLog(
+                    `🧮 Slots corrigés : /mine annonce <b>${st.rawCount}</b> vente(s), ` +
+                    `mais la base en montre <b>${st.count}</b> réellement active(s). ` +
+                    `Le bot utilise ${st.count}.`
+                );
+            }
+        } else if (st.list.length === 0 && st.count > 0) {
+            st.list = detail?.list || [];
             st.detailed = st.list.length > 0;
         }
+
         return st;
     }
 
@@ -8389,15 +8466,49 @@
     // sellCardViaUI, juste après avoir cliqué "Lancer l'enchère").
     async function ensureOnCollectionPage() {
         if (location.pathname.startsWith('/collection')) return true;
-        const backBtn = findButtonByText('Retour au marché');
-        if (backBtn) {
-            backBtn.click();
-            for (let i = 0; i < 20; i++) {
+
+        // v2.4.4 : "Retour au marché" ne revient PAS à /collection.
+        // Après une vente native, le site nous place sur /marketplace/<auction_id>.
+        // On utilise donc directement la navigation de l'application vers Collection.
+        const collectionLink = [
+            ...document.querySelectorAll('a[href="/collection"],a[href^="/collection?"]')
+        ].find(a => a && a.offsetParent !== null)
+            || document.querySelector('a[href="/collection"],a[href^="/collection?"]');
+
+        if (collectionLink) {
+            collectionLink.click();
+            for (let i = 0; i < 30; i++) {
                 await new Promise(r => setTimeout(r, 150));
                 if (location.pathname.startsWith('/collection')) return true;
             }
         }
-        return location.pathname.startsWith('/collection');
+
+        // Repli SPA : React Router écoute normalement popstate.
+        try {
+            history.pushState({}, '', '/collection');
+            window.dispatchEvent(new PopStateEvent('popstate'));
+            for (let i = 0; i < 20; i++) {
+                await new Promise(r => setTimeout(r, 150));
+                if (location.pathname.startsWith('/collection')) {
+                    // attend que la vraie page Collection ait remonté ses contrôles
+                    for (let j = 0; j < 20; j++) {
+                        if (document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]')) {
+                            return true;
+                        }
+                        await new Promise(r => setTimeout(r, 150));
+                    }
+                }
+            }
+        } catch (e) { }
+
+        // Dernier recours : navigation réelle. Le Flip Seller est mémorisé en sessionStorage
+        // et redémarrera automatiquement après le reload.
+        try {
+            sessionStorage.setItem('wm_flipseller_active', '1');
+            location.assign('/collection');
+        } catch (e) { }
+
+        return false;
     }
 
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
@@ -9983,8 +10094,15 @@
         const uid = currentUserId();
         if (!uid) return null;
         const nowIso = encodeURIComponent(new Date().toISOString());
-        return await queryAuctions(
-            `seller_id=eq.${uid}&status=eq.active&end_at=gt.${nowIso}`, 'end_at.asc', 50);
+
+        // v2.4.4 : on ne force plus status=active dans la requête.
+        // Le site peut conserver/transiter par d'autres libellés ; end_at + filtre local
+        // donnent un décompte plus robuste des enchères réellement encore actives.
+        const rows = await queryAuctions(
+            `seller_id=eq.${uid}&end_at=gt.${nowIso}`, 'end_at.asc', 50);
+
+        if (!Array.isArray(rows)) return null;
+        return rows.filter(a => isActiveSellingStatus(a?.status));
     }
 
     // Mes enchères gagnées — remplace le `won` disparu. Alimente l'historique des achats.
