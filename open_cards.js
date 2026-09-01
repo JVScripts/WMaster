@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.8';
+    const WM_VERSION = '2.4.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -669,6 +669,26 @@
                     err.includes('non possédé') ||
                     err.includes('tag vente absent') ||
                     err.includes('migration v2.4.7')
+                ) {
+                    r.nextTagRetryAt = 0;
+                    r.lastTagAttemptAt = 0;
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
+    // v2.4.9 : les lignes bloquées sur "absente ... vérification" sont relancées
+    // immédiatement avec le nouveau matching titre + rareté.
+    try {
+        const k = 'wm_flip_v249_reconcile_identity_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (!r || r.status !== 'pending_tag') return;
+                const err = String(r.lastError || '').toLowerCase();
+                if (
+                    err.includes('absente de la collection') ||
+                    err.includes('vérification vente/retour')
                 ) {
                     r.nextTagRetryAt = 0;
                     r.lastTagAttemptAt = 0;
@@ -1803,71 +1823,96 @@
     // "invendue" trop tôt et essayait de re-taguer une carte encore hors collection.
     const FLIP_SETTLEMENT_GRACE_MS = 30_000;
 
-    async function findActiveSellerAuctionForFlip(rec) {
-        if (!rec?.cardId) return null;
-        const uid = currentUserId();
-        if (!uid) return null;
+    function flipAuctionIdentityScore(rec, auction) {
+        if (!rec || !auction) return -1;
 
-        const nowIso = encodeURIComponent(new Date(serverNow()).toISOString());
-        const rows = await supabaseSelect(
-            `auctions?seller_id=eq.${uid}&card_id=eq.${rec.cardId}` +
-            `&end_at=gt.${nowIso}` +
-            `&select=id,card_id,status,end_at,base_amount,listing_base_amount,current_bid,created_at` +
-            `&order=end_at.asc&limit=20`
-        );
-        if (!Array.isArray(rows) || rows.length === 0) return null;
+        const recTitle = String(rec.title || '').trim();
+        const aTitle = String(auction.card?.wikipedia_title || '').trim();
+        const recRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+        const aRarity = String(
+            auction.snapshot_rarity || auction.card?.rarity || ''
+        ).toUpperCase();
 
-        const active = rows.filter(r => isActiveSellingStatus(r?.status));
-        if (active.length === 0) return null;
+        let score = 0;
 
-        // Si on connaît le prix auquel CE flip a été listé, on préfère la ligne correspondante.
+        // card_id exact = signal fort, mais plus obligatoire.
+        if (rec.cardId && auction.card_id === rec.cardId) score += 100;
+
+        // Titre exact + rareté = identité fonctionnelle quand le catalogue a remplacé l'id.
+        if (recTitle && recTitle !== '?' && aTitle === recTitle) score += 60;
+        if (recRarity && aRarity && aRarity === recRarity) score += 25;
+
         const wantedPrice = Number(rec.listPrice);
-        if (Number.isFinite(wantedPrice) && wantedPrice > 0) {
-            const exact = active.filter(r =>
-                Number(r.listing_base_amount ?? r.base_amount) === wantedPrice
-            );
-            if (exact.length === 1) return exact[0];
+        const auctionBase = Number(
+            auction.listing_base_amount ?? auction.base_amount
+        );
+        if (
+            Number.isFinite(wantedPrice) && wantedPrice > 0 &&
+            Number.isFinite(auctionBase) && auctionBase === wantedPrice
+        ) {
+            score += 30;
         }
 
-        // Une seule enchère de cette card_id à nous = attribution sûre.
-        if (active.length === 1) return active[0];
+        return score;
+    }
 
-        // Plusieurs doublons identiques en vente : ne pas deviner.
-        return { ambiguous: true, count: active.length };
+    function chooseUniqueFlipAuction(rec, auctions, minScore = 60) {
+        if (!Array.isArray(auctions) || auctions.length === 0) return null;
+
+        const ranked = auctions
+            .map(a => ({ a, score: flipAuctionIdentityScore(rec, a) }))
+            .filter(x => x.score >= minScore)
+            .sort((x, y) => y.score - x.score);
+
+        if (ranked.length === 0) return null;
+
+        // Le meilleur doit être unique. Si deux annonces ont le même score maximal,
+        // on ne devine pas quel doublon correspond au flip.
+        if (ranked.length > 1 && ranked[0].score === ranked[1].score) {
+            return { ambiguous: true, count: ranked.filter(x => x.score === ranked[0].score).length };
+        }
+
+        return ranked[0].a;
+    }
+
+    async function findActiveSellerAuctionForFlip(rec) {
+        if (!rec) return null;
+
+        // v2.4.9 : récupère toutes MES ventes actives et matche ensuite localement.
+        // Cela permet de retrouver une annonce même si rec.cardId est périmé.
+        const active = await fetchActiveSalesFromDb().catch(() => null);
+        if (!Array.isArray(active) || active.length === 0) return null;
+
+        const match = chooseUniqueFlipAuction(rec, active, 60);
+        return match;
     }
 
     async function findRecentSoldSellerAuctionForFlip(rec) {
-        if (!rec?.cardId || !Number.isFinite(Number(rec.listedAt))) return null;
-        const uid = currentUserId();
-        if (!uid) return null;
+        if (!rec) return null;
 
-        // Fenêtre légèrement antérieure au clic UI pour absorber l'écart horloge/navigation.
-        const since = Math.max(0, Number(rec.listedAt) - 2 * 60 * 1000);
-        const sinceIso = encodeURIComponent(new Date(since).toISOString());
+        // Si le listing Flip est connu, fenêtre autour du listing.
+        // Sinon on remonte à l'achat : cela permet aussi de reconnaître une carte vendue
+        // manuellement / par un autre module après son achat.
+        const referenceTs = Number.isFinite(Number(rec.listedAt))
+            ? Number(rec.listedAt)
+            : Number(rec.boughtAt);
 
-        const rows = await supabaseSelect(
-            `auctions?seller_id=eq.${uid}&card_id=eq.${rec.cardId}` +
-            `&winner_id=not.is.null&created_at=gte.${sinceIso}` +
-            `&select=id,card_id,winner_id,final_price,settled_at,created_at,base_amount,listing_base_amount,end_at,status` +
-            `&order=settled_at.desc&limit=20`
-        );
-        if (!Array.isArray(rows) || rows.length === 0) return null;
+        if (!Number.isFinite(referenceTs)) return null;
 
-        const wantedPrice = Number(rec.listPrice);
-        let candidates = rows.filter(r => {
-            const created = new Date(r.created_at || 0).getTime();
-            return Number.isFinite(created) && created >= since;
+        const since = Math.max(0, referenceTs - 2 * 60 * 1000);
+        const sold = await fetchSoldFromDb(500).catch(() => null);
+        if (!Array.isArray(sold) || sold.length === 0) return null;
+
+        const candidates = sold.filter(a => {
+            const ts = a.settled_at
+                ? new Date(a.settled_at).getTime()
+                : a.end_at
+                    ? new Date(a.end_at).getTime()
+                    : NaN;
+            return Number.isFinite(ts) && ts >= since;
         });
 
-        if (Number.isFinite(wantedPrice) && wantedPrice > 0) {
-            const samePrice = candidates.filter(r =>
-                Number(r.listing_base_amount ?? r.base_amount) === wantedPrice
-            );
-            if (samePrice.length > 0) candidates = samePrice;
-        }
-
-        // On ne conclut "vendu" sans auctionId exact que si l'attribution est unique.
-        return candidates.length === 1 ? candidates[0] : null;
+        return chooseUniqueFlipAuction(rec, candidates, 60);
     }
 
     async function reconcileFlipAbsentFromCollection(rec) {
@@ -1920,6 +1965,18 @@
         // 2) auctionId perdu : cherche d'abord une vente encore active de cette card_id.
         const active = await findActiveSellerAuctionForFlip(rec).catch(() => null);
         if (active?.id) {
+            if (active.card_id && active.card_id !== rec.cardId) {
+                rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                rec.cardId = active.card_id;
+            }
+            const activeRarity = String(
+                active.snapshot_rarity || active.card?.rarity || ''
+            ).toUpperCase();
+            if (activeRarity && activeRarity !== rec.rarity) {
+                rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                rec.rarity = activeRarity;
+            }
+
             rec.status = 'listed';
             rec.saleAuctionId = active.id;
             rec.userCardId = null;
@@ -1946,6 +2003,19 @@
         const sold = await findRecentSoldSellerAuctionForFlip(rec).catch(() => null);
         if (sold?.id && sold.winner_id) {
             const fp = Number(sold.final_price);
+
+            if (sold.card_id && sold.card_id !== rec.cardId) {
+                rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                rec.cardId = sold.card_id;
+            }
+            const soldRarity = String(
+                sold.snapshot_rarity || sold.card?.rarity || ''
+            ).toUpperCase();
+            if (soldRarity && soldRarity !== rec.rarity) {
+                rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+                rec.rarity = soldRarity;
+            }
+
             rec.status = 'sold';
             rec.saleAuctionId = sold.id;
             rec.soldPrice = Number.isFinite(fp) ? fp : null;
@@ -1960,6 +2030,16 @@
                 `${Number.isFinite(fp) ? ` · ${fp} 💰` : ''}.`
             );
             return { handled: true, state: 'sold', auctionId: sold.id };
+        }
+
+        if (sold?.ambiguous) {
+            rec.userCardId = null;
+            rec.status = 'pending_tag';
+            rec.lastError =
+                `absente · ${sold.count} ventes conclues possibles (titre/rareté) · attribution ambiguë`;
+            rec.nextTagRetryAt = Date.now() + 30_000;
+            saveFlipLedger();
+            return { handled: true, state: 'ambiguous_sold' };
         }
 
         // 4) Absente + état non prouvé : surtout PAS de tag. On attend de revoir la carte
