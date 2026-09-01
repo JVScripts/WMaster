@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.4.5';
+    const WM_VERSION = '2.4.6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -615,6 +615,28 @@
         }
     } catch (e) { }
 
+    // v2.4.6 : les anciennes lignes bloquées sur `tag_absent` ou
+    // `exemplaire gagné non résolu` sont retentées immédiatement après mise à jour.
+    try {
+        const k = 'wm_flip_v246_repair_reset_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (!r) return;
+                const err = String(r.lastError || '');
+                if (
+                    r.status === 'pending_tag' ||
+                    err.includes('tag_absent') ||
+                    err.includes('tag absent') ||
+                    err.includes('exemplaire gagné non résolu')
+                ) {
+                    r.nextTagRetryAt = 0;
+                    r.lastTagAttemptAt = 0;
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -1219,6 +1241,20 @@
         }
 
         if (!rec.userCardId) rec.userCardId = await findWonUserCardIdForFlip(rec);
+
+        // v2.4.6 : dernier recours = même résolveur que le Trash Seller.
+        // Il interroge directement MES user_cards par card_id, avec retries, puis /my-collection.
+        // On ne l'utilise qu'après l'échec du résolveur Flip plus strict.
+        if (!rec.userCardId && rec.cardId) {
+            rec.userCardId = await findCurrentUserCardId(rec.cardId, rec.title).catch(() => null);
+            if (rec.userCardId) {
+                wmLog(
+                    `🔎 Flip Seller : exemplaire résolu via fallback Trash → ` +
+                    `<b>${rec.title}</b> · ${String(rec.userCardId).slice(0, 8)}…`
+                );
+            }
+        }
+
         if (!flipLedger.includes(rec)) return false;
         if (!rec.userCardId) {
             rec.status = 'pending_tag';
@@ -1588,16 +1624,122 @@
         return { price: Math.max(1, Math.round(price)), floor, basis, stats };
     }
 
+    // v2.4.6 — Répare une ligne `vente prêt` dont WikiMasters a retiré le tag.
+    // Cas fréquent après retour/annulation/état intermédiaire : le ledger dit tagged mais
+    // user_card_tags ne contient plus `vente`. Sans réparation, runFlipSeller l'excluait
+    // de `ready` pour toujours.
+    async function repairMissingFlipSaleTag(rec) {
+        if (!rec || !flipLedger.includes(rec) || rec.status === 'sold' || rec.status === 'listed') {
+            return false;
+        }
+
+        let targetId = rec.userCardId || null;
+
+        // 1) Tente d'abord l'exemplaire déjà connu.
+        if (targetId) {
+            const r = await reapplyFlipSaleTag(targetId);
+            if (r?.ok) {
+                rec.status = 'tagged';
+                rec.tagAppliedAt = Date.now();
+                rec.lastError = null;
+                rec.nextTagRetryAt = 0;
+                saveFlipLedger();
+                wmLog(`🏷️ Flip Seller : tag <b>vente</b> réparé → <b>${rec.title}</b>.`);
+                return true;
+            }
+
+            // ID probablement périmé : on le libère et on résout l'exemplaire ACTUEL.
+            if ([404, 409].includes(Number(r?.status))) {
+                targetId = null;
+                rec.userCardId = null;
+            }
+        }
+
+        // 2) Même méthode robuste que le retour d'un invendu / Trash Seller.
+        if (!targetId && rec.cardId) {
+            targetId = await findCurrentUserCardId(rec.cardId, rec.title).catch(() => null);
+        }
+        if (!targetId) {
+            targetId = await findWonUserCardIdForFlip(rec).catch(() => null);
+        }
+
+        if (!flipLedger.includes(rec)) return false;
+
+        if (!targetId) {
+            rec.status = 'pending_tag';
+            rec.userCardId = null;
+            rec.lastError = 'tag vente absent · exemplaire actuel introuvable';
+            rec.nextTagRetryAt = Date.now() + 10_000;
+            saveFlipLedger();
+            return false;
+        }
+
+        rec.userCardId = targetId;
+        const tagged = await reapplyFlipSaleTag(targetId);
+
+        if (!flipLedger.includes(rec)) return false;
+
+        if (!tagged?.ok) {
+            rec.status = 'pending_tag';
+            rec.lastError = `tag vente absent · re-tag échoué · ${tagged?.error || `HTTP ${tagged?.status || '?'}`}`;
+            rec.nextTagRetryAt = Date.now() + 15_000;
+            saveFlipLedger();
+            return false;
+        }
+
+        rec.status = 'tagged';
+        rec.tagAppliedAt = Date.now();
+        rec.lastError = null;
+        rec.nextTagRetryAt = 0;
+        saveFlipLedger();
+
+        wmLog(
+            `🏷️ Flip Seller : tag <b>vente</b> remis sur <b>${rec.title}</b> ` +
+            `· exemplaire ${String(targetId).slice(0, 8)}…`
+        );
+        return true;
+    }
+
+    async function repairAllMissingFlipSaleTags(taggedIds) {
+        if (!(taggedIds instanceof Set)) return 0;
+
+        const missing = flipLedger
+            .filter(r =>
+                r &&
+                r.status === 'tagged' &&
+                r.userCardId &&
+                !taggedIds.has(r.userCardId)
+            )
+            .sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
+
+        let repaired = 0;
+        // Petit plafond par boucle pour ne pas monopoliser l'UI/réseau si beaucoup de vieux flips.
+        for (const rec of missing.slice(0, 8)) {
+            const ok = await repairMissingFlipSaleTag(rec).catch(() => false);
+            if (ok) repaired++;
+            await new Promise(r => setTimeout(r, 180));
+        }
+        return repaired;
+    }
+
     async function listFlipRecord(rec) {
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
         if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') {
             return { ok: false, reason: 'record_invalide' };
         }
 
-        const tagged = await fetchFlipTaggedUserCardIds();
+        let tagged = await fetchFlipTaggedUserCardIds();
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
+
         if (tagged && !tagged.has(rec.userCardId)) {
-            return { ok: false, reason: 'tag_absent' };
+            // Le tag a pu disparaître entre le calcul de ready et le clic de vente.
+            const repaired = await repairMissingFlipSaleTag(rec).catch(() => false);
+            if (!repaired) return { ok: false, reason: rec.lastError || 'tag_absent' };
+
+            tagged = await fetchFlipTaggedUserCardIds();
+            if (!(tagged instanceof Set) || !rec.userCardId || !tagged.has(rec.userCardId)) {
+                return { ok: false, reason: 'tag_absent_apres_reparation' };
+            }
         }
 
         const priceInfo = await resolveFlipSellPrice(rec);
@@ -1858,11 +2000,22 @@
                 await syncFlipSaleResults();
                 if (!flipSellerRunning) break;
 
-                const taggedIds = await fetchFlipTaggedUserCardIds();
+                let taggedIds = await fetchFlipTaggedUserCardIds();
                 if (taggedIds == null) {
                     if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag vente illisible — réessai dans 15s…</span>';
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
+                }
+
+                // v2.4.6 : AVANT de filtrer `ready`, répare les lignes dont le ledger dit
+                // `vente prêt` mais dont le tag a disparu. Sinon elles sont exclues à vie.
+                const repairedMissing = await repairAllMissingFlipSaleTags(taggedIds).catch(() => 0);
+                if (repairedMissing > 0) {
+                    taggedIds = await fetchFlipTaggedUserCardIds();
+                    if (taggedIds == null) {
+                        await new Promise(r => setTimeout(r, 5000));
+                        continue;
+                    }
                 }
 
                 const ready = flipLedger
@@ -1916,6 +2069,33 @@
             flipSellerBusy = false;
         }
     }
+
+    window.wmFlipRepairTags = async function () {
+        let ids = await fetchFlipTaggedUserCardIds();
+        if (!(ids instanceof Set)) return { ok: false, reason: 'tag vente illisible' };
+
+        const before = flipLedger.filter(
+            r => r?.status === 'tagged' && r.userCardId && !ids.has(r.userCardId)
+        ).length;
+
+        const repaired = await repairAllMissingFlipSaleTags(ids);
+
+        // Force aussi un passage sur les pending comme Percy.
+        flipLedger
+            .filter(r => r?.status === 'pending_tag')
+            .forEach(r => { r.nextTagRetryAt = 0; r.lastTagAttemptAt = 0; });
+        saveFlipLedger();
+        await retryPendingFlipTags();
+
+        ids = await fetchFlipTaggedUserCardIds();
+        const after = ids instanceof Set
+            ? flipLedger.filter(r => r?.status === 'tagged' && r.userCardId && !ids.has(r.userCardId)).length
+            : null;
+
+        const result = { version: WM_VERSION, tagsManquantsAvant: before, repares: repaired, tagsManquantsApres: after };
+        console.table(result);
+        return result;
+    };
 
     window.wmFlipSlots = async function () {
         const st = await fetchSellingState();
