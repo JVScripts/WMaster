@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.5';
+    const WM_VERSION = '2.3.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -431,7 +431,7 @@
         return true;
     }
 
-    /* ══════════ AUTO-ACHAT → $$$ → FLIP SELLER (v2.3) ══════════
+    /* ══════════ AUTO-ACHAT → vente → FLIP SELLER (v2.3) ══════════
        Un achat est considéré « auto » uniquement si LE BOT a réellement envoyé au moins
        une mise automatique gagnante sur cette enchère (Hunter, prioritaire, Fourbe ou
        riposte auto-bid). Le suivi est persisté : un F5 entre la mise et la victoire ne perd
@@ -440,22 +440,40 @@
        À la victoire :
        1) archive le vrai final_price (= prix d'achat),
        2) retrouve l'exemplaire user_card_id reçu,
-       3) crée/pose l'étiquette $$$,
+       3) crée/pose l'étiquette vente,
        4) le Flip Seller peut le revendre ensuite par user_card_id exact.
 
        Le prix de revente est prudent : plancher = prix d'achat + marge brute configurée ;
        si une médiane locale/officielle fiable (>=3 ventes) est supérieure, on vise la médiane.
        L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
        plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
-    const FLIP_TAG_NAME = '$$$';
+    const FLIP_TAG_NAME = 'vente';
     const AUTO_FLIP_CANDIDATES_KEY = 'wm_auto_flip_candidates_v1';
     const FLIP_LEDGER_KEY = 'wm_flip_ledger_v1';
     const FLIP_MARKUP_KEY = 'wm_flip_markup_pct';
     const FLIP_DURATION_KEY = 'wm_flip_duration_min';
     const FLIP_UNDERCUT_KEY = 'wm_flip_undercut';
-    const FLIP_TAG_CACHE_KEY = 'wm_flip_tag_id_v1';
 
-    let FLIP_TAG_ID = localStorage.getItem(FLIP_TAG_CACHE_KEY) || null;
+    // v2.3.7 : cache propre au tag "vente".
+    // L'ancien wm_flip_tag_id_v1 pouvait encore contenir l'UUID de $$$ et était
+    // réutilisé aveuglément après le renommage du tag.
+    const FLIP_TAG_CACHE_KEY = 'wm_flip_tag_id_vente_v2';
+    const FLIP_TAG_CACHE_NAME_KEY = 'wm_flip_tag_name_vente_v2';
+    const FLIP_TAG_CACHE_VALIDATE_MS = 60 * 1000;
+
+    try {
+        localStorage.removeItem('wm_flip_tag_id_v1'); // ancien cache $$$ / VENTE
+    } catch (e) { }
+
+    let FLIP_TAG_ID = null;
+    let flipTagValidatedAt = 0;
+    try {
+        const cachedId = localStorage.getItem(FLIP_TAG_CACHE_KEY);
+        const cachedName = localStorage.getItem(FLIP_TAG_CACHE_NAME_KEY);
+        if (cachedId && String(cachedName || '').toLowerCase() === FLIP_TAG_NAME.toLowerCase()) {
+            FLIP_TAG_ID = cachedId;
+        }
+    } catch (e) { }
     let flipSellerRunning = false;
     let flipSellerBusy = false;
 
@@ -538,6 +556,21 @@
         if (!Number.isFinite(Number(r.nextTagRetryAt))) r.nextTagRetryAt = 0;
     });
 
+    // v2.3.8 : le bug de relation PostgREST pouvait avoir envoyé les pending dans un long
+    // backoff. On remet leur échéance à zéro UNE fois pour tester immédiatement le nouveau chemin.
+    try {
+        const k = 'wm_flip_v238_retry_reset_done';
+        if (!localStorage.getItem(k)) {
+            flipLedger.forEach(r => {
+                if (r?.status === 'pending_tag') {
+                    r.nextTagRetryAt = 0;
+                    r.lastError = r.lastError || 'retest v2.3.8';
+                }
+            });
+            localStorage.setItem(k, '1');
+        }
+    } catch (e) { }
+
     function saveFlipLedger() {
         try {
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
@@ -601,18 +634,29 @@
 
     function rememberFlipTagId(id) {
         FLIP_TAG_ID = id || null;
+        flipTagValidatedAt = FLIP_TAG_ID ? Date.now() : 0;
         try {
-            if (FLIP_TAG_ID) localStorage.setItem(FLIP_TAG_CACHE_KEY, FLIP_TAG_ID);
-            else localStorage.removeItem(FLIP_TAG_CACHE_KEY);
+            if (FLIP_TAG_ID) {
+                localStorage.setItem(FLIP_TAG_CACHE_KEY, FLIP_TAG_ID);
+                localStorage.setItem(FLIP_TAG_CACHE_NAME_KEY, FLIP_TAG_NAME);
+            } else {
+                localStorage.removeItem(FLIP_TAG_CACHE_KEY);
+                localStorage.removeItem(FLIP_TAG_CACHE_NAME_KEY);
+            }
         } catch (e) { }
         return FLIP_TAG_ID;
     }
 
-    // Recherche le tag $$$ exactement comme le Trash Seller : d'abord dans les tags du compte,
+    // Recherche le tag vente exactement comme le Trash Seller : d'abord dans les tags du compte,
     // puis en requête directe par user_id, puis (sous RLS) par nom seul. `force=true` invalide
     // le cache : utile si le tag a été supprimé/recréé ou créé manuellement après le chargement.
     async function discoverFlipTagId(force = false) {
-        if (!force && FLIP_TAG_ID) return FLIP_TAG_ID;
+        // Un id chargé depuis localStorage n'est JAMAIS cru aveuglément au démarrage :
+        // on le revalide au moins une fois, puis au maximum une fois par minute.
+        if (!force && FLIP_TAG_ID && flipTagValidatedAt > 0
+            && Date.now() - flipTagValidatedAt < FLIP_TAG_CACHE_VALIDATE_MS) {
+            return FLIP_TAG_ID;
+        }
 
         const { token } = getSupabaseAccessToken();
         const claims = decodeJWT(token);
@@ -625,8 +669,15 @@
         // 1) Liste complète des tags du compte — la plus robuste pour un tag créé manuellement.
         try {
             const tags = await fetchUserTags();
+            const wanted = FLIP_TAG_NAME.toLocaleLowerCase('fr-FR');
             const existing = Array.isArray(tags)
-                ? tags.find(t => t && String(t.name || '').trim() === FLIP_TAG_NAME)
+                ? (
+                    // Préférence absolue au nom exact demandé : "vente".
+                    tags.find(t => t && String(t.name || '').trim() === FLIP_TAG_NAME)
+                    ||
+                    // Tolère un ancien "VENTE"/"Vente" si c'est le seul présent.
+                    tags.find(t => t && String(t.name || '').trim().toLocaleLowerCase('fr-FR') === wanted)
+                )
                 : null;
             if (existing?.id) return rememberFlipTagId(existing.id);
         } catch (e) { }
@@ -705,6 +756,34 @@
     // c'est précisément l'ordre d'acquisition visible côté site ; repli Supabase si nécessaire.
     const FLIP_ACQUISITION_MATCH_MS = 48 * 60 * 60 * 1000; // garde-fou anti-vieux doublon
 
+    // v2.3.8 : ne dépend plus des relations PostgREST imbriquées
+    // `user_cards(...)/user_card_tags(...)`. Sur le schéma WikiMasters, la relation inverse
+    // user_card_tags -> user_cards renvoie HTTP 400. On fait donc toujours 2 lectures simples.
+    async function enrichFlipUserCardsWithTags(rows) {
+        if (!Array.isArray(rows) || rows.length === 0) return [];
+        const ids = [...new Set(rows.map(r => r?.id).filter(Boolean))];
+        const tagsById = new Map(ids.map(id => [id, []]));
+
+        const CHUNK = 120;
+        for (let i = 0; i < ids.length; i += CHUNK) {
+            const chunk = ids.slice(i, i + CHUNK);
+            const links = await supabaseSelect(
+                `user_card_tags?user_card_id=in.(${chunk.join(',')})&select=user_card_id,tag_id&limit=${Math.max(200, chunk.length * 12)}`
+            );
+            if (!Array.isArray(links)) continue;
+            for (const link of links) {
+                if (!link?.user_card_id || !link?.tag_id) continue;
+                if (!tagsById.has(link.user_card_id)) tagsById.set(link.user_card_id, []);
+                tagsById.get(link.user_card_id).push({ tag_id: link.tag_id });
+            }
+        }
+
+        return rows.map(r => ({
+            ...r,
+            user_card_tags: tagsById.get(r.id) || []
+        }));
+    }
+
     function chooseOwnedFlipCandidate(rows, rec, tagId, cardMetaById = new Map()) {
         if (!Array.isArray(rows) || rows.length === 0) return null;
         const targetTs = Number(rec?.boughtAt) || Date.now();
@@ -736,19 +815,32 @@
             if (exact) return exact;
         }
 
-        // Un $$$ manuel est une preuve explicite : on peut l'accepter même si l'horodatage
+        // Un tag vente manuel est une preuve explicite : on peut l'accepter même si l'horodatage
         // d'acquisition est ancien/incomplet.
         const manuallyTagged = normalized
             .filter(r => r._alreadyFlip && (!used.has(r.id) || r.id === rec?.userCardId))
             .sort((a, b) => a._delta - b._delta)[0];
         if (manuallyTagged) return manuallyTagged;
 
-        // Pour l'auto-tag, on refuse volontairement un ancien doublon : il faut que created_at /
-        // obtained_at soit proche de la victoire. Sinon on attend la propagation de la vraie carte.
+        // On préfère toujours l'exemplaire dont la date est proche de l'achat.
         const close = normalized
             .filter(r => !used.has(r.id) && Number.isFinite(r._ts) && r._delta <= FLIP_ACQUISITION_MATCH_MS)
             .sort((a, b) => a._delta - b._delta);
-        return close[0] || null;
+        if (close[0]) return close[0];
+
+        // v2.3.8 : lors d'une vente entre joueurs, WikiMasters peut transférer un user_card
+        // EXISTANT au lieu d'en créer un nouveau. Son created_at reste alors ancien et ne peut
+        // absolument pas servir de preuve de date d'achat. Si le card_id est bien actuellement
+        // possédé par l'utilisateur, on prend donc en dernier recours un exemplaire équivalent
+        // non déjà réservé par un autre flip. Pour deux copies de même card_id/rareté, l'instance
+        // physique n'a pas d'incidence économique sur l'achat-revente.
+        const equivalent = normalized
+            .filter(r => !used.has(r.id))
+            .sort((a, b) => {
+                if (a._alreadyFlip !== b._alreadyFlip) return Number(b._alreadyFlip) - Number(a._alreadyFlip);
+                return a._delta - b._delta;
+            });
+        return equivalent[0] || null;
     }
 
     // Retrouve l'exemplaire gagné de façon robuste.
@@ -763,10 +855,14 @@
         async function ownedRowsForIds(ids) {
             const clean = [...new Set((ids || []).filter(Boolean))];
             if (clean.length === 0) return [];
+
+            // IMPORTANT v2.3.8 : pas d'embed `user_card_tags(tag_id)`.
+            // Les relations PostgREST ne sont pas toutes exposées sur WikiMasters.
             const rows = await supabaseSelect(
-                `user_cards?user_id=eq.${uid}&card_id=in.(${clean.join(',')})&select=id,card_id,created_at,user_card_tags(tag_id)&limit=100`
+                `user_cards?user_id=eq.${uid}&card_id=in.(${clean.join(',')})&select=id,card_id,created_at&limit=250`
             );
-            return Array.isArray(rows) ? rows : [];
+            if (!Array.isArray(rows)) return [];
+            return await enrichFlipUserCardsWithTags(rows);
         }
 
         // 1) ID connu au moment de l'achat.
@@ -814,7 +910,7 @@
         }
 
         // 3) Fallback API collection. On accepte card_id OU titre, mais toujours avec une preuve
-        // temporelle proche de l'achat (ou un $$$ déjà présent).
+        // temporelle proche de l'achat (ou un tag vente déjà présent).
         try {
             const targetTs = Number(rec.boughtAt) || Date.now();
             const used = new Set(
@@ -835,7 +931,10 @@
                     const titleMatch = rec.title && rec.title !== '?' && title === rec.title;
                     if (!idMatch && !titleMatch) continue;
                     const ts = itemObtainedTs(it);
-                    const tagged = (it.tags || []).some(t => String(t?.name || '').trim() === FLIP_TAG_NAME);
+                    const tagged = (it.tags || []).some(t =>
+                        String(t?.name || '').trim().toLocaleLowerCase('fr-FR')
+                        === FLIP_TAG_NAME.toLocaleLowerCase('fr-FR')
+                    );
                     const delta = Number.isFinite(ts) ? Math.abs(ts - targetTs) : Number.MAX_SAFE_INTEGER;
                     if (!tagged && (!Number.isFinite(ts) || delta > FLIP_ACQUISITION_MATCH_MS)) continue;
                     if (it.id && !used.has(it.id)) candidates.push({ it, delta, tagged });
@@ -882,7 +981,7 @@
         if (!flipLedger.includes(rec)) return false;
         if (!tagId) {
             rec.status = 'pending_tag';
-            rec.lastError = 'tag $$$ introuvable/création impossible';
+            rec.lastError = 'tag vente introuvable/création impossible';
             scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
@@ -925,7 +1024,7 @@
         rec.lastError = null;
         rec.nextTagRetryAt = 0;
         saveFlipLedger();
-        wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>$$$</b> posé.`);
+        wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>vente</b> posé.`);
         return true;
     }
 
@@ -964,21 +1063,45 @@
         let tagId = await ensureFlipTagId(forceRediscover);
         if (!tagId) return null;
 
-        let rows = await supabaseSelect(
-            `user_card_tags?tag_id=eq.${tagId}&select=user_card_id,user_cards(id,card_id,created_at)&limit=2000`
-        );
+        async function readForTag(id) {
+            // Étape 1 : les liaisons du tag. Cette requête simple est déjà utilisée ailleurs
+            // dans le script et ne dépend d'aucune relation PostgREST.
+            const links = await supabaseSelect(
+                `user_card_tags?tag_id=eq.${id}&select=user_card_id&limit=2000`
+            );
+            if (!Array.isArray(links)) return null;
 
-        // Si on a un ancien id de tag en cache mais qu'un $$$ a été recréé manuellement,
-        // une lecture vide peut être trompeuse. Avec des flips en attente, on redécouvre une fois.
+            const ids = [...new Set(links.map(r => r?.user_card_id).filter(Boolean))];
+            if (ids.length === 0) return [];
+
+            // Étape 2 : métadonnées des user_cards par leur ID, en petits lots pour ne pas
+            // produire une URL gigantesque. Même si un lot échoue, on conserve les liens :
+            // un userCardId exact reste exploitable.
+            const cardById = new Map();
+            const CHUNK = 100;
+            for (let i = 0; i < ids.length; i += CHUNK) {
+                const chunk = ids.slice(i, i + CHUNK);
+                const cards = await supabaseSelect(
+                    `user_cards?id=in.(${chunk.join(',')})&select=id,card_id,created_at&limit=${chunk.length}`
+                );
+                if (!Array.isArray(cards)) continue;
+                for (const uc of cards) if (uc?.id) cardById.set(uc.id, uc);
+            }
+
+            return ids.map(userCardId => ({
+                user_card_id: userCardId,
+                user_cards: cardById.get(userCardId) || null
+            }));
+        }
+
+        let rows = await readForTag(tagId);
+
+        // Tag supprimé/recréé ou cache périmé : redécouverte puis un seul nouvel essai.
         if (Array.isArray(rows) && rows.length === 0 && !forceRediscover
             && flipLedger.some(r => r && r.status === 'pending_tag')) {
             const oldId = tagId;
             tagId = await discoverFlipTagId(true);
-            if (tagId && tagId !== oldId) {
-                rows = await supabaseSelect(
-                    `user_card_tags?tag_id=eq.${tagId}&select=user_card_id,user_cards(id,card_id,created_at)&limit=2000`
-                );
-            }
+            if (tagId && tagId !== oldId) rows = await readForTag(tagId);
         }
 
         return Array.isArray(rows) ? rows : null;
@@ -990,7 +1113,7 @@
         return new Set(rows.map(r => r?.user_card_id).filter(Boolean));
     }
 
-    // Fait le lien entre un tag $$$ posé MANUELLEMENT dans WikiMasters et le registre des
+    // Fait le lien entre un tag vente posé MANUELLEMENT dans WikiMasters et le registre des
     // auto-achats. Avant v2.3.4, le seller exigeait status='tagged' dans le ledger et ignorait
     // donc un tag manuel pourtant bien présent en base.
     async function syncManualFlipTags() {
@@ -1016,12 +1139,12 @@
         for (const rec of flipLedger) {
             if (!rec || !['pending_tag', 'tagged'].includes(rec.status)) continue;
 
-            // Cas simple : on connaît déjà l'exemplaire exact et il porte désormais $$$.
+            // Cas simple : on connaît déjà l'exemplaire exact et il porte désormais le tag vente.
             let hit = rec.userCardId
                 ? tagged.find(x => x.userCardId === rec.userCardId)
                 : null;
 
-            // Sinon on rattache un $$$ manuel de la même carte au flip en attente.
+            // Sinon on rattache un tag vente manuel de la même carte au flip en attente.
             if (!hit && rec.cardId) {
                 const target = Number(rec.boughtAt) || Date.now();
                 const pool = tagged
@@ -1045,7 +1168,7 @@
             activeUsed.add(hit.userCardId);
             if (changed) {
                 linked++;
-                wmLog(`🏷️ Tag <b>$$$</b> détecté${rec.title ? ` pour <b>${rec.title}</b>` : ''} · exemplaire ${String(hit.userCardId).slice(0, 8)}… → Flip Seller prêt.`);
+                wmLog(`🏷️ Tag <b>vente</b> détecté${rec.title ? ` pour <b>${rec.title}</b>` : ''} · exemplaire ${String(hit.userCardId).slice(0, 8)}… → Flip Seller prêt.`);
             }
         }
 
@@ -1056,7 +1179,7 @@
     async function removeFlipTagFromUserCard(userCardId) {
         if (!userCardId) return { ok: true, skipped: true };
         const tagId = await ensureFlipTagId().catch(() => null);
-        if (!tagId) return { ok: false, error: 'tag $$$ introuvable' };
+        if (!tagId) return { ok: false, error: 'tag vente introuvable' };
         const { token } = getSupabaseAccessToken();
         if (!token) return { ok: false, error: 'authentification manquante' };
         try {
@@ -1082,14 +1205,14 @@
         if (!rec) return false;
         const listedNote = rec.status === 'listed'
             ? '\n\n⚠ Cette carte est actuellement en vente : la suppression retire seulement le suivi Flip Seller et N’ANNULE PAS l’enchère.'
-            : '\n\nLe tag $$$ sera retiré de cet exemplaire si possible.';
+            : '\n\nLe tag vente sera retiré de cet exemplaire si possible.';
         if (!confirm(`Supprimer « ${rec.title || '?'} » du Flip Seller ?${listedNote}`)) return false;
 
-        // Si la carte est encore dans la collection, retirer $$$ évite de laisser un tag orphelin.
+        // Si la carte est encore dans la collection, retirer le tag vente évite de laisser un tag orphelin.
         if (rec.status !== 'listed' && rec.userCardId) {
             const untag = await removeFlipTagFromUserCard(rec.userCardId);
             if (!untag?.ok) {
-                wmLog(`⚠️ Flip Seller : ligne supprimée pour <b>${rec.title}</b>, mais retrait du tag $$$ échoué · ${htmlEsc(untag?.error || '?')}`);
+                wmLog(`⚠️ Flip Seller : ligne supprimée pour <b>${rec.title}</b>, mais retrait du tag vente échoué · ${htmlEsc(untag?.error || '?')}`);
             }
         }
 
@@ -1233,7 +1356,7 @@
                 continue;
             }
             // Enchère terminée sans acheteur : la carte revient, son ancien lien de tag peut
-            // avoir disparu avec la mise en vente. On la remet dans le circuit $$$.
+            // avoir disparu avec la mise en vente. On la remet dans le circuit vente.
             rec.status = 'pending_tag';
             rec.saleAuctionId = null;
             rec.userCardId = null;
@@ -1267,7 +1390,7 @@
         const stateLabel = r => {
             if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${Number(r.soldPrice || 0).toLocaleString('fr-FR')} · ${r.profit >= 0 ? '+' : ''}${Number(r.profit || 0).toLocaleString('fr-FR')} 💰</span>`;
             if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${Number(r.listPrice || 0).toLocaleString('fr-FR')} 💰</span>`;
-            if (r.status === 'tagged') return '<span style="color:#fbbf24;">$$$ prêt</span>';
+            if (r.status === 'tagged') return '<span style="color:#fbbf24;">vente prêt</span>';
             const err = r.lastError ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>` : '';
             return `<span style="color:#888;">tag en attente</span>${err}`;
         };
@@ -1309,7 +1432,7 @@
 
                 const taggedIds = await fetchFlipTaggedUserCardIds();
                 if (taggedIds == null) {
-                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag $$$ illisible — réessai dans 15s…</span>';
+                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag vente illisible — réessai dans 15s…</span>';
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -1327,7 +1450,7 @@
                 const maxActive = effectiveMaxActive(state.max);
                 const slots = Math.max(0, maxActive - state.count);
                 if (ready.length === 0) {
-                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun $$$ prêt · ${state.count}/${maxActive} ventes actives</span>`;
+                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives</span>`;
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -1385,9 +1508,14 @@
         await syncManualFlipTags().catch(() => 0);
 
         const diag = {
+            version: WM_VERSION,
             tagNom: FLIP_TAG_NAME,
             tagId: tagId || null,
-            tagsDollarEnBase: Array.isArray(rows) ? rows.length : null,
+            cacheTagValideDepuis: flipTagValidatedAt
+                ? new Date(flipTagValidatedAt).toLocaleString('fr-FR')
+                : null,
+            lectureTagSansJointure: Array.isArray(rows),
+            tagsVenteEnBase: Array.isArray(rows) ? rows.length : null,
             pendingTag: flipLedger.filter(r => r?.status === 'pending_tag').length,
             prets: flipLedger.filter(r => r?.status === 'tagged').length,
             enVente: flipLedger.filter(r => r?.status === 'listed').length,
@@ -1457,7 +1585,7 @@
 
         // Traite les victoires provenant d'une mise automatique AVANT le garde-fou
         // wonInitialized : ainsi un reload entre le dernier bid et le settlement n'empêche
-        // jamais le tag $$$ / l'enregistrement du prix d'achat.
+        // jamais le tag VENTE / l'enregistrement du prix d'achat.
         await processAutoFlipWins(won);
 
         // L'archive est alimentée à CHAQUE passage, y compris le premier : c'est justement
@@ -1968,6 +2096,20 @@
     // 500 est autorisé ; 499 et moins sont ignorés.
     const HUNTER_DYNAMIC_MIN_MEDIAN = 500;
 
+    // v2.3.9 : plafond dynamique plus conservateur. Le ratio reste configurable,
+    // mais le résultat est arrondi vers le BAS à la dizaine à partir de 100 Wbid.
+    // Exemple : médiane 942 × 75% = 706,5 → plafond réel 700.
+    function dynamicHunterCapFromMedian(median) {
+        const med = Number(median);
+        if (!Number.isFinite(med) || med <= 0) return 0;
+        const ratio = Number(getSetting('autoSnipeAdaptiveRatio'));
+        if (!Number.isFinite(ratio) || ratio <= 0) return 0;
+        const raw = med * ratio;
+        return raw >= 100
+            ? Math.max(10, Math.floor(raw / 10) * 10)
+            : Math.max(1, Math.floor(raw));
+    }
+
     // Une enchère déjà armée par le Hunter dynamique peut survivre à un F5.
     // On réapplique donc aussi le filtre de médiane lors des RIPOSTES, pas seulement
     // lors de la première mise. Les auto-bids manuels / prioritaires / ciblés ne sont
@@ -1986,7 +2128,16 @@
 
         if (entry && entry.count >= 3 && Number(entry.median) >= HUNTER_DYNAMIC_MIN_MEDIAN) {
             dynamicMedianBlockLogged.delete(auction.id);
-            return true;
+
+            // Une enchère Hunter dynamique peut avoir été armée avant une baisse du ratio
+            // (ou survivre à un F5). On rabaisse son ancien plafond immédiatement, sans
+            // jamais le remonter automatiquement si l'utilisateur avait choisi plus bas.
+            const freshCap = dynamicHunterCapFromMedian(entry.median);
+            const oldCap = getAutoBidMax(auction.id);
+            if (freshCap > 0 && (oldCap == null || oldCap > freshCap)) {
+                setAutoBidMax(auction.id, freshCap);
+            }
+            return freshCap > 0;
         }
 
         // Coupe uniquement la poursuite automatique. On garde autoFlipCandidates :
@@ -2044,19 +2195,19 @@
             }
 
             const ratio = getSetting('autoSnipeAdaptiveRatio');
-            const threshold = Math.floor(entry.median * ratio);
+            const threshold = dynamicHunterCapFromMedian(entry.median);
 
             if (currentBid <= threshold) {
                 return {
                     snipe: true,
-                    reason: `≤ ${Math.round(ratio * 100)}% méd. (${entry.median})`,
+                    reason: `≤ ${Math.round(ratio * 100)}% méd. (${entry.median}) · plafond ${threshold}`,
                     cap: threshold
                 };
             }
 
             return {
                 snipe: false,
-                reason: `> ${Math.round(ratio * 100)}% méd. (${entry.median})`,
+                reason: `> ${Math.round(ratio * 100)}% méd. (${entry.median}) · plafond ${threshold}`,
                 cap: threshold
             };
         }
@@ -2179,7 +2330,7 @@
         logAutobid: true,
         autoSnipePrice: 100,
         autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = sous la médiane marché
-        autoSnipeAdaptiveRatio: 0.85,     // en mode adaptatif : snipe si prix <= ratio × médiane
+        autoSnipeAdaptiveRatio: 0.75,     // v2.3.9 : plafond Hunter dynamique plus conservateur
         minBalanceForAutoSnipe: 2000,
         autoRetagEnabled: true,
         sellTagName: 'Trash',
@@ -2244,6 +2395,16 @@
             localStorage.setItem(storageKey, String(value));
         }
     }
+
+    // v2.3.9 : l'ancien défaut était 85%, trop agressif. On migre uniquement
+    // les comptes encore sur cet ancien défaut ; un réglage personnalisé différent est conservé.
+    try {
+        const k = SETTINGS_KEYS.autoSnipeAdaptiveRatio;
+        const raw = localStorage.getItem(k);
+        if (raw === null || Math.abs(Number(raw) - 0.85) < 1e-9) {
+            localStorage.setItem(k, '0.75');
+        }
+    } catch (e) { }
 
     // Migration : purge des clés devenues obsolètes (anciennes versions du script)
     try {
@@ -10969,7 +11130,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>$$$</b>. Chaque ligne affiche la médiane marché live et peut être retirée manuellement avec ×.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>vente</b>. Chaque ligne affiche la médiane marché live et peut être retirée manuellement avec ×.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;max-height:300px;overflow-y:auto;padding-right:2px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -11117,7 +11278,7 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique (mise si prix sous la médiane des ventes passées)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la médiane en-dessous duquel sniper (ex. 85 = mise si prix ≤ 85% de la médiane). Si aucune vente connue, le seuil fixe ci-dessus sert de filet.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la médiane servant de plafond d’achat (ex. 75 = plafond à 75% de la médiane, arrondi vers le bas à la dizaine). Avec médiane 942 → plafond 700. Si aucune vente connue, aucune mise dynamique n’est faite.</div>
                     <input id="wm-set-autosnipe-ratio" type="number" min="1" max="200" step="5" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -11577,7 +11738,7 @@
             startTrashSeller();
         }
 
-        /* ════════ FLIP SELLER ($$$) ════════ */
+        /* ════════ FLIP SELLER (vente) ════════ */
         const flipBtn = document.getElementById('wm-flip-btn');
         const flipStatus = document.getElementById('wm-flip-status');
         const flipMarkup = document.getElementById('wm-flip-markup');
@@ -11635,7 +11796,7 @@
             if (sessionStorage.getItem('wm_flipseller_active')) startFlipSeller();
         }
         renderFlipHistory();
-        // Retente régulièrement les tags $$$ même si le Flip Seller n'est pas lancé : le but
+        // Retente régulièrement les tags vente même si le Flip Seller n'est pas lancé : le but
         // est que la carte soit marquée dès la victoire, pas seulement au prochain START.
         setInterval(() => {
             syncManualFlipTags().catch(() => { });
@@ -11755,7 +11916,7 @@
         // Ratio adaptatif
         autoSnipeRatioInput.onchange = () => {
             let pct = parseInt(autoSnipeRatioInput.value, 10);
-            if (!Number.isFinite(pct) || pct < 1) pct = 85;
+            if (!Number.isFinite(pct) || pct < 1) pct = 75;
             if (pct > 200) pct = 200;
             autoSnipeRatioInput.value = pct;
             setSetting('autoSnipeAdaptiveRatio', pct / 100);
