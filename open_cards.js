@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.3.6';
+    const WM_VERSION = '2.3.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -431,7 +431,7 @@
         return true;
     }
 
-    /* ══════════ AUTO-ACHAT → VENTE → FLIP SELLER (v2.3) ══════════
+    /* ══════════ AUTO-ACHAT → $$$ → FLIP SELLER (v2.3) ══════════
        Un achat est considéré « auto » uniquement si LE BOT a réellement envoyé au moins
        une mise automatique gagnante sur cette enchère (Hunter, prioritaire, Fourbe ou
        riposte auto-bid). Le suivi est persisté : un F5 entre la mise et la victoire ne perd
@@ -440,14 +440,14 @@
        À la victoire :
        1) archive le vrai final_price (= prix d'achat),
        2) retrouve l'exemplaire user_card_id reçu,
-       3) crée/pose l'étiquette VENTE,
+       3) crée/pose l'étiquette $$$,
        4) le Flip Seller peut le revendre ensuite par user_card_id exact.
 
        Le prix de revente est prudent : plancher = prix d'achat + marge brute configurée ;
        si une médiane locale/officielle fiable (>=3 ventes) est supérieure, on vise la médiane.
        L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
        plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
-    const FLIP_TAG_NAME = 'VENTE';
+    const FLIP_TAG_NAME = '$$$';
     const AUTO_FLIP_CANDIDATES_KEY = 'wm_auto_flip_candidates_v1';
     const FLIP_LEDGER_KEY = 'wm_flip_ledger_v1';
     const FLIP_MARKUP_KEY = 'wm_flip_markup_pct';
@@ -608,7 +608,7 @@
         return FLIP_TAG_ID;
     }
 
-    // Recherche le tag VENTE exactement comme le Trash Seller : d'abord dans les tags du compte,
+    // Recherche le tag $$$ exactement comme le Trash Seller : d'abord dans les tags du compte,
     // puis en requête directe par user_id, puis (sous RLS) par nom seul. `force=true` invalide
     // le cache : utile si le tag a été supprimé/recréé ou créé manuellement après le chargement.
     async function discoverFlipTagId(force = false) {
@@ -736,7 +736,7 @@
             if (exact) return exact;
         }
 
-        // Un VENTE manuel est une preuve explicite : on peut l'accepter même si l'horodatage
+        // Un $$$ manuel est une preuve explicite : on peut l'accepter même si l'horodatage
         // d'acquisition est ancien/incomplet.
         const manuallyTagged = normalized
             .filter(r => r._alreadyFlip && (!used.has(r.id) || r.id === rec?.userCardId))
@@ -814,7 +814,7 @@
         }
 
         // 3) Fallback API collection. On accepte card_id OU titre, mais toujours avec une preuve
-        // temporelle proche de l'achat (ou un VENTE déjà présent).
+        // temporelle proche de l'achat (ou un $$$ déjà présent).
         try {
             const targetTs = Number(rec.boughtAt) || Date.now();
             const used = new Set(
@@ -882,7 +882,7 @@
         if (!flipLedger.includes(rec)) return false;
         if (!tagId) {
             rec.status = 'pending_tag';
-            rec.lastError = 'tag VENTE introuvable/création impossible';
+            rec.lastError = 'tag $$$ introuvable/création impossible';
             scheduleNextFlipTagRetry(rec);
             saveFlipLedger();
             return false;
@@ -925,7 +925,7 @@
         rec.lastError = null;
         rec.nextTagRetryAt = 0;
         saveFlipLedger();
-        wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>VENTE</b> posé.`);
+        wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>$$$</b> posé.`);
         return true;
     }
 
@@ -968,7 +968,7 @@
             `user_card_tags?tag_id=eq.${tagId}&select=user_card_id,user_cards(id,card_id,created_at)&limit=2000`
         );
 
-        // Si on a un ancien id de tag en cache mais qu'un VENTE a été recréé manuellement,
+        // Si on a un ancien id de tag en cache mais qu'un $$$ a été recréé manuellement,
         // une lecture vide peut être trompeuse. Avec des flips en attente, on redécouvre une fois.
         if (Array.isArray(rows) && rows.length === 0 && !forceRediscover
             && flipLedger.some(r => r && r.status === 'pending_tag')) {
@@ -990,7 +990,7 @@
         return new Set(rows.map(r => r?.user_card_id).filter(Boolean));
     }
 
-    // Fait le lien entre un tag VENTE posé MANUELLEMENT dans WikiMasters et le registre des
+    // Fait le lien entre un tag $$$ posé MANUELLEMENT dans WikiMasters et le registre des
     // auto-achats. Avant v2.3.4, le seller exigeait status='tagged' dans le ledger et ignorait
     // donc un tag manuel pourtant bien présent en base.
     async function syncManualFlipTags() {
@@ -1016,12 +1016,12 @@
         for (const rec of flipLedger) {
             if (!rec || !['pending_tag', 'tagged'].includes(rec.status)) continue;
 
-            // Cas simple : on connaît déjà l'exemplaire exact et il porte désormais VENTE.
+            // Cas simple : on connaît déjà l'exemplaire exact et il porte désormais $$$.
             let hit = rec.userCardId
                 ? tagged.find(x => x.userCardId === rec.userCardId)
                 : null;
 
-            // Sinon on rattache un VENTE manuel de la même carte au flip en attente.
+            // Sinon on rattache un $$$ manuel de la même carte au flip en attente.
             if (!hit && rec.cardId) {
                 const target = Number(rec.boughtAt) || Date.now();
                 const pool = tagged
@@ -1045,7 +1045,7 @@
             activeUsed.add(hit.userCardId);
             if (changed) {
                 linked++;
-                wmLog(`🏷️ Tag <b>VENTE</b> détecté${rec.title ? ` pour <b>${rec.title}</b>` : ''} · exemplaire ${String(hit.userCardId).slice(0, 8)}… → Flip Seller prêt.`);
+                wmLog(`🏷️ Tag <b>$$$</b> détecté${rec.title ? ` pour <b>${rec.title}</b>` : ''} · exemplaire ${String(hit.userCardId).slice(0, 8)}… → Flip Seller prêt.`);
             }
         }
 
@@ -1056,7 +1056,7 @@
     async function removeFlipTagFromUserCard(userCardId) {
         if (!userCardId) return { ok: true, skipped: true };
         const tagId = await ensureFlipTagId().catch(() => null);
-        if (!tagId) return { ok: false, error: 'tag VENTE introuvable' };
+        if (!tagId) return { ok: false, error: 'tag $$$ introuvable' };
         const { token } = getSupabaseAccessToken();
         if (!token) return { ok: false, error: 'authentification manquante' };
         try {
@@ -1082,14 +1082,14 @@
         if (!rec) return false;
         const listedNote = rec.status === 'listed'
             ? '\n\n⚠ Cette carte est actuellement en vente : la suppression retire seulement le suivi Flip Seller et N’ANNULE PAS l’enchère.'
-            : '\n\nLe tag VENTE sera retiré de cet exemplaire si possible.';
+            : '\n\nLe tag $$$ sera retiré de cet exemplaire si possible.';
         if (!confirm(`Supprimer « ${rec.title || '?'} » du Flip Seller ?${listedNote}`)) return false;
 
-        // Si la carte est encore dans la collection, retirer VENTE évite de laisser un tag orphelin.
+        // Si la carte est encore dans la collection, retirer $$$ évite de laisser un tag orphelin.
         if (rec.status !== 'listed' && rec.userCardId) {
             const untag = await removeFlipTagFromUserCard(rec.userCardId);
             if (!untag?.ok) {
-                wmLog(`⚠️ Flip Seller : ligne supprimée pour <b>${rec.title}</b>, mais retrait du tag VENTE échoué · ${htmlEsc(untag?.error || '?')}`);
+                wmLog(`⚠️ Flip Seller : ligne supprimée pour <b>${rec.title}</b>, mais retrait du tag $$$ échoué · ${htmlEsc(untag?.error || '?')}`);
             }
         }
 
@@ -1233,7 +1233,7 @@
                 continue;
             }
             // Enchère terminée sans acheteur : la carte revient, son ancien lien de tag peut
-            // avoir disparu avec la mise en vente. On la remet dans le circuit VENTE.
+            // avoir disparu avec la mise en vente. On la remet dans le circuit $$$.
             rec.status = 'pending_tag';
             rec.saleAuctionId = null;
             rec.userCardId = null;
@@ -1267,7 +1267,7 @@
         const stateLabel = r => {
             if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${Number(r.soldPrice || 0).toLocaleString('fr-FR')} · ${r.profit >= 0 ? '+' : ''}${Number(r.profit || 0).toLocaleString('fr-FR')} 💰</span>`;
             if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${Number(r.listPrice || 0).toLocaleString('fr-FR')} 💰</span>`;
-            if (r.status === 'tagged') return '<span style="color:#fbbf24;">VENTE prêt</span>';
+            if (r.status === 'tagged') return '<span style="color:#fbbf24;">$$$ prêt</span>';
             const err = r.lastError ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>` : '';
             return `<span style="color:#888;">tag en attente</span>${err}`;
         };
@@ -1309,7 +1309,7 @@
 
                 const taggedIds = await fetchFlipTaggedUserCardIds();
                 if (taggedIds == null) {
-                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag VENTE illisible — réessai dans 15s…</span>';
+                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag $$$ illisible — réessai dans 15s…</span>';
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -1327,7 +1327,7 @@
                 const maxActive = effectiveMaxActive(state.max);
                 const slots = Math.max(0, maxActive - state.count);
                 if (ready.length === 0) {
-                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun VENTE prêt · ${state.count}/${maxActive} ventes actives</span>`;
+                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun $$$ prêt · ${state.count}/${maxActive} ventes actives</span>`;
                     await new Promise(r => setTimeout(r, 15000));
                     continue;
                 }
@@ -1457,7 +1457,7 @@
 
         // Traite les victoires provenant d'une mise automatique AVANT le garde-fou
         // wonInitialized : ainsi un reload entre le dernier bid et le settlement n'empêche
-        // jamais le tag VENTE / l'enregistrement du prix d'achat.
+        // jamais le tag $$$ / l'enregistrement du prix d'achat.
         await processAutoFlipWins(won);
 
         // L'archive est alimentée à CHAQUE passage, y compris le premier : c'est justement
@@ -10969,7 +10969,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>VENTE</b>. Chaque ligne affiche la médiane marché live et peut être retirée manuellement avec ×.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>$$$</b>. Chaque ligne affiche la médiane marché live et peut être retirée manuellement avec ×.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;max-height:300px;overflow-y:auto;padding-right:2px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -11577,7 +11577,7 @@
             startTrashSeller();
         }
 
-        /* ════════ FLIP SELLER (VENTE) ════════ */
+        /* ════════ FLIP SELLER ($$$) ════════ */
         const flipBtn = document.getElementById('wm-flip-btn');
         const flipStatus = document.getElementById('wm-flip-status');
         const flipMarkup = document.getElementById('wm-flip-markup');
@@ -11635,7 +11635,7 @@
             if (sessionStorage.getItem('wm_flipseller_active')) startFlipSeller();
         }
         renderFlipHistory();
-        // Retente régulièrement les tags VENTE même si le Flip Seller n'est pas lancé : le but
+        // Retente régulièrement les tags $$$ même si le Flip Seller n'est pas lancé : le but
         // est que la carte soit marquée dès la victoire, pas seulement au prochain START.
         setInterval(() => {
             syncManualFlipTags().catch(() => { });
