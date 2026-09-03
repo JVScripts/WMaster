@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.4';
+    const WM_VERSION = '2.6.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -478,6 +478,30 @@
     let flipSellerRunning = false;
     let flipSellerBusy = false;
 
+    // v2.6.5 : une nouvelle victoire Flip ne doit pas attendre la fin d'un sleep de
+    // 10/15 secondes du seller. Une seule boucle seller existe, donc un wake resolver suffit.
+    let flipSellerWakeResolver = null;
+
+    function flipSellerSleep(ms) {
+        return new Promise(resolve => {
+            let done = false;
+            const finish = () => {
+                if (done) return;
+                done = true;
+                if (flipSellerWakeResolver === finish) flipSellerWakeResolver = null;
+                clearTimeout(timer);
+                resolve();
+            };
+            const timer = setTimeout(finish, ms);
+            flipSellerWakeResolver = finish;
+        });
+    }
+
+    function wakeFlipSeller() {
+        const wake = flipSellerWakeResolver;
+        if (wake) wake();
+    }
+
     function getFlipMarkupPct() {
         const n = Number(localStorage.getItem(FLIP_MARKUP_KEY));
         return Number.isFinite(n) && n >= 0 ? Math.min(500, n) : 20;
@@ -851,8 +875,18 @@
             rec.purchaseRarity = rec.purchaseRarity || rec.rarity || (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase();
         }
         saveFlipLedger();
+
+        wmLog(
+            `💾 Victoire auto enregistrée dans Flip Seller : <b>${rec.title}</b> ` +
+            `[${rec.rarity || '?'}] · achat <b>${Number(rec.buyPrice || 0).toLocaleString('fr-FR')} 💰</b> ` +
+            `· état <b>${rec.status}</b>.`
+        );
+
+        // Si le seller dort en attendant une carte prête, on le réveille immédiatement.
+        wakeFlipSeller();
         return rec;
     }
+
 
     function rememberFlipTagId(id) {
         FLIP_TAG_ID = id || null;
@@ -1769,21 +1803,186 @@
         return true;
     }
 
+
+    let autoFlipWinReconcilePromise = null;
+    let lastAutoFlipCandidatePollAt = 0;
+
+    function sameUserId(a, b) {
+        return !!a && !!b && String(a) === String(b);
+    }
+
+    async function fetchAutoFlipCandidateRows() {
+        const ids = [...autoFlipCandidates.keys()].filter(Boolean);
+        if (ids.length === 0) return new Map();
+
+        const merged = new Map();
+
+        // URL PostgREST bornée : groupes de 40 ids plutôt qu'un énorme id=in.(...).
+        for (let i = 0; i < ids.length; i += 40) {
+            const part = ids.slice(i, i + 40);
+            const rows = await fetchAuctionsByIds(part);
+            if (!(rows instanceof Map)) continue;
+            for (const [id, row] of rows) merged.set(id, row);
+        }
+
+        return merged;
+    }
+
+    /* Source de vérité du Flip automatique :
+       - on part des auction_id sur lesquelles WMaster a réellement envoyé une mise auto
+         (autoFlipCandidates, persisté immédiatement après le POST accepté),
+       - puis on relit CES IDs exactement dans auctions.
+       Ainsi le Flip ne dépend plus de /mine, de sa pagination, de la liste générale des wins,
+       ni du panneau "Ventes actives". */
+    async function reconcileAutoFlipCandidatesById() {
+        if (autoFlipCandidates.size === 0) return { wins: 0, losses: 0, pending: 0 };
+
+        if (autoFlipWinReconcilePromise) return await autoFlipWinReconcilePromise;
+
+        autoFlipWinReconcilePromise = (async () => {
+            const uid = currentUserId();
+            if (!uid) return { wins: 0, losses: 0, pending: autoFlipCandidates.size };
+
+            const rows = await fetchAutoFlipCandidateRows();
+            let wins = 0;
+            let losses = 0;
+            let pending = 0;
+            let changedCandidates = false;
+
+            for (const [auctionId, candidate] of [...autoFlipCandidates.entries()]) {
+                const row = rows.get(auctionId);
+
+                // Une lecture manquante/RLS n'est JAMAIS interprétée comme une perte.
+                if (!row) {
+                    pending++;
+                    continue;
+                }
+
+                const winnerId = row.winner_id || null;
+                const finalPrice = Number(row.final_price);
+                const endTs = new Date(row.end_at || NaN).getTime();
+                const ended = Number.isFinite(endTs) && endTs <= Date.now();
+                const status = String(row.status || '').toLowerCase();
+                const terminalStatus =
+                    /settled|sold|completed|finished|ended|closed|expired|cancel/.test(status);
+
+                if (sameUserId(winnerId, uid)) {
+                    // Attendre final_price si le settlement est encore en propagation.
+                    if (!Number.isFinite(finalPrice) || finalPrice <= 0) {
+                        pending++;
+                        continue;
+                    }
+
+                    const syntheticWin = {
+                        ...row,
+                        id: auctionId,
+                        card_id: row.card_id || candidate?.cardId || null,
+                        snapshot_rarity: row.snapshot_rarity || candidate?.rarity || '',
+                        card: {
+                            id: row.card_id || candidate?.cardId || null,
+                            wikipedia_title: candidate?.title || '?',
+                            rarity: row.snapshot_rarity || candidate?.rarity || ''
+                        }
+                    };
+
+                    const rec = upsertFlipWin(syntheticWin, candidate);
+
+                    // On tente immédiatement le tag, mais le ledger existe AVANT ce réseau.
+                    await tagFlipRecord(rec).catch(() => false);
+
+                    autoFlipCandidates.delete(auctionId);
+                    changedCandidates = true;
+                    wins++;
+
+                    wakeFlipSeller();
+                    continue;
+                }
+
+                // Un autre gagnant est écrit : cette enchère auto est définitivement perdue.
+                if (winnerId && !sameUserId(winnerId, uid)) {
+                    autoFlipCandidates.delete(auctionId);
+                    changedCandidates = true;
+                    losses++;
+                    continue;
+                }
+
+                // Enchère terminée sans winner après une marge de propagation : pas un Flip.
+                if ((ended || terminalStatus) && !winnerId) {
+                    const graceBase = Number.isFinite(endTs) ? endTs : Number(candidate?.updatedAt || 0);
+                    if (Date.now() - graceBase > 60_000) {
+                        autoFlipCandidates.delete(auctionId);
+                        changedCandidates = true;
+                        losses++;
+                        continue;
+                    }
+                }
+
+                pending++;
+            }
+
+            if (changedCandidates) saveAutoFlipCandidates();
+            return { wins, losses, pending };
+        })();
+
+        try {
+            return await autoFlipWinReconcilePromise;
+        } finally {
+            autoFlipWinReconcilePromise = null;
+        }
+    }
+
     async function processAutoFlipWins(won) {
-        if (!Array.isArray(won) || autoFlipCandidates.size === 0) return;
+        if (!Array.isArray(won) || won.length === 0 || autoFlipCandidates.size === 0) return 0;
+
         let changedCandidates = false;
+        let processed = 0;
+
         for (const w of won) {
             if (!w?.id) continue;
             const candidate = autoFlipCandidates.get(w.id);
             if (!candidate) continue;
+
+            const uid = currentUserId();
+            if (uid && w.winner_id && !sameUserId(w.winner_id, uid)) continue;
+
+            const finalPrice = Number(w.final_price);
+            if (!Number.isFinite(finalPrice) || finalPrice <= 0) continue;
+
             const rec = upsertFlipWin(w, candidate);
-            // En cas de propagation lente, le record reste pending_tag et sera retenté par le seller/sync.
+
+            // En cas de propagation lente de /my-collection, le record reste pending_tag,
+            // mais il est DÉJÀ durablement visible dans le Flip Seller.
             await tagFlipRecord(rec).catch(() => false);
+
             autoFlipCandidates.delete(w.id);
             changedCandidates = true;
+            processed++;
+            wakeFlipSeller();
         }
+
         if (changedCandidates) saveAutoFlipCandidates();
+        return processed;
     }
+
+
+    // Tant qu'une mise automatique n'a pas encore été résolue gagnée/perdue,
+    // on relit ses auction_id toutes les 15 s. Une perte est purgée, une victoire entre
+    // immédiatement dans flipLedger. Aucun /mine n'est appelé ici.
+    setInterval(() => {
+        if (autoFlipCandidates.size === 0) return;
+        if (!navigator.onLine) return;
+        if (Date.now() - lastAutoFlipCandidatePollAt < 12_000) return;
+
+        lastAutoFlipCandidatePollAt = Date.now();
+        reconcileAutoFlipCandidatesById()
+            .then(result => {
+                if (result?.wins > 0) {
+                    retryPendingFlipTags().catch(() => { });
+                    wakeFlipSeller();
+                }
+            })
+            .catch(() => { });
+    }, 15_000);
 
     async function retryPendingFlipTags() {
         await deepResolvePendingFlipRecords(false).catch(() => 0);
@@ -3007,7 +3206,7 @@
                 let taggedIds = await fetchFlipTaggedUserCardIds();
                 if (taggedIds == null) {
                     if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag vente illisible — réessai dans 15s…</span>';
-                    await new Promise(r => setTimeout(r, 15000));
+                    await flipSellerSleep(15000);
                     continue;
                 }
 
@@ -3017,7 +3216,7 @@
                 if (repairedMissing > 0) {
                     taggedIds = await fetchFlipTaggedUserCardIds();
                     if (taggedIds == null) {
-                        await new Promise(r => setTimeout(r, 5000));
+                        await flipSellerSleep(5000);
                         continue;
                     }
                 }
@@ -3029,7 +3228,7 @@
                 const state = await fetchSellingState();
                 if (!state) {
                     if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>';
-                    await new Promise(r => setTimeout(r, 15000));
+                    await flipSellerSleep(15000);
                     continue;
                 }
                 const maxActive = effectiveMaxActive(state.max);
@@ -3037,12 +3236,12 @@
                 const slotSource = state.countSource === 'db' ? 'base' : '/mine';
                 if (ready.length === 0) {
                     if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
-                    await new Promise(r => setTimeout(r, 15000));
+                    await flipSellerSleep(15000);
                     continue;
                 }
                 if (slots === 0) {
                     if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
-                    await new Promise(r => setTimeout(r, 15000));
+                    await flipSellerSleep(15000);
                     continue;
                 }
 
@@ -3067,7 +3266,7 @@
                 // Si des flips sont encore prêts, on ne dort pas 10 s inutilement :
                 // on recalcule immédiatement les slots avec l'état frais.
                 const stillReady = flipLedger.some(r => r && r.status === 'tagged' && r.userCardId);
-                await new Promise(r => setTimeout(r, stillReady ? 1500 : 10000));
+                await flipSellerSleep(stillReady ? 1500 : 10000);
             }
         } finally {
             flipSellerBusy = false;
@@ -3087,6 +3286,55 @@
             isPro: data?.isPro ?? null
         };
         console.log('[WikiMasters][summary]', result);
+        return result;
+    };
+
+    window.wmFlipWinDiag = async function () {
+        const uid = currentUserId();
+        const candidatesBefore = [...autoFlipCandidates.values()].map(c => ({
+            auctionId: c.auctionId,
+            carte: c.title,
+            rarete: c.rarity,
+            source: c.source,
+            derniereMiseAuto: c.lastAutoBid,
+            ageSec: Math.round((Date.now() - Number(c.updatedAt || c.firstBidAt || Date.now())) / 1000)
+        }));
+
+        const reconcile = await reconcileAutoFlipCandidatesById().catch(e => ({
+            error: e?.message || String(e)
+        }));
+
+        const won = await fetchWonFromDb(30).catch(() => null);
+        const candidateIds = new Set(candidatesBefore.map(c => c.auctionId));
+
+        const result = {
+            version: WM_VERSION,
+            userId: uid,
+            candidatsAvant: candidatesBefore.length,
+            reconciliation: reconcile,
+            candidatsApres: autoFlipCandidates.size,
+            ledger: flipLedger.length,
+            pendingTag: flipLedger.filter(r => r?.status === 'pending_tag').length,
+            prets: flipLedger.filter(r => r?.status === 'tagged').length,
+            enVente: flipLedger.filter(r => r?.status === 'listed').length,
+            winsDbRecents: Array.isArray(won) ? won.length : null,
+            winsDbCorrespondantAuxCandidats: Array.isArray(won)
+                ? won.filter(w => candidateIds.has(w?.id)).length
+                : null
+        };
+
+        console.log('[WikiMasters][FlipWinDiag]', result);
+        console.table(candidatesBefore);
+        if (Array.isArray(won)) {
+            console.table(won.slice(0, 15).map(w => ({
+                auctionId: w.id,
+                winnerId: w.winner_id,
+                finalPrice: w.final_price,
+                titre: w.card?.wikipedia_title || '?',
+                rarete: w.snapshot_rarity || w.card?.rarity || ''
+            })));
+        }
+        renderFlipHistory();
         return result;
     };
 
@@ -3433,76 +3681,109 @@
 
     // Récupère les enchères gagnées et crédite les nouveaux achats à la session courante.
     // `preFetched` : réponse /mine déjà en main (évite une requête de plus).
+    let syncWonAuctionsPromise = null;
+
     async function syncWonAuctions(preFetched) {
-        const data = preFetched || await fetchMine();
-        if (!data) return;
-        // /mine ne porte plus `won` : on lit les enchères gagnées en base. La branche historique
-        // est conservée au cas où le champ réapparaîtrait.
-        let won = Array.isArray(data?.won) ? data.won : null;
-        if (!won) won = await fetchWonFromDb(100);
-        if (!Array.isArray(won)) return;
+        if (syncWonAuctionsPromise) return await syncWonAuctionsPromise;
 
-        // Traite les victoires provenant d'une mise automatique AVANT le garde-fou
-        // wonInitialized : ainsi un reload entre le dernier bid et le settlement n'empêche
-        // jamais le tag VENTE / l'enregistrement du prix d'achat.
-        await processAutoFlipWins(won);
+        syncWonAuctionsPromise = (async () => {
+            // 1) PRIORITÉ ABSOLUE : réconciliation exacte des mises automatiques.
+            // Ne dépend ni de /mine ni du panneau de ventes actives.
+            await reconcileAutoFlipCandidatesById().catch(() => null);
 
-        // L'archive est alimentée à CHAQUE passage, y compris le premier : c'est justement
-        // lui qui capture la fenêtre serveur existante et amorce l'historique long.
-        let archived = 0;
-        won.forEach(w => { if (recordPurchase(w)) archived++; });
-        if (archived > 0) saveBuyHistory();
+            // 2) Historique général des achats gagnés : DB en source principale.
+            // /mine ne porte plus `won` sur le site actuel et peut répondre 404/429 ;
+            // son échec ne doit PLUS interrompre les Flips ni les métriques.
+            let won = await fetchWonFromDb(200);
 
-        // Premier passage de la session : on mémorise les achats déjà existants sans les
-        // compter (ils datent d'avant — ils ne doivent pas gonfler la session courante).
-        if (!wonInitialized) {
-            won.forEach(w => { if (w?.id) wonSeenIds.add(w.id); });
-            wonInitialized = true;
-            saveWonSeen();
-            return;
-        }
-
-        // Passages suivants : tout achat dont l'ID est nouveau = gagné pendant la session
-        let credited = 0;
-        const newWins = [];
-        won.forEach(w => {
-            if (!w?.id || wonSeenIds.has(w.id)) return;
-            wonSeenIds.add(w.id);
-            const price = w.final_price ?? w.current_bid ?? 0;
-            sessionMetrics.bidsWon++;
-            sessionMetrics.bidsSpent += price;
-            credited++;
-            saveSessionMetrics();
-            finalizeSession(); // persiste immédiatement, sans attendre la fermeture de l'onglet
-            const title = w.card?.wikipedia_title || '?';
-            const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
-            newWins.push({ title, rar, price });
-            wmLog(`🏆 Enchère gagnée : <b>${title}</b> [${rar}] → <span style="color:#ef4444;">${price} 💰</span>`);
-
-            // Chasseur ciblé — auto-pause : cette enchère avait été armée par une chasse avec
-            // `autoDisable` actif et vient d'être gagnée → on la met en pause toute seule.
-            // On retire l'entrée de la map dans tous les cas (gagnée ou pas, elle est conclue).
-            const hunterText = hunterAutoDisableMap.get(w.id);
-            if (hunterText) {
-                hunterAutoDisableMap.delete(w.id);
-                saveHunterAutoDisableMap();
-                const hEntry = KEYWORDS_HUNTER.find(x => x.text === hunterText);
-                if (hEntry && hEntry.enabled !== false) {
-                    hEntry.enabled = false;
-                    saveHunterKeywords();
-                    renderKeywordsPanel(); // no-op si le panneau n'est pas affiché
-                    wmLog(`🎯 Chasseur mis en pause automatiquement (obtenue) : <b style="color:#5dade2;">${hunterText}</b>`);
-                }
+            // Fallback legacy uniquement si la DB/RLS est momentanément indisponible.
+            let data = preFetched || null;
+            if (!Array.isArray(won)) {
+                if (!data) data = await fetchMine();
+                won = Array.isArray(data?.won) ? data.won : null;
             }
-        });
-        if (credited > 0) {
-            saveWonSeen();
-            if (typeof updateBidsSumDisplay === 'function') updateBidsSumDisplay();
-            // Feedback dédié « enchère gagnée » : son + badge + Discord (groupé).
-            playSound('won');
-            if (window.wmNotify) window.wmNotify(credited);
-            const lines = newWins.map(w => `• **${w.title}** [${w.rar}] — ${w.price} 💰`).join('\n');
-            sendToDiscord(`🏆 **${credited} enchère(s) gagnée(s)**\n${lines}`, 16766720, 'market');
+
+            if (!Array.isArray(won)) return null;
+
+            // Filet supplémentaire : si une victoire auto est présente dans la liste générale,
+            // on la traite également. L'upsert est idempotent via auctionId.
+            await processAutoFlipWins(won);
+
+            let archived = 0;
+            won.forEach(w => { if (recordPurchase(w)) archived++; });
+            if (archived > 0) saveBuyHistory();
+
+            if (!wonInitialized) {
+                won.forEach(w => { if (w?.id) wonSeenIds.add(w.id); });
+                wonInitialized = true;
+                saveWonSeen();
+                return won;
+            }
+
+            let credited = 0;
+            const newWins = [];
+
+            won.forEach(w => {
+                if (!w?.id || wonSeenIds.has(w.id)) return;
+
+                wonSeenIds.add(w.id);
+                const price = w.final_price ?? w.current_bid ?? 0;
+                sessionMetrics.bidsWon++;
+                sessionMetrics.bidsSpent += price;
+                credited++;
+                saveSessionMetrics();
+                finalizeSession();
+
+                const title = w.card?.wikipedia_title || '?';
+                const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
+                newWins.push({ title, rar, price });
+
+                wmLog(
+                    `🏆 Enchère gagnée : <b>${title}</b> [${rar}] → ` +
+                    `<span style="color:#ef4444;">${price} 💰</span>`
+                );
+
+                const hunterText = hunterAutoDisableMap.get(w.id);
+                if (hunterText) {
+                    hunterAutoDisableMap.delete(w.id);
+                    saveHunterAutoDisableMap();
+                    const hEntry = KEYWORDS_HUNTER.find(x => x.text === hunterText);
+                    if (hEntry && hEntry.enabled !== false) {
+                        hEntry.enabled = false;
+                        saveHunterKeywords();
+                        renderKeywordsPanel();
+                        wmLog(
+                            `🎯 Chasseur mis en pause automatiquement (obtenue) : ` +
+                            `<b style="color:#5dade2;">${hunterText}</b>`
+                        );
+                    }
+                }
+            });
+
+            if (credited > 0) {
+                saveWonSeen();
+                playSound('won');
+
+                if (window.wmNotify) window.wmNotify(credited);
+
+                const lines = newWins.map(x =>
+                    `- **${x.title}** [${x.rar}] → **${x.price} 💰**`
+                ).join('\\n');
+
+                sendToDiscord(
+                    `🏆 ${credited} enchère${credited > 1 ? 's' : ''} gagnée${credited > 1 ? 's' : ''}\\n\\n${lines}`,
+                    15844367,
+                    'market'
+                );
+            }
+
+            return won;
+        })();
+
+        try {
+            return await syncWonAuctionsPromise;
+        } finally {
+            syncWonAuctionsPromise = null;
         }
     }
 
@@ -14787,6 +15068,14 @@
         // Retente régulièrement les tags vente même si le Flip Seller n'est pas lancé : le but
         // est que la carte soit marquée dès la victoire, pas seulement au prochain START.
         setInterval(() => {
+            // Victoires auto d'abord : une nouvelle ligne Flip doit exister avant les retries/tag/list.
+            if (autoFlipCandidates.size > 0) {
+                reconcileAutoFlipCandidatesById()
+                    .then(result => {
+                        if (result?.wins > 0) wakeFlipSeller();
+                    })
+                    .catch(() => { });
+            }
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
             syncFlipSaleResults().catch(() => { });
@@ -16529,13 +16818,16 @@
         // Porte AUSSI la synchro des enchères gagnées, pour ne pas rouvrir une requête /mine.
         const refreshActiveSales = async () => {
             try {
-                const st = await fetchSellingState(); // complète déjà le détail depuis la base
-                if (!st) return; // échec : on garde l'affichage en place (cf. renderActiveSales)
-                renderActiveSales(st.list, st);
+                // La synchro des wins est INDÉPENDANTE des ventes actives.
+                // Même si fetchSellingState() échoue, un achat auto doit entrer dans Flip Seller.
                 if (Date.now() - lastWonSync > 60000) {
                     lastWonSync = Date.now();
-                    await syncWonAuctions();
+                    syncWonAuctions().catch(() => { });
                 }
+
+                const st = await fetchSellingState();
+                if (!st) return; // on garde seulement l'affichage précédent
+                renderActiveSales(st.list, st);
             } catch (e) { /* silent */ }
         };
         refreshActiveSales(); // initial
