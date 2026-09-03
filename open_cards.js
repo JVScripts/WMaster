@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.0';
+    const WM_VERSION = '2.6.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -487,12 +487,14 @@
         return n;
     }
     function getFlipDurationMin() {
-        const n = Number(localStorage.getItem(FLIP_DURATION_KEY));
-        return [10, 30, 60, 180, 360, 720, 1440].includes(n) ? n : 60;
+        const raw = localStorage.getItem(FLIP_DURATION_KEY);
+        if (raw === null || raw === '') return 10;
+        const n = Number(raw);
+        return [10, 30, 60, 180, 360, 720, 1440].includes(n) ? n : 10;
     }
     function setFlipDurationMin(v) {
         const n = Number(v);
-        const safe = [10, 30, 60, 180, 360, 720, 1440].includes(n) ? n : 60;
+        const safe = [10, 30, 60, 180, 360, 720, 1440].includes(n) ? n : 10;
         localStorage.setItem(FLIP_DURATION_KEY, String(safe));
         return safe;
     }
@@ -2474,6 +2476,11 @@
                 no_search_input: 'barre de recherche collection introuvable',
                 no_sell_button: 'bouton "Mettre aux enchères" introuvable',
                 no_launch_button: 'bouton "Lancer l’enchère" introuvable',
+                no_auction_modal_controls: 'formulaire de mise en vente non chargé',
+                price_not_applied: 'prix calculé non appliqué au formulaire — vente annulée',
+                duration_not_applied: 'durée non appliquée au formulaire — vente annulée',
+                form_changed_before_launch: 'prix/durée modifiés par le site avant lancement — vente annulée',
+                launch_button_disabled: 'bouton de lancement désactivé',
                 modal_still_open: 'mise en vente refusée par le site'
             };
             return { ok: false, reason: reasonMap[ui?.reason] || ui?.reason || 'échec UI' };
@@ -2481,25 +2488,40 @@
 
         rec.status = 'listed';
         rec.saleAuctionId = ui.auctionId || null;
-        rec.listPrice = priceInfo.price;
+        rec.listPrice = Number.isFinite(Number(ui.actualPrice))
+            ? Number(ui.actualPrice)
+            : priceInfo.price;
+        rec.listDurationMin = Number.isFinite(Number(ui.actualDurationMin))
+            ? Number(ui.actualDurationMin)
+            : duration;
 
         // Une nouvelle vente vient d'être créée : le prochain calcul des slots doit relire
         // immédiatement l'état au lieu de réutiliser le cache précédent.
         invalidateSalesDetail();
         rec.listedAt = Date.now();
-        rec.lastError = rec.saleAuctionId
-            ? null
-            : 'listé via UI · id enchère non capturé, suivi à confirmer';
+
+        rec.lastError = ui.anomaly
+            ? ui.anomaly
+            : rec.saleAuctionId
+                ? null
+                : 'listé via UI · id enchère non capturé, suivi à confirmer';
 
         saveFlipLedger();
 
         wmLog(
             `💸 Flip Seller : <b>${rec.title}</b> [${rec.rarity}] · ` +
-            `acheté ${rec.buyPrice} → listé <b>${priceInfo.price} 💰</b> ` +
-            `(${priceInfo.basis}, ${duration} min) via UI native.`
+            `acheté ${rec.buyPrice} → listé <b>${rec.listPrice} 💰</b> ` +
+            `(${priceInfo.basis}, ${DURATION_BUTTON_LABELS[rec.listDurationMin] || rec.listDurationMin + ' min'}) via UI native.`
         );
 
-        return { ok: true, auctionId: rec.saleAuctionId, priceInfo };
+        return {
+            ok: true,
+            auctionId: rec.saleAuctionId,
+            priceInfo,
+            actualPrice: rec.listPrice,
+            actualDurationMin: rec.listDurationMin,
+            anomaly: ui.anomaly || null
+        };
     }
 
     // v2.4.5 — Remet le tag `vente` sur un flip revenu invendu dans la collection.
@@ -2869,7 +2891,16 @@
 
         const stateLabel = r => {
             if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${Number(r.soldPrice || 0).toLocaleString('fr-FR')} · ${r.profit >= 0 ? '+' : ''}${Number(r.profit || 0).toLocaleString('fr-FR')} 💰</span>`;
-            if (r.status === 'listed') return `<span style="color:#06b6d4;">en vente ${Number(r.listPrice || 0).toLocaleString('fr-FR')} 💰</span>`;
+            if (r.status === 'listed') {
+                const duration = Number(r.listDurationMin);
+                const durText = Number.isFinite(duration) && duration > 0
+                    ? ` · ${DURATION_BUTTON_LABELS[duration] || duration + ' min'}`
+                    : '';
+                const err = r.lastError
+                    ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>`
+                    : '';
+                return `<span style="color:#06b6d4;">en vente ${Number(r.listPrice || 0).toLocaleString('fr-FR')} 💰${durText}</span>${err}`;
+            }
             if (r.status === 'tagged') {
                 const err = r.lastError
                     ? ` · <span style="color:#ef4444;" title="${htmlEsc(r.lastError)}">${htmlEsc(r.lastError)}</span>`
@@ -2998,6 +3029,32 @@
             isPro: data?.isPro ?? null
         };
         console.log('[WikiMasters][summary]', result);
+        return result;
+    };
+
+    window.wmFlipSellFormDiag = function () {
+        const modal = findAuctionSellModal();
+        const input = getAuctionStartPriceInput(modal);
+        const result = {
+            version: WM_VERSION,
+            modalTrouve: !!modal,
+            prixActuel: input ? Number(input.value) : null,
+            dureeActive: activeAuctionDurationLabel(modal),
+            boutonLancer: !!findButtonByTextWithin(modal, "Lancer l'enchère"),
+            dureeFlipConfiguree: getFlipDurationMin()
+        };
+        console.table(result);
+        return result;
+    };
+
+    window.wmLogDiag = function () {
+        const result = {
+            version: WM_VERSION,
+            lignesMemoire: logEntries.length,
+            limite: LOG_MAX_ENTRIES,
+            lignesDOM: document.getElementById('wm-log')?.children?.length || 0
+        };
+        console.table(result);
         return result;
     };
 
@@ -4327,7 +4384,35 @@
     /* ===================== LOG ===================== */
 
     /* ── Log (accessible depuis toutes les fonctions du module) ── */
+    const LOG_MAX_ENTRIES = 1000;
+    const LOG_MAINTENANCE_INTERVAL_MS = 5 * 60 * 1000;
     const logEntries = [];
+
+    function trimLogEntries() {
+        const overflow = logEntries.length - LOG_MAX_ENTRIES;
+        if (overflow > 0) logEntries.splice(0, overflow);
+
+        const el = document.getElementById('wm-log');
+        if (el) {
+            while (el.children.length > LOG_MAX_ENTRIES) {
+                el.lastElementChild?.remove();
+            }
+        }
+    }
+
+    function renderLogEntries() {
+        const el = document.getElementById('wm-log');
+        if (!el) return;
+
+        el.innerHTML = [...logEntries]
+            .reverse()
+            .map(e => `<div class="wm-log-e"><span style="color:#333">${e.ts}</span> ${e.msg}</div>`)
+            .join('');
+        el.dataset.wmLogReady = '1';
+        trimLogEntries();
+    }
+
+    setInterval(trimLogEntries, LOG_MAINTENANCE_INTERVAL_MS);
 
     // Détecte la catégorie d'un log à partir de son contenu (ordre important :
     // les patterns plus spécifiques d'abord)
@@ -4361,12 +4446,31 @@
     function wmLog(msg) {
         const category = detectLogCategory(msg);
         if (!isLogCategoryEnabled(category)) return;
+
         const t = new Date();
-        const ts = [t.getHours(), t.getMinutes(), t.getSeconds()].map(n => String(n).padStart(2, '0')).join(':');
+        const ts = [t.getHours(), t.getMinutes(), t.getSeconds()]
+            .map(n => String(n).padStart(2, '0'))
+            .join(':');
+
         logEntries.push({ ts, msg });
-        if (logEntries.length > 9000000) logEntries.shift();
+        trimLogEntries();
+
         const el = document.getElementById('wm-log');
-        if (el) el.innerHTML = [...logEntries].reverse().map(e => `<div class="wm-log-e"><span style="color:#333">${e.ts}</span> ${e.msg}</div>`).join('');
+        if (!el) return;
+
+        if (el.dataset.wmLogReady !== '1') {
+            renderLogEntries();
+            return;
+        }
+
+        el.insertAdjacentHTML(
+            'afterbegin',
+            `<div class="wm-log-e"><span style="color:#333">${ts}</span> ${msg}</div>`
+        );
+
+        while (el.children.length > LOG_MAX_ENTRIES) {
+            el.lastElementChild?.remove();
+        }
     }
 
     // Exporte le log en .txt (HTML strippé, 1 ligne par entry).
@@ -9945,9 +10049,22 @@
     // (React a surchargé le setter sur l'instance, pas sur le prototype) : il faut passer par
     // le setter natif du PROTOTYPE puis émettre un vrai événement 'input' pour que React le voie.
     function setReactInputValue(el, value) {
-        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-        setter.call(el, value);
-        el.dispatchEvent(new Event('input', { bubbles: true }));
+        if (!el) return;
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+        if (setter) setter.call(el, value);
+        else el.value = value;
+
+        // React/Next peut écouter input ou change suivant le composant.
+        try {
+            el.dispatchEvent(new InputEvent('input', {
+                bubbles: true,
+                inputType: 'insertText',
+                data: String(value)
+            }));
+        } catch (e) {
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        el.dispatchEvent(new Event('change', { bubbles: true }));
     }
     function findLeafByExactText(text) {
         for (const el of document.querySelectorAll('*')) {
@@ -10121,25 +10238,238 @@
         return true;
     }
 
+
+    function findAuctionSellModal() {
+        const headings = [...document.querySelectorAll('h1,h2,h3')]
+            .filter(h => String(h.textContent || '').trim() === 'Mettre aux enchères');
+
+        for (const h of headings) {
+            const root =
+                h.closest('.card-frame') ||
+                h.closest('[role="dialog"]') ||
+                h.closest('[class*="max-w-lg"]');
+            if (root) return root;
+        }
+        return null;
+    }
+
+    function findButtonByTextWithin(root, text) {
+        if (!root) return null;
+        return [...root.querySelectorAll('button')]
+            .find(b => String(b.textContent || '').trim() === text) || null;
+    }
+
+    function getAuctionStartPriceInput(modal) {
+        if (!modal) return null;
+        return (
+            modal.querySelector('input[aria-label="Mise de départ"]') ||
+            modal.querySelector('input[type="number"][inputmode="numeric"][min="1"][step="1"]')
+        );
+    }
+
+    function auctionDurationButtonIsActive(btn) {
+        if (!btn) return false;
+
+        if (
+            btn.getAttribute('aria-pressed') === 'true' ||
+            btn.getAttribute('aria-checked') === 'true' ||
+            btn.getAttribute('data-state') === 'checked'
+        ) {
+            return true;
+        }
+
+        const cls = String(btn.className || '');
+        return (
+            cls.includes('bg-[var(--color-accent)]') &&
+            cls.includes('border-[var(--color-accent)]')
+        );
+    }
+
+    function activeAuctionDurationLabel(modal) {
+        if (!modal) return null;
+        for (const label of Object.values(DURATION_BUTTON_LABELS)) {
+            const btn = findButtonByTextWithin(modal, label);
+            if (auctionDurationButtonIsActive(btn)) return label;
+        }
+        return null;
+    }
+
+    async function waitForAuctionSellModalControls(timeoutMs = 8000) {
+        const started = Date.now();
+
+        while (Date.now() - started < timeoutMs) {
+            const modal = findAuctionSellModal();
+            if (modal) {
+                const priceInput = getAuctionStartPriceInput(modal);
+                const launchBtn = findButtonByTextWithin(modal, "Lancer l'enchère");
+                const hasDurationButtons = Object.values(DURATION_BUTTON_LABELS)
+                    .some(label => !!findButtonByTextWithin(modal, label));
+
+                if (priceInput && launchBtn && hasDurationButtons) {
+                    return { modal, priceInput, launchBtn };
+                }
+            }
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        return null;
+    }
+
+    async function setAndVerifyAuctionStartPrice(expectedPrice) {
+        const expected = Math.max(1, Math.round(Number(expectedPrice) || 0));
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const modal = findAuctionSellModal();
+            const input = getAuctionStartPriceInput(modal);
+            if (!modal || !input) {
+                await new Promise(r => setTimeout(r, 120));
+                continue;
+            }
+
+            try { input.focus(); } catch (e) { }
+            setReactInputValue(input, String(expected));
+
+            // Laisse React traiter l'évènement puis relit le NOUVEL input au cas où
+            // le composant ait été recréé après le fetch de la moyenne officielle.
+            await new Promise(r => setTimeout(r, 160));
+
+            const freshModal = findAuctionSellModal();
+            const freshInput = getAuctionStartPriceInput(freshModal);
+            const current = Number(freshInput?.value);
+
+            if (Number.isFinite(current) && current === expected) {
+                try { freshInput.blur(); } catch (e) { }
+                return { ok: true, value: current };
+            }
+
+            await new Promise(r => setTimeout(r, 120));
+        }
+
+        const modal = findAuctionSellModal();
+        const input = getAuctionStartPriceInput(modal);
+        return {
+            ok: false,
+            value: Number(input?.value),
+            expected
+        };
+    }
+
+    async function selectAndVerifyAuctionDuration(duration) {
+        const durLabel = DURATION_BUTTON_LABELS[duration];
+        if (!durLabel) {
+            return { ok: false, reason: 'duration_inconnue', expected: duration };
+        }
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const modal = findAuctionSellModal();
+            const btn = findButtonByTextWithin(modal, durLabel);
+
+            if (!modal || !btn) {
+                await new Promise(r => setTimeout(r, 120));
+                continue;
+            }
+
+            if (!auctionDurationButtonIsActive(btn)) btn.click();
+            await new Promise(r => setTimeout(r, 180));
+
+            const freshModal = findAuctionSellModal();
+            const freshBtn = findButtonByTextWithin(freshModal, durLabel);
+
+            if (auctionDurationButtonIsActive(freshBtn)) {
+                return {
+                    ok: true,
+                    duration,
+                    label: durLabel
+                };
+            }
+        }
+
+        const modal = findAuctionSellModal();
+        return {
+            ok: false,
+            expected: duration,
+            expectedLabel: durLabel,
+            activeLabel: activeAuctionDurationLabel(modal)
+        };
+    }
+
+    function closeAuctionSellModal() {
+        const modal = findAuctionSellModal();
+        if (!modal) return;
+
+        const cancel = findButtonByTextWithin(modal, 'Annuler');
+        if (cancel) {
+            cancel.click();
+            return;
+        }
+
+        const close = modal.querySelector('button[aria-label="Fermer"]');
+        if (close) close.click();
+    }
+
+    async function verifyAuctionFormBeforeLaunch(price, duration) {
+        const expectedPrice = Math.max(1, Math.round(Number(price) || 0));
+        const expectedDurationLabel = DURATION_BUTTON_LABELS[duration];
+
+        const modal = findAuctionSellModal();
+        const input = getAuctionStartPriceInput(modal);
+        const priceNow = Number(input?.value);
+        const activeDuration = activeAuctionDurationLabel(modal);
+
+        return {
+            ok:
+                Number.isFinite(priceNow) &&
+                priceNow === expectedPrice &&
+                activeDuration === expectedDurationLabel,
+            expectedPrice,
+            priceNow,
+            expectedDurationLabel,
+            activeDuration
+        };
+    }
+
+    async function fetchCreatedAuctionForVerification(auctionId) {
+        if (!auctionId) return null;
+        const waits = [0, 150, 350, 700, 1200];
+
+        for (const wait of waits) {
+            if (wait) await new Promise(r => setTimeout(r, wait));
+            try {
+                const row = await fetchSingleAuction(auctionId);
+                if (row?.id) return row;
+            } catch (e) { }
+        }
+        return null;
+    }
+
+    function actualAuctionDurationMinutes(row) {
+        const start = new Date(row?.created_at || NaN).getTime();
+        const end = new Date(row?.end_at || NaN).getTime();
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+        return Math.round((end - start) / 60000);
+    }
+
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
-        const searchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
+        const requestedPrice = Math.max(1, Math.round(Number(price) || 0));
+        const requestedDuration = Number(duration);
+
+        const searchInput = document.querySelector(
+            'input[placeholder="Rechercher par titre ou catégorie..."]'
+        );
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
+
         setReactInputValue(searchInput, title);
 
-        // Le filtrage du site peut prendre plus d'une seconde (debounce + requête) : on sonde
-        // plutôt qu'un délai fixe, jusqu'à trouver une tuile cliquable pour ce titre. Redemande
-        // findLeafByExactText à chaque tour : un match "orphelin" trouvé trop tôt (avant que le
-        // rendu ne se termine) disparaît une fois les vrais résultats affichés.
         let tile = null;
         for (let i = 0; i < 20 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
             tile = findCollectionTileByTitleAndRarity(title, rarity);
         }
-        // Bug/particularité du site : juste après le retour d'une enchère invendue,
-        // la carte peut ne PAS ressortir dans la recherche générale, mais apparaît dès que
-        // la rareté est filtrée. On reproduit automatiquement ce filtre puis on relance.
+
+        // Retour d'invendu : le filtre de rareté peut être nécessaire pour faire apparaître
+        // immédiatement la carte dans la collection.
         if (!tile && rarity) {
             const filtered = await activateCollectionRarityFilter(rarity).catch(() => false);
             if (filtered) {
@@ -10155,33 +10485,118 @@
         }
 
         if (!tile) return { ok: false, reason: 'card_not_found' };
+
         tile.click();
         await new Promise(r => setTimeout(r, 600));
 
         const sellBtn = findButtonByText('Mettre aux enchères');
         if (!sellBtn) return { ok: false, reason: 'no_sell_button' };
+
         sellBtn.click();
-        await new Promise(r => setTimeout(r, 500));
 
-        const priceInput = document.querySelector('input[aria-label="Mise de départ"]');
-        if (priceInput) setReactInputValue(priceInput, String(Math.max(1, Math.round(price))));
+        // La nouvelle fenêtre charge les statistiques de marché de façon asynchrone.
+        // On attend donc LES VRAIS contrôles au lieu d'un délai fixe de 500 ms.
+        const controls = await waitForAuctionSellModalControls(8000);
+        if (!controls) {
+            closeAuctionSellModal();
+            return { ok: false, reason: 'no_auction_modal_controls' };
+        }
 
-        const durLabel = DURATION_BUTTON_LABELS[duration];
-        const durBtn = durLabel && findButtonByText(durLabel);
-        if (durBtn) durBtn.click(); // pas de retour en échec si absent : mieux vaut lister à la
-        // durée par défaut du site que ne pas lister du tout
-        await new Promise(r => setTimeout(r, 200));
+        // Petit délai de stabilisation : le fetch de moyenne peut provoquer un rerender React.
+        await new Promise(r => setTimeout(r, 250));
 
-        const launchBtn = findButtonByText("Lancer l'enchère");
-        if (!launchBtn) return { ok: false, reason: 'no_launch_button' };
+        const priceResult = await setAndVerifyAuctionStartPrice(requestedPrice);
+        if (!priceResult.ok) {
+            wmLog(
+                `🚫 Flip Seller : <b>${title}</b> — prix formulaire non appliqué ` +
+                `(voulu ${requestedPrice}, lu ${Number.isFinite(priceResult.value) ? priceResult.value : '?'}). ` +
+                `Enchère NON lancée.`
+            );
+            closeAuctionSellModal();
+            return {
+                ok: false,
+                reason: 'price_not_applied',
+                expectedPrice: requestedPrice,
+                actualPrice: priceResult.value
+            };
+        }
+
+        const durationResult = await selectAndVerifyAuctionDuration(requestedDuration);
+        if (!durationResult.ok) {
+            wmLog(
+                `🚫 Flip Seller : <b>${title}</b> — durée formulaire non appliquée ` +
+                `(voulue ${DURATION_BUTTON_LABELS[requestedDuration] || requestedDuration}, ` +
+                `active ${durationResult.activeLabel || '?'}). Enchère NON lancée.`
+            );
+            closeAuctionSellModal();
+            return {
+                ok: false,
+                reason: 'duration_not_applied',
+                expectedDuration: requestedDuration,
+                activeDurationLabel: durationResult.activeLabel || null
+            };
+        }
+
+        // Laisse passer un éventuel rerender tardif puis RE-VÉRIFIE juste avant le clic.
+        await new Promise(r => setTimeout(r, 250));
+
+        let finalCheck = await verifyAuctionFormBeforeLaunch(
+            requestedPrice,
+            requestedDuration
+        );
+
+        // Une seule réparation automatique si React a réinitialisé le formulaire.
+        if (!finalCheck.ok) {
+            await setAndVerifyAuctionStartPrice(requestedPrice);
+            await selectAndVerifyAuctionDuration(requestedDuration);
+            await new Promise(r => setTimeout(r, 120));
+            finalCheck = await verifyAuctionFormBeforeLaunch(
+                requestedPrice,
+                requestedDuration
+            );
+        }
+
+        if (!finalCheck.ok) {
+            wmLog(
+                `🚫 Flip Seller : <b>${title}</b> — formulaire modifié avant lancement ` +
+                `(prix ${finalCheck.priceNow ?? '?'} / ${requestedPrice}, ` +
+                `durée ${finalCheck.activeDuration || '?'} / ${finalCheck.expectedDurationLabel || '?'}). ` +
+                `Enchère NON lancée.`
+            );
+            closeAuctionSellModal();
+            return {
+                ok: false,
+                reason: 'form_changed_before_launch',
+                form: finalCheck
+            };
+        }
+
+        const modal = findAuctionSellModal();
+        const launchBtn = findButtonByTextWithin(modal, "Lancer l'enchère");
+        if (!launchBtn) {
+            closeAuctionSellModal();
+            return { ok: false, reason: 'no_launch_button' };
+        }
+
+        if (launchBtn.disabled) {
+            closeAuctionSellModal();
+            return { ok: false, reason: 'launch_button_disabled' };
+        }
+
+        wmLog(
+            `💸 Flip Seller : formulaire vérifié → <b>${title}</b> [${rarity}] · ` +
+            `<b>${requestedPrice} 💰</b> · <b>${DURATION_BUTTON_LABELS[requestedDuration]}</b>.`
+        );
+
         _lastUiListingAuctionId = null;
         launchBtn.click();
-        await new Promise(r => setTimeout(r, 900)); // laisse la requête + navigation vers la page de l'enchère se faire
 
-        // Sur succès, le site NAVIGUE vers la page de l'enchère créée (le bouton et toute la
-        // page collection disparaissent avec elle). Toujours présent → refusé côté site
-        // (impossible de lire le message d'erreur exact depuis ce flux, contrairement au POST).
-        if (document.body.contains(launchBtn)) return { ok: false, reason: 'modal_still_open' };
+        await new Promise(r => setTimeout(r, 900));
+
+        // Si le modal existe encore, le site a refusé ou n'a pas encore accepté le listing.
+        if (document.body.contains(launchBtn)) {
+            return { ok: false, reason: 'modal_still_open' };
+        }
 
         let createdAuctionId = _lastUiListingAuctionId;
         if (!createdAuctionId) {
@@ -10189,16 +10604,63 @@
             if (m) createdAuctionId = m[1];
         }
 
-        // Revient sur /collection (sinon la carte suivante ne retrouverait plus la barre de
-        // recherche). Pas bloquant si ça échoue : la prochaine sellCardViaUI() retentera via
-        // ensureOnCollectionPage() avant de conclure à un vrai blocage.
+        let actualPrice = requestedPrice;
+        let actualDurationMin = requestedDuration;
+        let anomaly = null;
+
+        // Contrôle serveur après création quand l'auction_id est disponible.
+        if (createdAuctionId) {
+            const row = await fetchCreatedAuctionForVerification(createdAuctionId);
+            if (row) {
+                const serverPrice = Number(
+                    row.listing_base_amount ?? row.base_amount
+                );
+                const serverDuration = actualAuctionDurationMinutes(row);
+
+                if (Number.isFinite(serverPrice)) actualPrice = serverPrice;
+                if (Number.isFinite(serverDuration)) actualDurationMin = serverDuration;
+
+                const priceMismatch =
+                    Number.isFinite(serverPrice) &&
+                    serverPrice !== requestedPrice;
+
+                const durationMismatch =
+                    Number.isFinite(serverDuration) &&
+                    Math.abs(serverDuration - requestedDuration) > 1;
+
+                if (priceMismatch || durationMismatch) {
+                    anomaly =
+                        `ANOMALIE listing serveur : demandé ${requestedPrice} 💰 / ` +
+                        `${DURATION_BUTTON_LABELS[requestedDuration] || requestedDuration + ' min'}, ` +
+                        `créé ${Number.isFinite(serverPrice) ? serverPrice : '?'} 💰 / ` +
+                        `${Number.isFinite(serverDuration) ? serverDuration + ' min' : '?'}`;
+
+                    wmLog(
+                        `🚨 Flip Seller : <b>${title}</b> — ${anomaly}. ` +
+                        `Aucun deuxième listing ne sera créé.`
+                    );
+                }
+            }
+        }
+
         await ensureOnCollectionPage();
 
-        const nextSearchInput = document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]');
+        const nextSearchInput = document.querySelector(
+            'input[placeholder="Rechercher par titre ou catégorie..."]'
+        );
         if (nextSearchInput) setReactInputValue(nextSearchInput, '');
 
-        return { ok: true, auctionId: createdAuctionId || null };
+        return {
+            ok: true,
+            auctionId: createdAuctionId || null,
+            actualPrice,
+            actualDurationMin,
+            anomaly,
+            requestedPrice,
+            requestedDuration
+        };
     }
+
     /* ══════════ ANTI-BOUCLE TRASH SELLER ══════════ */
 
     // Une carte qui échoue n'est pas retentée immédiatement.
@@ -13284,10 +13746,16 @@
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                         <div class="wm-lbl" style="margin:0;">Log</div>
-                        <button id="wm-log-export" title="Exporter le log en .txt"
-                            style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#aaa;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
-                            Export logs 💾
-                        </button>
+                        <div style="display:flex;gap:4px;align-items:center;">
+                            <button id="wm-log-clear" title="Effacer le log"
+                                style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#888;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
+                                Effacer 🧹
+                            </button>
+                            <button id="wm-log-export" title="Exporter le log en .txt"
+                                style="background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.1);color:#aaa;font-size:9px;padding:2px 6px;border-radius:4px;cursor:pointer;font-family:inherit;">
+                                Export logs 💾
+                            </button>
+                        </div>
                     </div>
                     <div id="wm-log" class="wm-log"></div>
                 </div>
@@ -14012,6 +14480,19 @@
         /* ════════ HEADER CONTROLS ════════ */
         document.getElementById('wm-close-btn').onclick = () => overlay.classList.remove('open');
         document.getElementById('wm-log-export').onclick = () => exportLogs();
+
+        const logClearBtn = document.getElementById('wm-log-clear');
+        if (logClearBtn) {
+            logClearBtn.onclick = () => {
+                logEntries.length = 0;
+                const logEl = document.getElementById('wm-log');
+                if (logEl) {
+                    logEl.innerHTML = '';
+                    logEl.dataset.wmLogReady = '1';
+                }
+            };
+        }
+        renderLogEntries();
 
         /* ════════ PARAMÈTRES ════════ */
         const settingsHdr = document.getElementById('wm-settings-hdr');
