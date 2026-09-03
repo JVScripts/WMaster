@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.8';
+    const WM_VERSION = '2.6.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3397,13 +3397,13 @@
                 return `<div style="position:relative;padding:5px 24px 5px 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:9px;line-height:1.35;">
                     <button onclick="window.wmDeleteFlipRecord('${htmlEsc(r.auctionId || '')}')" title="Supprimer cette ligne du Flip Seller"
                         style="position:absolute;right:0;top:5px;width:19px;height:19px;padding:0;border-radius:4px;border:1px solid rgba(239,68,68,.25);background:rgba(239,68,68,.08);color:#ef4444;cursor:pointer;font-size:11px;line-height:17px;">×</button>
-                    <div style="display:flex;justify-content:space-between;gap:8px;min-width:0;">
-                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;" title="${htmlEsc(r.title || '?')}"><b>${htmlEsc(r.title || '?')}</b> <span style="color:#666;">${rarityTxt}</span></span>
-                        <span style="white-space:nowrap;color:#aaa;">achat ${Number(r.buyPrice || 0).toLocaleString('fr-FR')} · ${stateLabel(r)}</span>
+                    <div style="display:flex;justify-content:space-between;gap:6px;min-width:0;flex-wrap:wrap;">
+                        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:90px;flex:1 1 45%;" title="${htmlEsc(r.title || '?')}"><b>${htmlEsc(r.title || '?')}</b> <span style="color:#666;">${rarityTxt}</span></span>
+                        <span style="color:#aaa;flex:0 1 auto;text-align:right;">achat ${Number(r.buyPrice || 0).toLocaleString('fr-FR')} · ${stateLabel(r)}</span>
                     </div>
-                    <div style="margin-top:2px;display:flex;justify-content:space-between;gap:6px;align-items:center;">
-                        <span>${flipMarketRecapHtml(r)}</span>
-                        <span style="color:#555;white-space:nowrap;">âge ${flipAgeLabel(r)}</span>
+                    <div style="margin-top:2px;display:flex;justify-content:space-between;gap:6px;align-items:flex-start;min-width:0;flex-wrap:wrap;">
+                        <span style="min-width:0;flex:1 1 170px;overflow-wrap:anywhere;">${flipMarketRecapHtml(r)}</span>
+                        <span style="color:#555;white-space:nowrap;flex:0 0 auto;">âge ${flipAgeLabel(r)}</span>
                     </div>
                 </div>`;
             }).join('') +
@@ -3613,6 +3613,39 @@
         console.table(rows);
         renderActiveSales(st.list, st);
         return rows;
+    };
+
+    window.wmFlipLayoutDiag = function () {
+        const hist = document.getElementById('wm-flip-history');
+        const body = hist?.closest('.wm-pb');
+        const log = document.getElementById('wm-log');
+
+        const box = el => {
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            const cs = getComputedStyle(el);
+            return {
+                height: Math.round(r.height),
+                scrollHeight: el.scrollHeight,
+                overflowY: cs.overflowY,
+                flex: cs.flex,
+                flexShrink: cs.flexShrink,
+                minHeight: cs.minHeight,
+                maxHeight: cs.maxHeight
+            };
+        };
+
+        const result = {
+            version: WM_VERSION,
+            zoomApprox: window.devicePixelRatio,
+            flipHistory: box(hist),
+            panelBody: box(body),
+            log: box(log),
+            lignesFlip: flipLedger.length
+        };
+
+        console.log('[WikiMasters][FlipLayout]', result);
+        return result;
     };
 
     window.wmFlipAverageDiag = async function (title = '') {
@@ -14527,8 +14560,36 @@
             .wm-ab-off { border-color:rgba(255,255,255,0.1)!important; background:rgba(255,255,255,0.03)!important; color:#555!important; }
             .wm-ab-on  { border-color:rgba(74,222,128,0.4)!important; background:rgba(74,222,128,0.1)!important; color:#4ade80!important; }
 
+            /* v2.6.9 — le Log est flex:1 dans la même colonne que le Flip Seller.
+               Sans flex-shrink:0, Chrome pouvait compresser #wm-flip-history à ~0px
+               à zoom 100%, puis le faire réapparaître uniquement en dézoomant. */
+            #wm-flip-history {
+                flex:0 0 auto;
+                min-height:72px;
+                max-height:min(300px, 34vh);
+                overflow-y:auto;
+                overflow-x:hidden;
+                padding-right:4px;
+                scrollbar-width:thin;
+                scrollbar-color:rgba(74,222,128,.22) transparent;
+                contain:layout paint;
+            }
+            #wm-flip-history::-webkit-scrollbar { width:7px; }
+            #wm-flip-history::-webkit-scrollbar-track { background:transparent; }
+            #wm-flip-history::-webkit-scrollbar-thumb {
+                background:rgba(74,222,128,.20);
+                border-radius:4px;
+            }
+            #wm-flip-history::-webkit-scrollbar-thumb:hover {
+                background:rgba(74,222,128,.34);
+            }
+
+            /* Les séparateurs/contrôles autour du Flip ne doivent pas céder leur hauteur
+               au log non plus. Le débordement est pris en charge par .wm-pb. */
+            #wm-flip-history + .wm-sep { flex-shrink:0; }
+
             /* IMPORTANT: flex:1 (et pas max-height) pour que le log prenne toute la place dispo jusqu'en bas du panel */
-            .wm-log { background:rgba(0,0,0,0.3); border-radius:5px; padding:6px 8px; font-size:10px; font-family:monospace; flex:1; min-height:140px; overflow-y:auto; color:#555; scrollbar-width:thin; }
+            .wm-log { background:rgba(0,0,0,0.3); border-radius:5px; padding:6px 8px; font-size:10px; font-family:monospace; flex:1 0 140px; min-height:140px; overflow-y:auto; color:#555; scrollbar-width:thin; }
             .wm-log-e { padding:1px 0; border-bottom:1px solid rgba(255,255,255,0.03); }
             .wm-log-e:last-child { color:#aaa; border:none; }
 
@@ -14813,7 +14874,7 @@
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
                     <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = <b>moyenne officielle WikiMasters</b> moins <b>5%</b> par défaut · jamais sous la marge mini. La médiane locale reste affichée à titre informatif uniquement. Victoire auto → tag <b>vente</b>.</div>
-                    <div id="wm-flip-history" style="margin-bottom:7px;max-height:300px;overflow-y:auto;padding-right:2px;"></div>
+                    <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
                         <div class="wm-lbl" style="margin:0;">Log</div>
