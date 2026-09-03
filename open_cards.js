@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.6';
+    const WM_VERSION = '2.6.8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -455,6 +455,12 @@
     const FLIP_UNDERCUT_KEY = 'wm_flip_undercut';
     const FLIP_REFERENCE_DISCOUNT_KEY = 'wm_flip_reference_discount_pct';
 
+    // v2.6.8 : le cache général de moyenne WM reste long pour Hunter/Market Watcher,
+    // mais le Flip Seller maintient sa PROPRE fraîcheur.
+    const FLIP_WM_AVERAGE_REFRESH_MS = 2 * 60 * 1000;      // refresh suivi : 2 min
+    const FLIP_WM_AVERAGE_MAX_STALE_MS = 5 * 60 * 1000;    // fallback max si un fetch échoue
+    const FLIP_POST_PURCHASE_REFRESH_DELAYS_MS = [0, 2500, 8000];
+
     // v2.3.7 : cache propre au tag "vente".
     // L'ancien wm_flip_tag_id_v1 pouvait encore contenir l'UUID de $$$ et était
     // réutilisé aveuglément après le renommage du tag.
@@ -532,6 +538,174 @@
         return n >= 100
             ? Math.max(10, Math.floor(n / 10) * 10)
             : Math.max(1, Math.floor(n));
+    }
+
+
+    function flipOfficialAverageFromSummary(entry, rarity = '') {
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (!entry || !rr) return null;
+        const avg = Number(entry?.summary?.[rr]?.average);
+        return Number.isFinite(avg) && avg > 0 ? avg : null;
+    }
+
+    function getStoredFlipOfficialAverage(rec, maxAgeMs = Infinity) {
+        if (!rec) return null;
+        const avg = Number(rec.wmAverage);
+        const ts = Number(rec.wmAverageFetchedAt || 0);
+        if (!Number.isFinite(avg) || avg <= 0 || !Number.isFinite(ts) || ts <= 0) return null;
+        if (Date.now() - ts > maxAgeMs) return null;
+        return {
+            average: avg,
+            fetchedAt: ts,
+            ageMs: Math.max(0, Date.now() - ts),
+            reason: rec.wmAverageReason || null
+        };
+    }
+
+    function applyFlipOfficialAverageSnapshot(rec, entry, reason = 'refresh') {
+        if (!rec || !entry) return null;
+        const avg = flipOfficialAverageFromSummary(entry, rec.rarity);
+        if (!Number.isFinite(avg) || avg <= 0) return null;
+
+        rec.wmAverage = avg;
+        rec.wmAverageFetchedAt = Number(entry.fetchedAt || Date.now());
+        rec.wmAverageReason = reason;
+        return {
+            average: avg,
+            fetchedAt: rec.wmAverageFetchedAt,
+            reason
+        };
+    }
+
+    async function refreshFlipOfficialAverage(
+        rec,
+        { force = true, reason = 'refresh Flip', save = true, logChange = false } = {}
+    ) {
+        if (!rec?.cardId || !rec?.rarity) return null;
+
+        const before = Number(rec.wmAverage);
+        const entry = await fetchWmOfficialSummary(rec.cardId, force).catch(() => null);
+        const snap = applyFlipOfficialAverageSnapshot(rec, entry, reason);
+
+        if (!snap) return null;
+
+        if (save) saveFlipLedger();
+
+        if (
+            logChange &&
+            Number.isFinite(before) &&
+            before > 0 &&
+            before !== snap.average
+        ) {
+            wmLog(
+                `📈 Moyenne WM actualisée : <b>${rec.title}</b> [${rec.rarity}] ` +
+                `${before.toLocaleString('fr-FR')} → <b>${snap.average.toLocaleString('fr-FR')} 💰</b>.`
+            );
+        }
+
+        return snap;
+    }
+
+    function scheduleFlipPostPurchaseAverageRefresh(rec) {
+        if (!rec?.auctionId || !rec?.cardId) return;
+
+        const auctionId = rec.auctionId;
+
+        for (const delay of FLIP_POST_PURCHASE_REFRESH_DELAYS_MS) {
+            setTimeout(() => {
+                const liveRec = flipRecordByAuctionId(auctionId);
+                if (!liveRec || liveRec.status === 'sold') return;
+
+                refreshFlipOfficialAverage(liveRec, {
+                    force: true,
+                    reason: delay === 0
+                        ? 'après achat'
+                        : `après achat +${Math.round(delay / 1000)}s`,
+                    save: true,
+                    logChange: delay > 0
+                }).then(snap => {
+                    if (snap) {
+                        liveRec.wmAveragePostPurchaseRefreshedAt = Date.now();
+                        saveFlipLedger();
+                        renderFlipHistory();
+                    }
+                }).catch(() => { });
+            }, delay);
+        }
+    }
+
+    let flipAverageRefreshBusy = false;
+
+    async function refreshTrackedFlipOfficialAverages(forceAll = false) {
+        if (flipAverageRefreshBusy) return 0;
+        flipAverageRefreshBusy = true;
+
+        try {
+            const tracked = flipLedger.filter(r =>
+                r &&
+                r.cardId &&
+                r.rarity &&
+                r.status !== 'sold'
+            );
+
+            if (tracked.length === 0) return 0;
+
+            const byCard = new Map();
+            for (const rec of tracked) {
+                if (!byCard.has(rec.cardId)) byCard.set(rec.cardId, []);
+                byCard.get(rec.cardId).push(rec);
+            }
+
+            let refreshed = 0;
+            let changed = false;
+
+            for (const [cardId, records] of byCard) {
+                const due = forceAll || records.some(rec => {
+                    const ts = Number(rec.wmAverageFetchedAt || 0);
+                    return !ts || Date.now() - ts >= FLIP_WM_AVERAGE_REFRESH_MS;
+                });
+                if (!due) continue;
+
+                const entry = await fetchWmOfficialSummary(cardId, true).catch(() => null);
+                if (!entry) continue;
+
+                for (const rec of records) {
+                    const before = Number(rec.wmAverage);
+                    const snap = applyFlipOfficialAverageSnapshot(
+                        rec,
+                        entry,
+                        rec.status === 'listed' ? 'suivi vente active' : 'suivi Flip'
+                    );
+                    if (!snap) continue;
+                    refreshed++;
+                    changed = true;
+
+                    if (
+                        rec.status === 'listed' &&
+                        Number.isFinite(before) &&
+                        before > 0 &&
+                        before !== snap.average
+                    ) {
+                        const listPrice = Number(rec.listPrice);
+                        const targetRaw = snap.average * (1 - getFlipReferenceDiscountPct() / 100);
+                        const target = roundFlipReferencePriceDown(targetRaw);
+                        rec.wmCurrentTarget = target;
+                    }
+                }
+
+                // Endpoint très léger, mais on étale si plusieurs cartes Flip sont suivies.
+                await new Promise(r => setTimeout(r, 180));
+            }
+
+            if (changed) {
+                saveFlipLedger();
+                renderFlipHistory();
+            }
+
+            return refreshed;
+        } finally {
+            flipAverageRefreshBusy = false;
+        }
     }
 
     function getFlipDurationMin() {
@@ -862,6 +1036,11 @@
                 soldAt: null,
                 profit: null,
                 relists: 0,
+                wmAverage: null,
+                wmAverageFetchedAt: 0,
+                wmAverageReason: null,
+                wmAveragePostPurchaseRefreshedAt: 0,
+                wmCurrentTarget: null,
                 lastError: null
             };
             flipLedger.push(rec);
@@ -881,6 +1060,12 @@
             `[${rec.rarity || '?'}] · achat <b>${Number(rec.buyPrice || 0).toLocaleString('fr-FR')} 💰</b> ` +
             `· état <b>${rec.status}</b>.`
         );
+
+        // Notre propre achat peut modifier la moyenne officielle. On invalide volontairement
+        // l'ancienne référence Flip et on redemande la moyenne immédiatement, puis à nouveau
+        // après quelques secondes pour couvrir une éventuelle propagation du settlement.
+        rec.wmAverageFetchedAt = 0;
+        scheduleFlipPostPurchaseAverageRefresh(rec);
 
         // Si le seller dort en attendant une carte prête, on le réveille immédiatement.
         wakeFlipSeller();
@@ -2219,9 +2404,15 @@
 
     function flipMarketRecapHtml(rec) {
         const stats = getFlipLiveMarketStats(rec);
-        const wmAverage = getWmOfficialAverage(rec?.cardId, rec?.rarity);
 
-        if (rec?.cardId) queueWmOfficialSummaryFetch(rec.cardId);
+        // Pour le Flip, on privilégie le snapshot explicitement rafraîchi.
+        // Le cache général reste uniquement un affichage de secours au tout premier rendu.
+        const storedWm = getStoredFlipOfficialAverage(rec);
+        const cachedWm = getWmOfficialAverage(rec?.cardId, rec?.rarity);
+        const wmAverage = storedWm?.average ??
+            (Number.isFinite(Number(cachedWm)) ? Number(cachedWm) : null);
+
+        if (rec?.cardId && !storedWm) queueWmOfficialSummaryFetch(rec.cardId);
 
         const ref = rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))
             ? Number(rec.listPrice)
@@ -2251,8 +2442,30 @@
         }
 
         if (Number.isFinite(wmAverage) && wmAverage > 0) {
+            let freshText = '';
+            if (storedWm) {
+                const ageSec = Math.floor(storedWm.ageMs / 1000);
+                freshText = ageSec < 60
+                    ? ` · maj ${Math.max(1, ageSec)}s`
+                    : ` · maj ${Math.floor(ageSec / 60)}m`;
+            }
+
+            let marketDrift = '';
+            if (rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))) {
+                const target = roundFlipReferencePriceDown(
+                    wmAverage * (1 - getFlipReferenceDiscountPct() / 100)
+                );
+                const lp = Number(rec.listPrice);
+                if (target > 0 && lp > 0) {
+                    const pct = Math.round((lp / target - 1) * 100);
+                    marketDrift =
+                        ` · <span style="color:${Math.abs(pct) <= 5 ? '#4ade80' : '#fbbf24'};">` +
+                        `cible actuelle ${target.toLocaleString('fr-FR')} (${pct >= 0 ? '+' : ''}${pct}%)</span>`;
+                }
+            }
+
             parts.push(
-                `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b></span>`
+                `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b>${freshText}${marketDrift}</span>`
             );
         } else {
             parts.push('<span style="color:#444;">moy. WM …</span>');
@@ -2277,50 +2490,54 @@
         const floor = Math.max(1, Math.ceil(buy * (1 + markupPct / 100)));
         const stats = getFlipLiveMarketStats(rec);
 
-        await fetchWmOfficialSummary(rec?.cardId).catch(() => null);
-        const wmAverage = getWmOfficialAverage(rec?.cardId, rec?.rarity);
+        // v2.6.8 : CHAQUE listing/relisting force une nouvelle lecture de la moyenne WM.
+        // On ne fixe jamais un prix Flip à partir du cache général de 6 h.
+        const fresh = await refreshFlipOfficialAverage(rec, {
+            force: true,
+            reason: rec?.relists > 0 ? 'avant relisting' : 'avant listing',
+            save: true,
+            logChange: true
+        }).catch(() => null);
+
+        // En cas de panne réseau ponctuelle, on tolère uniquement le dernier snapshot Flip
+        // s'il a moins de 5 minutes. Au-delà : pas de vieille moyenne, fallback au plancher.
+        const recentStored = getStoredFlipOfficialAverage(
+            rec,
+            FLIP_WM_AVERAGE_MAX_STALE_MS
+        );
+
+        const wmAverage =
+            Number.isFinite(Number(fresh?.average)) && Number(fresh.average) > 0
+                ? Number(fresh.average)
+                : recentStored?.average ?? null;
 
         const discountPct = getFlipReferenceDiscountPct();
 
-        let reference = null;
-        let referenceKind = null;
-        let referenceLabel = null;
+        const reference =
+            Number.isFinite(Number(wmAverage)) && Number(wmAverage) > 0
+                ? Number(wmAverage)
+                : null;
 
-        // Référence prioritaire : médiane locale fiable.
-        if (
-            stats &&
-            Number(stats.count) >= 3 &&
-            Number.isFinite(Number(stats.median)) &&
-            Number(stats.median) > 0
-        ) {
-            reference = Number(stats.median);
-            referenceKind = 'median';
-            referenceLabel = `médiane locale ${reference}`;
-        }
-        // Sinon moyenne officielle WikiMasters.
-        else if (Number.isFinite(Number(wmAverage)) && Number(wmAverage) > 0) {
-            reference = Number(wmAverage);
-            referenceKind = 'wm_average';
-            referenceLabel = `moyenne WM ${reference}`;
-        }
+        const referenceKind = reference ? 'wm_average' : null;
+        const referenceLabel = reference ? `moyenne WM fraîche ${reference}` : null;
 
         let price = floor;
-        let basis = `achat +${markupPct}%`;
+        let basis = `achat +${markupPct}% · moyenne WM fraîche indisponible`;
 
-        if (Number.isFinite(reference) && reference > 0) {
+        if (reference) {
             const discountedRaw = reference * (1 - discountPct / 100);
             const discounted = roundFlipReferencePriceDown(discountedRaw);
 
-            // La décote accélère la vente, mais ne peut jamais casser la marge minimale.
             price = Math.max(floor, discounted);
             basis =
                 `${referenceLabel} -${discountPct}%` +
                 ` → ${discounted}` +
                 (price > discounted ? ` · plancher ${floor}` : '');
+
+            rec.wmCurrentTarget = discounted;
+            saveFlipLedger();
         }
 
-        // Option historique : undercut encore plus bas que la cible -X %, mais jamais sous le floor.
-        // Elle reste explicitement contrôlée par sa checkbox.
         let undercut = null;
         if (getFlipUndercut()) {
             const lowest = await fetchLowestActiveListing(rec.cardId).catch(() => null);
@@ -2343,6 +2560,7 @@
             basis,
             stats,
             wmAverage,
+            wmAverageFetchedAt: Number(rec?.wmAverageFetchedAt || 0),
             reference,
             referenceKind,
             referenceDiscountPct: discountPct,
@@ -3397,6 +3615,69 @@
         return rows;
     };
 
+    window.wmFlipAverageDiag = async function (title = '') {
+        const q = String(title || '').trim().toLocaleLowerCase('fr-FR');
+        const records = flipLedger.filter(r =>
+            r &&
+            r.status !== 'sold' &&
+            (!q || String(r.title || '').toLocaleLowerCase('fr-FR').includes(q))
+        );
+
+        if (records.length === 0) {
+            console.warn('[WikiMasters][Flip] Aucun Flip actif correspondant.');
+            return [];
+        }
+
+        await refreshTrackedFlipOfficialAverages(true);
+
+        const rows = records.map(r => {
+            const snap = getStoredFlipOfficialAverage(r);
+            const target = snap
+                ? roundFlipReferencePriceDown(
+                    snap.average * (1 - getFlipReferenceDiscountPct() / 100)
+                )
+                : null;
+
+            return {
+                carte: r.title,
+                rarete: r.rarity,
+                statut: r.status,
+                achat: r.buyPrice,
+                moyenneWM: snap?.average ?? null,
+                ageMoyenneSec: snap ? Math.round(snap.ageMs / 1000) : null,
+                raisonRefresh: snap?.reason ?? null,
+                cibleMoinsDecote: target,
+                prixListe: r.listPrice ?? null,
+                derniereMaj: snap?.fetchedAt
+                    ? new Date(snap.fetchedAt).toLocaleTimeString('fr-FR')
+                    : null
+            };
+        });
+
+        console.table(rows);
+        renderFlipHistory();
+        return rows;
+    };
+
+    window.wmFlipPricingMode = function () {
+        const result = {
+            version: WM_VERSION,
+            sourceMiseEnVente: 'moyenne officielle WikiMasters fraîche uniquement',
+            refreshApresAchat: 'immédiat + 2.5 s + 8 s',
+            refreshSuiviMin: FLIP_WM_AVERAGE_REFRESH_MS / 60000,
+            refreshForceAvantChaqueListing: true,
+            fallbackMaxAgeMin: FLIP_WM_AVERAGE_MAX_STALE_MS / 60000,
+            decotePct: getFlipReferenceDiscountPct(),
+            margeMiniPct: getFlipMarkupPct(),
+            dureeMin: getFlipDurationMin(),
+            medianeLocale: 'affichage uniquement',
+            fallbackSiMoyenneAbsente: 'plancher achat + marge mini',
+            undercut: getFlipUndercut()
+        };
+        console.table(result);
+        return result;
+    };
+
     window.wmFlipPriceDiag = async function (auctionIdOrTitle) {
         const q = String(auctionIdOrTitle || '').trim().toLowerCase();
         const rec = flipLedger.find(r =>
@@ -3419,7 +3700,8 @@
             ventesLocales: info.stats?.count ?? 0,
             moyenneWM: info.wmAverage ?? null,
             reference: info.reference ?? null,
-            sourceReference: info.referenceKind ?? null,
+            sourceReference: info.referenceKind ?? 'aucune_moyenne_WM',
+            medianeLocaleInformative: info.stats?.median ?? null,
             decotePct: info.referenceDiscountPct,
             plancherMarge: info.floor,
             prixCible: info.price,
@@ -14530,7 +14812,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = médiane locale (n≥3), sinon moyenne WM, moins <b>5%</b> par défaut · jamais sous la marge mini. Victoire auto → tag <b>vente</b>.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = <b>moyenne officielle WikiMasters</b> moins <b>5%</b> par défaut · jamais sous la marge mini. La médiane locale reste affichée à titre informatif uniquement. Victoire auto → tag <b>vente</b>.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;max-height:300px;overflow-y:auto;padding-right:2px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -15278,10 +15560,18 @@
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
             syncFlipSaleResults().catch(() => { });
-            renderFlipHistory(); // médiane / écart marché / âge rafraîchis en continu
+
+            // Garde les moyennes officielles des Flips vivants à jour. La fonction ne fait
+            // réellement un fetch que si le dernier snapshot a ≥ 2 min.
+            refreshTrackedFlipOfficialAverages(false).catch(() => { });
+
+            renderFlipHistory(); // médiane / moyenne WM / âge rafraîchis en continu
         }, 15000);
-        // L'affichage seul est très léger : entre deux cycles réseau, l'âge et les médianes déjà
-        // reçues se rafraîchissent toutes les 5 s sans déclencher de requête supplémentaire.
+        // Au chargement, les anciens Flips sans snapshot frais sont actualisés rapidement.
+        setTimeout(() => refreshTrackedFlipOfficialAverages(false).catch(() => { }), 2500);
+
+        // L'affichage seul est très léger : entre deux cycles réseau, l'âge, la médiane
+        // informative et la dernière moyenne WM reçue se rafraîchissent sans requête.
         setInterval(() => renderFlipHistory(), 5000);
 
         /* ════════ HEADER CONTROLS ════════ */
