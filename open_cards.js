@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.5';
+    const WM_VERSION = '2.6.6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3286,6 +3286,42 @@
             isPro: data?.isPro ?? null
         };
         console.log('[WikiMasters][summary]', result);
+        return result;
+    };
+
+    window.wmBidderDiag = async function (auctionId) {
+        invalidateSalesDetail();
+        const st = await fetchSellingState();
+
+        const a = (st?.list || []).find(x => x?.id === auctionId)
+            || (st?.list || []).find(x => auctionCurrentBidderId(x));
+
+        if (!a) {
+            console.warn('[WikiMasters] Aucune vente active avec enchérisseur trouvée.');
+            return null;
+        }
+
+        const bidderId = auctionCurrentBidderId(a);
+        const before = findKnownBidderNameForActiveSale(a);
+        const pageName = before ? null : await fetchBidderNameFromAuctionPage(a);
+        const resolved = before || pageName || cachedResolvedBidderName(bidderId);
+
+        if (resolved) applyBidderNameToAuction(a, resolved);
+
+        const result = {
+            version: WM_VERSION,
+            auctionId: a.id,
+            carte: a.card?.wikipedia_title || '?',
+            bidderId,
+            pseudoAvant: before || null,
+            pseudoPageEnchere: pageName || null,
+            pseudoFinal: resolved || null,
+            tableProfil: _profileTable || null,
+            cachePseudos: _usernameCache.size
+        };
+
+        console.table(result);
+        renderActiveSales(st?.list || [], st);
         return result;
     };
 
@@ -10324,7 +10360,12 @@
             const bidderId = auctionCurrentBidderId(a);
             const bidder = validResolvedUsername(a.current_bidder?.username);
             const hasBid = !!bidderId || !!bidder;
-            const bidderLabel = bidder || (hasBid ? 'enchérisseur…' : null);
+            const bidderLabel = bidder || (hasBid ? 'résolution du pseudo…' : null);
+            const bidderTitle = bidder
+                ? bidder
+                : bidderId
+                    ? `Pseudo en cours de résolution · id ${String(bidderId).slice(0, 8)}…`
+                    : 'aucune mise';
             const marketUrl = `https://www.wiki-masters.com/marketplace/${a.id}`;
             // Échappe le titre pour l'attribut data-* (peut contenir guillemets, apostrophes…)
             const titleAttr = String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -10359,7 +10400,7 @@
                         style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:10px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;flex-shrink:0;">✕</button>` : ''}
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;gap:6px;">
-                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? bidderLabel : 'aucune mise'}">
+                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${bidderTitle}">
                         ${hasBid ? `👤 ${bidderLabel}` : '— pas de mise'}
                     </span>
                     <span style="color:#fbbf24;font-weight:700;white-space:nowrap;">
@@ -12660,6 +12701,52 @@
         );
     }
 
+
+    function looksLikeUuid(v) {
+        return typeof v === 'string' &&
+            /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(v);
+    }
+
+    function harvestUsernamesFromJson(value, depth = 0, seen = new WeakSet()) {
+        if (value == null || depth > 12) return 0;
+
+        if (Array.isArray(value)) {
+            let n = 0;
+            for (const item of value) n += harvestUsernamesFromJson(item, depth + 1, seen);
+            return n;
+        }
+
+        if (typeof value !== 'object') return 0;
+        if (seen.has(value)) return 0;
+        seen.add(value);
+
+        let found = 0;
+        const username = pickUsername(value);
+        const candidateIds = [
+            value.id,
+            value.user_id,
+            value.userId,
+            value.profile_id,
+            value.profileId,
+            value.bidder_id,
+            value.bidderId
+        ].filter(looksLikeUuid);
+
+        if (username && candidateIds.length) {
+            for (const id of candidateIds) {
+                cacheResolvedBidderName(id, username);
+                found++;
+            }
+        }
+
+        for (const child of Object.values(value)) {
+            if (child && typeof child === 'object') {
+                found += harvestUsernamesFromJson(child, depth + 1, seen);
+            }
+        }
+        return found;
+    }
+
     function cacheResolvedBidderName(bidderId, name) {
         const clean = validResolvedUsername(name);
         if (!bidderId || !clean) return;
@@ -12724,6 +12811,96 @@
         return null;
     }
 
+
+    function regexEscapeText(s) {
+        return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    }
+
+    function normalizeNextSerializedText(raw) {
+        return String(raw || '')
+            .replace(/&quot;/g, '"')
+            .replace(/&#34;/g, '"')
+            .replace(/\\u0022/gi, '"')
+            .replace(/\\u0027/gi, "'")
+            .replace(/\\"/g, '"')
+            .replace(/\\\\/g, '\\');
+    }
+
+    function usernameNearUserIdInText(raw, userId) {
+        if (!raw || !userId) return null;
+
+        const text = normalizeNextSerializedText(raw);
+        const id = regexEscapeText(userId);
+        const keys = USERNAME_KEYS
+            .map(regexEscapeText)
+            .join('|');
+
+        // Même objet / même fragment sérialisé : UUID puis pseudo.
+        const after = new RegExp(
+            id + `[\\s\\S]{0,700}?(?:${keys})["']?\\s*[:=]\\s*["']([^"'<>\\\\]{1,80})["']`,
+            'i'
+        );
+        let m = text.match(after);
+        if (m?.[1]) return validResolvedUsername(m[1]);
+
+        // Certaines structures sérialisent username avant id.
+        const before = new RegExp(
+            `(?:${keys})["']?\\s*[:=]\\s*["']([^"'<>\\\\]{1,80})["'][\\s\\S]{0,700}?` + id,
+            'i'
+        );
+        m = text.match(before);
+        if (m?.[1]) return validResolvedUsername(m[1]);
+
+        return null;
+    }
+
+    async function fetchBidderNameFromAuctionPage(a) {
+        if (!a?.id) return null;
+
+        const bidderId = auctionCurrentBidderId(a);
+        if (!bidderId) return null;
+
+        try {
+            const res = await fetch(
+                `/marketplace/${encodeURIComponent(a.id)}`,
+                {
+                    method: 'GET',
+                    credentials: 'include',
+                    headers: {
+                        'Accept': 'text/html,application/xhtml+xml'
+                    }
+                }
+            );
+            if (!res.ok) return null;
+
+            const html = await res.text();
+
+            // D'abord recherche ciblée autour de l'UUID du meneur dans le HTML/RSC Next.
+            let name = usernameNearUserIdInText(html, bidderId);
+            if (name) {
+                cacheResolvedBidderName(bidderId, name);
+                return name;
+            }
+
+            // Deuxième passe : contenus de scripts normalisés séparément.
+            try {
+                const doc = new DOMParser().parseFromString(html, 'text/html');
+                const scriptText = [...doc.querySelectorAll('script')]
+                    .map(s => s.textContent || '')
+                    .join('\n');
+                name = usernameNearUserIdInText(scriptText, bidderId);
+                if (name) {
+                    cacheResolvedBidderName(bidderId, name);
+                    return name;
+                }
+            } catch (e) { }
+
+            return null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     async function fetchActiveSaleBidderFromMarketplace(a) {
         if (!a?.id) return null;
 
@@ -12734,49 +12911,71 @@
         }
 
         const bidderId = auctionCurrentBidderId(a);
-        if (!bidderId) return null; // aucune mise => aucun pseudo à chercher
+        if (!bidderId) return null;
 
         const lastProbe = Number(_activeSaleAuctionProbeAt.get(a.id) || 0);
         if (Date.now() - lastProbe < ACTIVE_SALE_PROBE_COOLDOWN_MS) return null;
         _activeSaleAuctionProbeAt.set(a.id, Date.now());
 
         const cardId = a.card?.id ?? a.card_id;
-        if (!cardId) return null;
 
-        try {
-            // L'API peut ignorer card_id sur certaines versions : on refiltre TOUJOURS par id.
-            const res = await fetch(
-                `${MARKET_API_BASE}?card_id=${encodeURIComponent(cardId)}&limit=50&sort=ending_soon`,
-                { credentials: 'include' }
-            );
-            if (!res.ok) return null;
+        // 1) API marketplace normale : rapide si elle contient encore current_bidder.
+        if (cardId) {
+            try {
+                const res = await fetch(
+                    `${MARKET_API_BASE}?card_id=${encodeURIComponent(cardId)}&limit=100&sort=ending_soon`,
+                    { credentials: 'include' }
+                );
 
-            const data = await res.json().catch(() => null);
-            const rows = Array.isArray(data?.auctions)
-                ? data.auctions
-                : Array.isArray(data)
-                    ? data
-                    : [];
+                if (res.ok) {
+                    const data = await res.json().catch(() => null);
 
-            const exact = rows.find(row => row?.id === a.id);
-            if (!exact) return null;
+                    // Profite de toute structure utilisateur renvoyée par le site.
+                    if (data) harvestUsernamesFromJson(data);
 
-            const name = extractAuctionBidderName(exact);
-            if (!name) return null;
+                    const rows = Array.isArray(data?.auctions)
+                        ? data.auctions
+                        : Array.isArray(data)
+                            ? data
+                            : [];
 
-            applyBidderNameToAuction(a, name);
+                    const exact = rows.find(row => row?.id === a.id);
+                    if (exact) {
+                        const name = extractAuctionBidderName(exact)
+                            || cachedResolvedBidderName(bidderId);
 
-            // Enrichit aussi les caches du Market Watcher si l'enchère y existe.
-            const cachedHit = lastHitsCache.find(h => h?.id === a.id);
-            if (cachedHit) applyBidderNameToAuction(cachedHit, name);
+                        if (name) {
+                            applyBidderNameToAuction(a, name);
 
-            const activeHit = activeHitsMap.get(a.id);
-            if (activeHit?.auction) applyBidderNameToAuction(activeHit.auction, name);
+                            const cachedHit = lastHitsCache.find(h => h?.id === a.id);
+                            if (cachedHit) applyBidderNameToAuction(cachedHit, name);
 
-            return name;
-        } catch (e) {
-            return null;
+                            const activeHit = activeHitsMap.get(a.id);
+                            if (activeHit?.auction) applyBidderNameToAuction(activeHit.auction, name);
+
+                            return name;
+                        }
+                    }
+                }
+            } catch (e) { }
         }
+
+        // 2) La page exacte de l'enchère contient souvent les données Next/RSC même lorsque
+        // l'API de liste omet le profil du meneur.
+        const pageName = await fetchBidderNameFromAuctionPage(a);
+        if (pageName) {
+            applyBidderNameToAuction(a, pageName);
+            return pageName;
+        }
+
+        // 3) Dernière chance : entre-temps une autre réponse du site a pu alimenter le cache.
+        const harvested = cachedResolvedBidderName(bidderId);
+        if (harvested) {
+            applyBidderNameToAuction(a, harvested);
+            return harvested;
+        }
+
+        return null;
     }
 
     async function enrichActiveSalesBidderNames(auctions) {
@@ -17613,6 +17812,7 @@
             // l'associer à sellHistory. Déclarée ici (comme les variables au-dessus) pour rester
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
+            let shouldHarvestUsernames = false;
             try {
                 const req = args[0];
                 const url = (typeof req === 'string') ? req : (req && req.url) || '';
@@ -17625,6 +17825,17 @@
                 // stricte sur l'URL absolue ne matchait jamais, donc auctionId restait toujours
                 // null (bug du 2026-08-20 : plus de re-tag Trash sur les invendus).
                 isMarketplaceCreate = method === 'POST' && /\/api\/marketplace(\?|$)/.test(url);
+
+                // Lecture passive uniquement sur des réponses susceptibles de contenir des
+                // objets utilisateur. Aucun appel supplémentaire n'est déclenché ici.
+                shouldHarvestUsernames =
+                    method === 'GET' &&
+                    (
+                        url.includes('/api/marketplace') ||
+                        /\/api\/(friends|messages|chat|guild|leaderboard|profile|users?)(\/|\?|$)/i.test(url) ||
+                        /\/rest\/v1\/(profiles|users|user_profiles|accounts|players|members)(\?|$)/i.test(url)
+                    );
+
                 // Capture le payload d'un POST /rest/v1/... pour le rejouer/exploiter côté bot.
                 const capture = () => {
                     if (args[1] && typeof args[1].body === 'string') return { body: args[1].body };
@@ -17653,6 +17864,24 @@
             } catch (e) { }
 
             const p = origFetch.apply(this, args);
+
+            if (shouldHarvestUsernames) {
+                p.then(res => {
+                    if (!res || !res.ok) return;
+                    const ct = String(res.headers?.get?.('content-type') || '');
+                    if (ct && !ct.includes('json')) return;
+
+                    res.clone().json().then(data => {
+                        const before = _usernameCache.size;
+                        harvestUsernamesFromJson(data);
+                        if (_usernameCache.size > before) {
+                            // Un pseudo nouvellement appris peut débloquer immédiatement
+                            // l'affichage "Ventes actives".
+                            invalidateSalesDetail();
+                        }
+                    }).catch(() => { });
+                }).catch(() => { });
+            }
 
             if (isMarketplaceCreate) {
                 p.then(res => {
