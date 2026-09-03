@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.2';
+    const WM_VERSION = '2.6.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -453,6 +453,7 @@
     const FLIP_MARKUP_KEY = 'wm_flip_markup_pct';
     const FLIP_DURATION_KEY = 'wm_flip_duration_min';
     const FLIP_UNDERCUT_KEY = 'wm_flip_undercut';
+    const FLIP_REFERENCE_DISCOUNT_KEY = 'wm_flip_reference_discount_pct';
 
     // v2.3.7 : cache propre au tag "vente".
     // L'ancien wm_flip_tag_id_v1 pouvait encore contenir l'UUID de $$$ et était
@@ -486,6 +487,29 @@
         localStorage.setItem(FLIP_MARKUP_KEY, String(n));
         return n;
     }
+    function getFlipReferenceDiscountPct() {
+        const raw = localStorage.getItem(FLIP_REFERENCE_DISCOUNT_KEY);
+        if (raw === null || raw === '') return 5;
+        const n = Number(raw);
+        return Number.isFinite(n) ? Math.max(0, Math.min(50, n)) : 5;
+    }
+
+    function setFlipReferenceDiscountPct(v) {
+        const n = Number(v);
+        const safe = Number.isFinite(n) ? Math.max(0, Math.min(50, n)) : 5;
+        localStorage.setItem(FLIP_REFERENCE_DISCOUNT_KEY, String(safe));
+        return safe;
+    }
+
+    function roundFlipReferencePriceDown(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) return 0;
+        // Même logique lisible que le cap Hunter : dizaine inférieure dès 100.
+        return n >= 100
+            ? Math.max(10, Math.floor(n / 10) * 10)
+            : Math.max(1, Math.floor(n));
+    }
+
     function getFlipDurationMin() {
         const raw = localStorage.getItem(FLIP_DURATION_KEY);
         if (raw === null || raw === '') return 10;
@@ -2050,36 +2074,66 @@
 
     async function resolveFlipSellPrice(rec) {
         const buy = Math.max(1, Number(rec?.buyPrice) || 1);
-        const floor = Math.max(1, Math.ceil(buy * (1 + getFlipMarkupPct() / 100)));
+        const markupPct = getFlipMarkupPct();
+        const floor = Math.max(1, Math.ceil(buy * (1 + markupPct / 100)));
         const stats = getFlipLiveMarketStats(rec);
 
         await fetchWmOfficialSummary(rec?.cardId).catch(() => null);
         const wmAverage = getWmOfficialAverage(rec?.cardId, rec?.rarity);
 
-        let price = floor;
-        let basis = `achat +${getFlipMarkupPct()}%`;
+        const discountPct = getFlipReferenceDiscountPct();
 
-        // Médiane locale fiable prioritaire.
-        if (stats && Number(stats.count) >= 3 && Number(stats.median) > price) {
-            price = Math.round(stats.median);
-            basis = `médiane locale ${stats.median}`;
-        }
-        // Historique local fragile/absent : moyenne officielle WikiMasters en fallback.
-        else if (
-            Number.isFinite(wmAverage) &&
-            wmAverage > price
+        let reference = null;
+        let referenceKind = null;
+        let referenceLabel = null;
+
+        // Référence prioritaire : médiane locale fiable.
+        if (
+            stats &&
+            Number(stats.count) >= 3 &&
+            Number.isFinite(Number(stats.median)) &&
+            Number(stats.median) > 0
         ) {
-            price = Math.round(wmAverage);
-            basis = `moyenne WM ${wmAverage}`;
+            reference = Number(stats.median);
+            referenceKind = 'median';
+            referenceLabel = `médiane locale ${reference}`;
+        }
+        // Sinon moyenne officielle WikiMasters.
+        else if (Number.isFinite(Number(wmAverage)) && Number(wmAverage) > 0) {
+            reference = Number(wmAverage);
+            referenceKind = 'wm_average';
+            referenceLabel = `moyenne WM ${reference}`;
         }
 
+        let price = floor;
+        let basis = `achat +${markupPct}%`;
+
+        if (Number.isFinite(reference) && reference > 0) {
+            const discountedRaw = reference * (1 - discountPct / 100);
+            const discounted = roundFlipReferencePriceDown(discountedRaw);
+
+            // La décote accélère la vente, mais ne peut jamais casser la marge minimale.
+            price = Math.max(floor, discounted);
+            basis =
+                `${referenceLabel} -${discountPct}%` +
+                ` → ${discounted}` +
+                (price > discounted ? ` · plancher ${floor}` : '');
+        }
+
+        // Option historique : undercut encore plus bas que la cible -X %, mais jamais sous le floor.
+        // Elle reste explicitement contrôlée par sa checkbox.
+        let undercut = null;
         if (getFlipUndercut()) {
             const lowest = await fetchLowestActiveListing(rec.cardId).catch(() => null);
             if (Number.isFinite(lowest) && lowest > 1) {
                 const under = Math.max(1, Math.round(lowest - 1));
                 if (under >= floor && under < price) {
+                    const before = price;
                     price = under;
-                    basis = `undercut ${lowest} (plancher ${floor})`;
+                    undercut = { from: before, market: lowest };
+                    basis =
+                        `${basis} · undercut ${lowest} → ${under}` +
+                        ` (plancher ${floor})`;
                 }
             }
         }
@@ -2089,7 +2143,11 @@
             floor,
             basis,
             stats,
-            wmAverage
+            wmAverage,
+            reference,
+            referenceKind,
+            referenceDiscountPct: discountPct,
+            undercut
         };
     }
 
@@ -3032,6 +3090,39 @@
         return result;
     };
 
+    window.wmFlipPriceDiag = async function (auctionIdOrTitle) {
+        const q = String(auctionIdOrTitle || '').trim().toLowerCase();
+        const rec = flipLedger.find(r =>
+            String(r?.auctionId || '').toLowerCase() === q ||
+            String(r?.title || '').toLowerCase() === q
+        );
+
+        if (!rec) {
+            console.warn('[WikiMasters][Flip] flip introuvable :', auctionIdOrTitle);
+            return null;
+        }
+
+        const info = await resolveFlipSellPrice(rec);
+        const result = {
+            version: WM_VERSION,
+            carte: rec.title,
+            rarete: rec.rarity,
+            achat: rec.buyPrice,
+            medianeLocale: info.stats?.median ?? null,
+            ventesLocales: info.stats?.count ?? 0,
+            moyenneWM: info.wmAverage ?? null,
+            reference: info.reference ?? null,
+            sourceReference: info.referenceKind ?? null,
+            decotePct: info.referenceDiscountPct,
+            plancherMarge: info.floor,
+            prixCible: info.price,
+            undercut: info.undercut || null,
+            calcul: info.basis
+        };
+        console.table(result);
+        return result;
+    };
+
     window.wmFlipSellFormDiag = function () {
         const modal = findAuctionSellModal();
         const input = getAuctionStartPriceInput(modal);
@@ -3224,6 +3315,7 @@
             vendus: flipLedger.filter(r => r.status === 'sold').length,
             profitBrutRealise: flipLedger.filter(r => r.status === 'sold').reduce((s, r) => s + Number(r.profit || 0), 0),
             margeCiblePct: getFlipMarkupPct(),
+            decoteReferencePct: getFlipReferenceDiscountPct(),
             dureeMin: getFlipDurationMin(),
             undercut: getFlipUndercut()
         };
@@ -13727,9 +13819,12 @@
                         <button class="wm-btn wm-g wm-sm" id="wm-flip-btn" style="padding:2px 8px;">▶ START</button>
                     </div>
                     <div id="wm-flip-status" style="font-size:9px;color:#888;min-height:13px;margin-bottom:5px;"></div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:5px;">
-                        <label style="font-size:9px;color:#888;">Marge brute mini %
+                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px;">
+                        <label style="font-size:9px;color:#888;">Marge mini %
                             <input id="wm-flip-markup" type="number" min="0" max="500" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#888;">Sous réf. %
+                            <input id="wm-flip-ref-discount" type="number" min="0" max="50" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
                         <label style="font-size:9px;color:#888;">Durée
                             <select id="wm-flip-duration" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
@@ -13741,7 +13836,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Victoire auto → prix d'achat enregistré → tag <b>vente</b>. Chaque ligne affiche la médiane marché live et peut être retirée manuellement avec ×.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = médiane locale (n≥3), sinon moyenne WM, moins <b>5%</b> par défaut · jamais sous la marge mini. Victoire auto → tag <b>vente</b>.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;max-height:300px;overflow-y:auto;padding-right:2px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -14411,6 +14506,7 @@
         const flipBtn = document.getElementById('wm-flip-btn');
         const flipStatus = document.getElementById('wm-flip-status');
         const flipMarkup = document.getElementById('wm-flip-markup');
+        const flipRefDiscount = document.getElementById('wm-flip-ref-discount');
         const flipDuration = document.getElementById('wm-flip-duration');
         const flipUndercut = document.getElementById('wm-flip-undercut');
 
@@ -14422,6 +14518,15 @@
                 wmLog(`💸 Flip Seller : marge brute minimale → <b>${v}%</b>.`);
             };
         }
+        if (flipRefDiscount) {
+            flipRefDiscount.value = getFlipReferenceDiscountPct();
+            flipRefDiscount.onchange = () => {
+                const v = setFlipReferenceDiscountPct(flipRefDiscount.value);
+                flipRefDiscount.value = v;
+                wmLog(`💸 Flip Seller : décote sous référence → <b>${v}%</b>.`);
+            };
+        }
+
         if (flipDuration) {
             flipDuration.value = String(getFlipDurationMin());
             flipDuration.onchange = () => {
