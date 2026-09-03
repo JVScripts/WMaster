@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.3';
+    const WM_VERSION = '2.6.4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3088,6 +3088,29 @@
         };
         console.log('[WikiMasters][summary]', result);
         return result;
+    };
+
+    window.wmActiveSalesUsernames = async function () {
+        invalidateSalesDetail();
+        const st = await fetchSellingState();
+
+        if (!st) {
+            console.warn('[WikiMasters] Ventes actives illisibles.');
+            return null;
+        }
+
+        const rows = (st.list || []).map(a => ({
+            auctionId: a.id,
+            carte: a.card?.wikipedia_title || '?',
+            bidderId: auctionCurrentBidderId(a) || null,
+            pseudo: validResolvedUsername(a.current_bidder?.username) || null,
+            prix: a.current_bid ?? a.base_amount ?? null,
+            fin: a.end_at || null
+        }));
+
+        console.table(rows);
+        renderActiveSales(st.list, st);
+        return rows;
     };
 
     window.wmFlipPriceDiag = async function (auctionIdOrTitle) {
@@ -9907,6 +9930,10 @@
             st.count = detail.list.length;
             st.countSource = 'db';
 
+            // La DB connaît l'UUID du meneur mais pas toujours son pseudo.
+            // Enrichissement via l'annonce marketplace exacte avant rendu du panneau.
+            await enrichActiveSalesBidderNames(st.list);
+
             if (st.rawCount !== st.count && Date.now() - _sellingCountMismatchLoggedAt > 60000) {
                 _sellingCountMismatchLoggedAt = Date.now();
                 wmLog(
@@ -9918,6 +9945,9 @@
         } else if (st.list.length === 0 && st.count > 0) {
             st.list = detail?.list || [];
             st.detailed = st.list.length > 0;
+            await enrichActiveSalesBidderNames(st.list);
+        } else if (st.list.length > 0) {
+            await enrichActiveSalesBidderNames(st.list);
         }
 
         return st;
@@ -10010,8 +10040,10 @@
             const r = RARITY[rarity] || { color: '#888' };
             const rarHex = r.color;
             const bid = a.current_bid ?? a.base_amount ?? 0;
-            const bidder = a.current_bidder?.username || null;
-            const hasBid = bidder !== null;
+            const bidderId = auctionCurrentBidderId(a);
+            const bidder = validResolvedUsername(a.current_bidder?.username);
+            const hasBid = !!bidderId || !!bidder;
+            const bidderLabel = bidder || (hasBid ? 'enchérisseur…' : null);
             const marketUrl = `https://www.wiki-masters.com/marketplace/${a.id}`;
             // Échappe le titre pour l'attribut data-* (peut contenir guillemets, apostrophes…)
             const titleAttr = String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -10046,8 +10078,8 @@
                         style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:10px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;flex-shrink:0;">✕</button>` : ''}
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;gap:6px;">
-                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? bidder : 'aucune mise'}">
-                        ${hasBid ? `👤 ${bidder}` : '— pas de mise'}
+                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${hasBid ? bidderLabel : 'aucune mise'}">
+                        ${hasBid ? `👤 ${bidderLabel}` : '— pas de mise'}
                     </span>
                     <span style="color:#fbbf24;font-weight:700;white-space:nowrap;">
                         ${hasBid ? `${bid} 💰` : `base ${bid} 💰`}
@@ -12241,8 +12273,9 @@
                 _profileProbeLogged = true;
                 wmLog(`🔬 Pseudos non résolus : aucune table de profils lisible parmi <span style="color:#888;">${tried.join(', ')}</span>. Les enchérisseurs s'afficheront « ? ».`);
             }
-            // Les ids non résolus sont mis en cache à '?' pour ne pas être re-demandés en boucle.
-            missing.forEach(id => { if (!_usernameCache.has(id)) _usernameCache.set(id, '?'); });
+            // Ne PAS mémoriser '?' durablement : le pseudo peut être récupéré ensuite par
+            // l'API marketplace publique, ou une table de profil peut devenir lisible après
+            // reconnexion. Le cache ne conserve que les pseudos réellement résolus.
         }
         const out = {};
         (ids || []).forEach(id => { if (id) out[id] = _usernameCache.get(id) || '?'; });
@@ -12317,6 +12350,187 @@
         const names = await resolveUsernames(
             rows.flatMap(r => [r.current_bidder_id, r.seller_id]));
         return rows.map(r => adaptAuctionRow(r, names));
+    }
+
+
+    /* ── Pseudos des enchérisseurs dans "Ventes actives" ──
+       La table `auctions` expose current_bidder_id mais pas forcément le profil associé.
+       L'API marketplace normale, elle, renvoie déjà `current_bidder.username` dans ses
+       annonces (même source que le Market Watcher). On l'utilise uniquement pour enrichir
+       les ventes dont le pseudo est encore inconnu. */
+    const _activeSaleBidderNameCache = new Map(); // bidderId -> {name, ts}
+    const _activeSaleAuctionProbeAt = new Map();  // auctionId -> timestamp
+    const ACTIVE_SALE_NAME_TTL_MS = 6 * 60 * 60 * 1000;
+    const ACTIVE_SALE_PROBE_COOLDOWN_MS = 20 * 1000;
+
+    function validResolvedUsername(name) {
+        const s = String(name || '').trim();
+        return s && s !== '?' ? s : null;
+    }
+
+    function extractAuctionBidderName(a) {
+        return validResolvedUsername(
+            a?.current_bidder?.username ||
+            a?.current_bidder?.user_name ||
+            a?.current_bidder?.display_name ||
+            a?.bidder?.username ||
+            a?.bidder_username ||
+            a?.current_bidder_username
+        );
+    }
+
+    function cacheResolvedBidderName(bidderId, name) {
+        const clean = validResolvedUsername(name);
+        if (!bidderId || !clean) return;
+        _activeSaleBidderNameCache.set(String(bidderId), {
+            name: clean,
+            ts: Date.now()
+        });
+        _usernameCache.set(String(bidderId), clean);
+    }
+
+    function cachedResolvedBidderName(bidderId) {
+        if (!bidderId) return null;
+
+        const direct = validResolvedUsername(_usernameCache.get(String(bidderId)));
+        if (direct) return direct;
+
+        const hit = _activeSaleBidderNameCache.get(String(bidderId));
+        if (!hit) return null;
+        if (Date.now() - Number(hit.ts || 0) > ACTIVE_SALE_NAME_TTL_MS) {
+            _activeSaleBidderNameCache.delete(String(bidderId));
+            return null;
+        }
+        return validResolvedUsername(hit.name);
+    }
+
+    function applyBidderNameToAuction(a, name) {
+        const clean = validResolvedUsername(name);
+        if (!a || !clean) return false;
+
+        const bidderId = auctionCurrentBidderId(a);
+        a.current_bidder = {
+            ...(a.current_bidder || {}),
+            ...(bidderId ? { id: bidderId } : {}),
+            username: clean
+        };
+
+        if (bidderId) cacheResolvedBidderName(bidderId, clean);
+        return true;
+    }
+
+    function findKnownBidderNameForActiveSale(a) {
+        if (!a?.id) return null;
+
+        // 1) Déjà fourni par la ligne elle-même.
+        let name = extractAuctionBidderName(a);
+        if (name) return name;
+
+        // 2) Cache par UUID utilisateur.
+        const bidderId = auctionCurrentBidderId(a);
+        name = cachedResolvedBidderName(bidderId);
+        if (name) return name;
+
+        // 3) Market Watcher / hot-lane ont peut-être déjà vu cette enchère avec le profil.
+        const cachedHit = lastHitsCache.find(h => h?.id === a.id);
+        name = extractAuctionBidderName(cachedHit);
+        if (name) return name;
+
+        const activeHit = activeHitsMap.get(a.id)?.auction;
+        name = extractAuctionBidderName(activeHit);
+        if (name) return name;
+
+        return null;
+    }
+
+    async function fetchActiveSaleBidderFromMarketplace(a) {
+        if (!a?.id) return null;
+
+        const known = findKnownBidderNameForActiveSale(a);
+        if (known) {
+            applyBidderNameToAuction(a, known);
+            return known;
+        }
+
+        const bidderId = auctionCurrentBidderId(a);
+        if (!bidderId) return null; // aucune mise => aucun pseudo à chercher
+
+        const lastProbe = Number(_activeSaleAuctionProbeAt.get(a.id) || 0);
+        if (Date.now() - lastProbe < ACTIVE_SALE_PROBE_COOLDOWN_MS) return null;
+        _activeSaleAuctionProbeAt.set(a.id, Date.now());
+
+        const cardId = a.card?.id ?? a.card_id;
+        if (!cardId) return null;
+
+        try {
+            // L'API peut ignorer card_id sur certaines versions : on refiltre TOUJOURS par id.
+            const res = await fetch(
+                `${MARKET_API_BASE}?card_id=${encodeURIComponent(cardId)}&limit=50&sort=ending_soon`,
+                { credentials: 'include' }
+            );
+            if (!res.ok) return null;
+
+            const data = await res.json().catch(() => null);
+            const rows = Array.isArray(data?.auctions)
+                ? data.auctions
+                : Array.isArray(data)
+                    ? data
+                    : [];
+
+            const exact = rows.find(row => row?.id === a.id);
+            if (!exact) return null;
+
+            const name = extractAuctionBidderName(exact);
+            if (!name) return null;
+
+            applyBidderNameToAuction(a, name);
+
+            // Enrichit aussi les caches du Market Watcher si l'enchère y existe.
+            const cachedHit = lastHitsCache.find(h => h?.id === a.id);
+            if (cachedHit) applyBidderNameToAuction(cachedHit, name);
+
+            const activeHit = activeHitsMap.get(a.id);
+            if (activeHit?.auction) applyBidderNameToAuction(activeHit.auction, name);
+
+            return name;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    async function enrichActiveSalesBidderNames(auctions) {
+        if (!Array.isArray(auctions) || auctions.length === 0) return auctions;
+
+        const needs = [];
+        for (const a of auctions) {
+            const bidderId = auctionCurrentBidderId(a);
+            if (!bidderId) continue;
+
+            const known = findKnownBidderNameForActiveSale(a);
+            if (known) {
+                applyBidderNameToAuction(a, known);
+                continue;
+            }
+            needs.push(a);
+        }
+
+        if (needs.length === 0) return auctions;
+
+        // Peu de ventes actives simultanées ; 3 workers évitent néanmoins une rafale de fetch.
+        let idx = 0;
+        const worker = async () => {
+            while (idx < needs.length) {
+                const a = needs[idx++];
+                await fetchActiveSaleBidderFromMarketplace(a);
+                await new Promise(r => setTimeout(r, 90));
+            }
+        };
+
+        await Promise.all(
+            Array.from({ length: Math.min(3, needs.length) }, () => worker())
+        );
+
+        return auctions;
     }
 
     // Mes ventes en cours — remplace le `selling` disparu de /api/marketplace/mine.
