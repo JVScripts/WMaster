@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.6.9';
+    const WM_VERSION = '2.8.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -96,13 +96,11 @@
     };
 
 
-    /* ══════════ RECHERCHE GLOBALE + SOURCE HUNTER DYNAMIQUE (v2.2) ══════════
+    /* ══════════ RECHERCHE GLOBALE + SOURCE HUNTER DYNAMIQUE ══════════
        - Recherche globale : UNIQUEMENT un filtre de rareté, totalement indépendant des
          mots-clés Standards / Prioritaires / Fourbe / Chasseur ciblé.
        - Hunter dynamique : l'utilisateur choisit sa source : Standards, Recherche globale,
          ou union des deux.
-       - Historique local : collecte l'union Standards + Recherche globale afin qu'un changement
-         de source Hunter ne fasse pas repartir les statistiques de zéro.
        - Les Exclus restent un garde-fou commun aux deux sources. */
     const GLOBAL_SEARCH_RARITIES_KEY = 'wm_global_search_rarities_v1';
     const HUNTER_DYNAMIC_SOURCE_KEY = 'wm_hunter_dynamic_source_v1';
@@ -194,10 +192,6 @@
     function getHunterDynamicCandidatePool(list) {
         if (!Array.isArray(list) || list.length === 0) return [];
         return list.filter(a => hunterDynamicMatchesSource(a));
-    }
-
-    function localHistoryShouldObserve(auction) {
-        return globalSearchMatchesAuction(auction) || standardSearchMatchesAuction(auction);
     }
 
     function hunterDynamicSourceLabel(short = false) {
@@ -444,7 +438,7 @@
        4) le Flip Seller peut le revendre ensuite par user_card_id exact.
 
        Le prix de revente est prudent : plancher = prix d'achat + marge brute configurée ;
-       si une médiane locale/officielle fiable (>=3 ventes) est supérieure, on vise la médiane.
+       si une moyenne officielle WM est disponible, elle est utilisée comme référence.
        L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
        plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
     const FLIP_TAG_NAME = 'vente';
@@ -629,7 +623,7 @@
                         saveFlipLedger();
                         renderFlipHistory();
                     }
-                }).catch(() => { });
+                }).catch(() => {});
             }, delay);
         }
     }
@@ -2162,11 +2156,11 @@
         reconcileAutoFlipCandidatesById()
             .then(result => {
                 if (result?.wins > 0) {
-                    retryPendingFlipTags().catch(() => { });
+                    retryPendingFlipTags().catch(() => {});
                     wakeFlipSeller();
                 }
             })
-            .catch(() => { });
+            .catch(() => {});
     }, 15_000);
 
     async function retryPendingFlipTags() {
@@ -2383,97 +2377,29 @@
         return true;
     };
 
-    function getFlipLiveMarketStats(rec) {
-        if (!rec?.cardId) return null;
-        let stats = null;
-        // Après initialisation v2.2, getCachedSales() pointe déjà sur l'historique local pour
-        // les comptes non-PRO. Le fallback direct rend aussi l'affichage robuste pendant le boot.
-        try { stats = getCachedSales(rec.cardId, rec.rarity); } catch (e) { stats = null; }
-        if (!stats || !Number(stats.count)) {
-            try { stats = getLocalMarketStats(rec.cardId, rec.rarity); } catch (e) { }
-        }
-        if (!stats || !Number(stats.count) || !Number.isFinite(Number(stats.median))) return null;
-        return {
-            median: Number(stats.median),
-            count: Number(stats.count) || 0,
-            last: Number.isFinite(Number(stats.last)) ? Number(stats.last) : null,
-            min: Number.isFinite(Number(stats.min)) ? Number(stats.min) : null,
-            max: Number.isFinite(Number(stats.max)) ? Number(stats.max) : null
-        };
-    }
 
     function flipMarketRecapHtml(rec) {
-        const stats = getFlipLiveMarketStats(rec);
-
-        // Pour le Flip, on privilégie le snapshot explicitement rafraîchi.
-        // Le cache général reste uniquement un affichage de secours au tout premier rendu.
         const storedWm = getStoredFlipOfficialAverage(rec);
         const cachedWm = getWmOfficialAverage(rec?.cardId, rec?.rarity);
-        const wmAverage = storedWm?.average ??
-            (Number.isFinite(Number(cachedWm)) ? Number(cachedWm) : null);
-
+        const wmAverage = storedWm?.average ?? (Number.isFinite(Number(cachedWm)) ? Number(cachedWm) : null);
         if (rec?.cardId && !storedWm) queueWmOfficialSummaryFetch(rec.cardId);
-
-        const ref = rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))
-            ? Number(rec.listPrice)
-            : Number(rec.buyPrice || 0);
-
-        const parts = [];
-
-        if (stats) {
-            const med = Number(stats.median);
-            const reliable = Number(stats.count) >= 3;
-            let comparison = '';
-            if (med > 0 && ref > 0) {
-                const pct = Math.round((ref / med - 1) * 100);
-                const color = rec.status === 'listed'
-                    ? (pct > 15 ? '#ef4444' : pct > 5 ? '#fbbf24' : pct < -15 ? '#06b6d4' : '#4ade80')
-                    : (pct <= -20 ? '#4ade80' : '#aaa');
-                comparison = ` · <span style="color:${color};">${rec.status === 'listed' ? 'vente' : 'achat'} ${pct >= 0 ? '+' : ''}${pct}% vs méd.</span>`;
-            }
-            const reliability = reliable ? '' : ' · <span style="color:#fbbf24;">⚠ n&lt;3</span>';
-            const last = stats.last != null ? ` · dern. ${Number(stats.last).toLocaleString('fr-FR')}` : '';
-            parts.push(
-                `<span style="color:${reliable ? '#c4b5fd' : '#888'};">méd. <b>${med.toLocaleString('fr-FR')}</b> · n=${stats.count}</span>` +
-                `${last}${comparison}${reliability}`
-            );
-        } else {
-            parts.push('<span style="color:#555;">méd. —</span>');
+        if (!Number.isFinite(wmAverage) || wmAverage <= 0) return '<span style="color:#444;">moy. WM …</span>';
+        let freshText = '';
+        if (storedWm) {
+            const ageSec = Math.floor(storedWm.ageMs / 1000);
+            freshText = ageSec < 60 ? ` · maj ${Math.max(1, ageSec)}s` : ` · maj ${Math.floor(ageSec / 60)}m`;
         }
-
-        if (Number.isFinite(wmAverage) && wmAverage > 0) {
-            let freshText = '';
-            if (storedWm) {
-                const ageSec = Math.floor(storedWm.ageMs / 1000);
-                freshText = ageSec < 60
-                    ? ` · maj ${Math.max(1, ageSec)}s`
-                    : ` · maj ${Math.floor(ageSec / 60)}m`;
+        let marketDrift = '';
+        if (rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))) {
+            const target = roundFlipReferencePriceDown(wmAverage * (1 - getFlipReferenceDiscountPct() / 100));
+            const lp = Number(rec.listPrice);
+            if (target > 0 && lp > 0) {
+                const pct = Math.round((lp / target - 1) * 100);
+                marketDrift = ` · <span style="color:${Math.abs(pct) <= 5 ? '#4ade80' : '#fbbf24'};">cible actuelle ${target.toLocaleString('fr-FR')} (${pct >= 0 ? '+' : ''}${pct}%)</span>`;
             }
-
-            let marketDrift = '';
-            if (rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))) {
-                const target = roundFlipReferencePriceDown(
-                    wmAverage * (1 - getFlipReferenceDiscountPct() / 100)
-                );
-                const lp = Number(rec.listPrice);
-                if (target > 0 && lp > 0) {
-                    const pct = Math.round((lp / target - 1) * 100);
-                    marketDrift =
-                        ` · <span style="color:${Math.abs(pct) <= 5 ? '#4ade80' : '#fbbf24'};">` +
-                        `cible actuelle ${target.toLocaleString('fr-FR')} (${pct >= 0 ? '+' : ''}${pct}%)</span>`;
-                }
-            }
-
-            parts.push(
-                `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b>${freshText}${marketDrift}</span>`
-            );
-        } else {
-            parts.push('<span style="color:#444;">moy. WM …</span>');
         }
-
-        return parts.join(' · ');
+        return `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b>${freshText}${marketDrift}</span>`;
     }
-
 
     function flipAgeLabel(rec) {
         const t = Number(rec?.boughtAt);
@@ -2488,9 +2414,8 @@
         const buy = Math.max(1, Number(rec?.buyPrice) || 1);
         const markupPct = getFlipMarkupPct();
         const floor = Math.max(1, Math.ceil(buy * (1 + markupPct / 100)));
-        const stats = getFlipLiveMarketStats(rec);
 
-        // v2.6.8 : CHAQUE listing/relisting force une nouvelle lecture de la moyenne WM.
+        // v2.8.0 : CHAQUE listing/relisting force une nouvelle lecture de la moyenne WM.
         // On ne fixe jamais un prix Flip à partir du cache général de 6 h.
         const fresh = await refreshFlipOfficialAverage(rec, {
             force: true,
@@ -2558,7 +2483,6 @@
             price: Math.max(1, Math.round(price)),
             floor,
             basis,
-            stats,
             wmAverage,
             wmAverageFetchedAt: Number(rec?.wmAverageFetchedAt || 0),
             reference,
@@ -3387,7 +3311,7 @@
         };
 
         const hidden = Math.max(0, sorted.filter(r => r && r.status !== 'sold').length - openRows.length);
-        el.innerHTML = `<div style="font-size:8px;color:#555;margin-bottom:4px;">Prix live = médiane locale carte + rareté sur 30 j · n&lt;3 = fragile · moyenne WM officielle en complément/fallback.</div>` +
+        el.innerHTML = `<div style="font-size:8px;color:#555;margin-bottom:4px;">Prix live = moyenne officielle WikiMasters · actualisée automatiquement pour les Flips.</div>` +
             rows.map(r => {
                 const rarNow = htmlEsc(r.rarity || '?');
                 const boughtRar = String(r.purchaseRarity || '').toUpperCase();
@@ -3615,6 +3539,24 @@
         return rows;
     };
 
+    window.wmHunterPriceDiag = async function (cardId, rarity = '') {
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (cardId) await fetchWmOfficialSummary(cardId, true).catch(() => null);
+        const ref = getHunterPricingReference(cardId, rr);
+        const result = {
+            version: WM_VERSION,
+            cardId,
+            rarete: rr,
+            moyenneWM: ref?.value ?? null,
+            sourceUtiliseePourAchat: ref ? 'moyenne officielle WikiMasters' : 'aucune',
+            ratioPct: Math.round(Number(getSetting('autoSnipeAdaptiveRatio')) * 100),
+            plafondHunter: ref ? dynamicHunterCapFromReference(ref.value) : null,
+            achatPossible: !!(ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_REFERENCE)
+        };
+        console.table(result);
+        return result;
+    };
+
     window.wmFlipLayoutDiag = function () {
         const hist = document.getElementById('wm-flip-history');
         const body = hist?.closest('.wm-pb');
@@ -3703,7 +3645,6 @@
             decotePct: getFlipReferenceDiscountPct(),
             margeMiniPct: getFlipMarkupPct(),
             dureeMin: getFlipDurationMin(),
-            medianeLocale: 'affichage uniquement',
             fallbackSiMoyenneAbsente: 'plancher achat + marge mini',
             undercut: getFlipUndercut()
         };
@@ -3713,28 +3654,17 @@
 
     window.wmFlipPriceDiag = async function (auctionIdOrTitle) {
         const q = String(auctionIdOrTitle || '').trim().toLowerCase();
-        const rec = flipLedger.find(r =>
-            String(r?.auctionId || '').toLowerCase() === q ||
-            String(r?.title || '').toLowerCase() === q
-        );
-
-        if (!rec) {
-            console.warn('[WikiMasters][Flip] flip introuvable :', auctionIdOrTitle);
-            return null;
-        }
-
+        const rec = flipLedger.find(r => String(r?.auctionId || '').toLowerCase() === q || String(r?.title || '').toLowerCase() === q);
+        if (!rec) { console.warn('[WikiMasters][Flip] flip introuvable :', auctionIdOrTitle); return null; }
         const info = await resolveFlipSellPrice(rec);
         const result = {
             version: WM_VERSION,
             carte: rec.title,
             rarete: rec.rarity,
             achat: rec.buyPrice,
-            medianeLocale: info.stats?.median ?? null,
-            ventesLocales: info.stats?.count ?? 0,
             moyenneWM: info.wmAverage ?? null,
             reference: info.reference ?? null,
             sourceReference: info.referenceKind ?? 'aucune_moyenne_WM',
-            medianeLocaleInformative: info.stats?.median ?? null,
             decotePct: info.referenceDiscountPct,
             plancherMarge: info.floor,
             prixCible: info.price,
@@ -3948,8 +3878,8 @@
 
     window.wmFlipDeepResolve = async function () {
         const n = await deepResolvePendingFlipRecords(true);
-        await retryPendingFlipTags().catch(() => { });
-        await syncManualFlipTags().catch(() => { });
+        await retryPendingFlipTags().catch(() => {});
+        await syncManualFlipTags().catch(() => {});
         renderFlipHistory();
         console.log(`[WikiMasters][Flip] résolution profonde forcée : ${n} exemplaire(s) retrouvé(s).`);
         return n;
@@ -4419,50 +4349,23 @@
     let lastHitsCache = []; // cache pour re-render sans attendre le prochain scan
     let lastAllMarketAuctions = []; // scan complet : source Recherche globale / Hunter dynamique v2.2
 
-    /* ═══════ HISTORIQUE DES VENTES & VALORISATION ═══════ */
-    // Cache localStorage des ventes passées par carte : card_id → { median, count, fetchedAt }
-    // L'historique bouge sur des jours/semaines, donc un TTL long évite de refetcher inutilement.
-    const SALES_CACHE_KEY = 'wm_sales_cache_30d_v1';
-    const SALES_CACHE_TTL = 12 * 3600 * 1000; // 12h
-    let salesCache = {};
-    try { salesCache = JSON.parse(localStorage.getItem(SALES_CACHE_KEY) || '{}') || {}; } catch (e) { salesCache = {}; }
-    function saveSalesCache() {
-        try {
-            // Purge les entrées périmées (>TTL) avant d'écrire : getCachedSales() les traite
-            // déjà comme invalides à la lecture, donc les retirer du stockage ne change aucun
-            // comportement (elles seront simplement re-fetchées, comme un cache-miss normal).
-            // Sans ça, ce cache grossit indéfiniment (une entrée par carte distincte croisée
-            // en scan) et devenait l'une des plus grosses clés localStorage du compte.
-            const now = Date.now();
-            for (const id in salesCache) {
-                if (now - (salesCache[id].fetchedAt || 0) > SALES_CACHE_TTL) delete salesCache[id];
-            }
-            localStorage.setItem(SALES_CACHE_KEY, JSON.stringify(salesCache));
-        } catch (e) { }
-    }
-    // Purge immédiatement au chargement du script (pas seulement à la prochaine vente fetchée) :
-    // un cache déjà gonflé par les anciennes versions doit dégonfler dès le premier chargement
-    // de la page, sans attendre qu'un fetchCardSales() ait l'occasion de tourner — sinon un
-    // quota déjà dépassé ne se résorbe pas tout seul.
-    saveSalesCache();
+    /* ═══════ PRIX OFFICIEL WIKIMASTERS — scope=summary ═══════
+       v2.8.0 : toutes les références de prix automatiques utilisent exclusivement
+       la moyenne officielle WikiMasters par carte + rareté.
 
-    /* ═══════ MOYENNE OFFICIELLE WIKIMASTERS — scope=summary ═══════
-       Endpoint public pour une card_id valide, même si la carte n'est pas possédée :
+       Endpoint :
        /api/marketplace/cards/{card_id}/sales?scope=summary
+
        Réponse observée :
        { wikipedia_title, summary: { UR:{average:...}, L:{average:...}, ... }, isPro:false }
 
-       Cette donnée est séparée de l'historique /sales complet (toujours PRO).
-       Elle sert de fallback au Hunter quand n local < 3, et de seconde référence UI. */
+       L'ancien historique 30 j n'est plus chargé ni analysé pour produire une valeur centrale. */
     const WM_OFFICIAL_SUMMARY_KEY = 'wm_official_sales_summary_v1';
-    const WM_OFFICIAL_SUMMARY_TTL_MS = 6 * 60 * 60 * 1000; // 6 h
+    const WM_OFFICIAL_SUMMARY_TTL_MS = 6 * 60 * 60 * 1000;
     let wmOfficialSummaryCache = {};
     try {
-        wmOfficialSummaryCache =
-            JSON.parse(localStorage.getItem(WM_OFFICIAL_SUMMARY_KEY) || '{}') || {};
-    } catch (e) {
-        wmOfficialSummaryCache = {};
-    }
+        wmOfficialSummaryCache = JSON.parse(localStorage.getItem(WM_OFFICIAL_SUMMARY_KEY) || '{}') || {};
+    } catch (e) { wmOfficialSummaryCache = {}; }
 
     const wmOfficialSummaryInflight = new Map();
 
@@ -4517,11 +4420,7 @@
             const cached = getCachedWmOfficialSummary(cardId);
             if (cached) return cached;
         }
-
-        if (wmOfficialSummaryInflight.has(cardId)) {
-            return await wmOfficialSummaryInflight.get(cardId);
-        }
-
+        if (wmOfficialSummaryInflight.has(cardId)) return await wmOfficialSummaryInflight.get(cardId);
         const promise = (async () => {
             try {
                 const res = await fetch(
@@ -4535,17 +4434,11 @@
                 wmOfficialSummaryCache[cardId] = normalized;
                 saveWmOfficialSummaryCache();
                 return normalized;
-            } catch (e) {
-                return null;
-            }
+            } catch (e) { return null; }
         })();
-
         wmOfficialSummaryInflight.set(cardId, promise);
-        try {
-            return await promise;
-        } finally {
-            wmOfficialSummaryInflight.delete(cardId);
-        }
+        try { return await promise; }
+        finally { wmOfficialSummaryInflight.delete(cardId); }
     }
 
     const wmOfficialSummaryQueue = [];
@@ -4556,7 +4449,7 @@
         if (!cardId || getCachedWmOfficialSummary(cardId) || wmOfficialSummaryQueued.has(cardId)) return;
         wmOfficialSummaryQueued.add(cardId);
         wmOfficialSummaryQueue.push(cardId);
-        processWmOfficialSummaryQueue().catch(() => { });
+        processWmOfficialSummaryQueue().catch(() => {});
     }
 
     async function processWmOfficialSummaryQueue() {
@@ -4566,206 +4459,98 @@
             while (wmOfficialSummaryQueue.length > 0) {
                 const cardId = wmOfficialSummaryQueue.shift();
                 wmOfficialSummaryQueued.delete(cardId);
-                if (!getCachedWmOfficialSummary(cardId)) {
-                    await fetchWmOfficialSummary(cardId);
-                }
+                if (!getCachedWmOfficialSummary(cardId)) await fetchWmOfficialSummary(cardId);
                 await new Promise(r => setTimeout(r, 220));
             }
-        } finally {
-            wmOfficialSummaryQueueRunning = false;
+        } finally { wmOfficialSummaryQueueRunning = false; }
+    }
+
+    /* Adaptateur interne pour les anciennes fonctions qui attendent {avg,count,...}.
+       La valeur provient exclusivement du summary officiel. */
+    function officialPriceEntry(cardId, rarity = '') {
+        if (!cardId) return null;
+        const cached = getCachedWmOfficialSummary(cardId);
+        if (!cached) return null;
+        let rr = String(rarity || '').trim().toUpperCase();
+        if (!rr) {
+            const available = Object.keys(cached.summary || {});
+            if (available.length !== 1) return null;
+            rr = available[0];
         }
+        const avg = Number(cached?.summary?.[rr]?.average);
+        if (!Number.isFinite(avg) || avg <= 0) return null;
+        return {
+            avg,
+            count: 1,
+            last: null,
+            min: null,
+            max: null,
+            fetchedAt: Number(cached.fetchedAt || Date.now()),
+            source: 'wm_summary',
+            rarity: rr
+        };
     }
 
-    function getCachedSales(cardId) {
-        const entry = salesCache[cardId];
-        if (!entry) return null;
-        if (Date.now() - entry.fetchedAt > SALES_CACHE_TTL) return null; // périmé
-        // Invalide les entrées de l'ancien format (avant l'ajout de avg/min/max/last)
-        if (entry.count > 0 && entry.avg === undefined) return null;
-        // Normalise les médianes à demi-entier des anciennes entrées (cache d'avant l'arrondi)
-        if (Number.isFinite(entry.median) && entry.median % 1 !== 0) entry.median = Math.round(entry.median);
-        return entry;
-    }
-    // File d'attente des cartes à fetcher (étalée pour ne pas flooder l'API)
-    const salesFetchQueue = [];
-    const salesFetchQueued = new Set(); // évite les doublons dans la file
-    let salesFetchRunning = false;
+    function getCachedSales(cardId, rarity = '') { return officialPriceEntry(cardId, rarity); }
 
-    function median(nums) {
-        if (!nums.length) return 0;
-        const s = [...nums].sort((a, b) => a - b);
-        const mid = Math.floor(s.length / 2);
-        // Arrondi à l'entier : on ne peut pas miser en dessous de 1, ni en décimales
-        const m = s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
-        return Math.round(m);
+    async function fetchCardSales(cardId, rarity = '') {
+        if (!cardId) return null;
+        await fetchWmOfficialSummary(cardId, true).catch(() => null);
+        return officialPriceEntry(cardId, rarity);
     }
 
-    // Récupère et met en cache l'historique des 30 derniers jours d'une carte
-    async function fetchCardSales(cardId) {
-        try {
-            const res = await fetch(
-                `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
-                { credentials: "include" }
-            );
-
-            if (!res.ok) return null;
-
-            const data = await res.json();
-
-            // Fenêtre glissante de 30 jours
-            const cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
-
-            // On ne garde que :
-            // - les ventes avec un prix final valide
-            // - les ventes avec une date valide
-            // - les ventes réalisées dans les 30 derniers jours
-            const sales = (data.sales || []).filter(s => {
-                if (!Number.isFinite(s.final_price)) return false;
-                if (!s.settled_at) return false;
-
-                const ts = new Date(s.settled_at).getTime();
-
-                return Number.isFinite(ts) && ts >= cutoff;
-            });
-
-            const prices = sales.map(s => s.final_price);
-
-            // Plus récente en premier
-            const recent = sales
-                .slice()
-                .sort((a, b) =>
-                    new Date(b.settled_at).getTime() -
-                    new Date(a.settled_at).getTime()
-                );
-
-            const entry = {
-                median: median(prices),
-                count: prices.length,
-                last: recent.length ? recent[0].final_price : null,
-                avg: prices.length
-                    ? Math.round(prices.reduce((sum, p) => sum + p, 0) / prices.length)
-                    : null,
-                min: prices.length ? Math.min(...prices) : null,
-                max: prices.length ? Math.max(...prices) : null,
-                fetchedAt: Date.now()
-            };
-
-            salesCache[cardId] = entry;
-            saveSalesCache();
-
-            return entry;
-
-        } catch (e) {
+    function computeValuation(currentPrice, cardId, rarity = '') {
+        const rr = String(rarity || '').trim().toUpperCase();
+        const avg = getWmOfficialAverage(cardId, rr);
+        if (!Number.isFinite(avg) || avg <= 0) {
+            queueWmOfficialSummaryFetch(cardId);
             return null;
         }
+        const ratio = Number(currentPrice) / avg;
+        const formatted = avg.toLocaleString('fr-FR');
+        const tip = `Moyenne officielle WikiMasters : ${formatted} 💰`;
+        const common = { count:1, wmAverage:avg, reference:avg, referenceKind:'wm_average', tip };
+        if (ratio < 0.75) return { ...common, status:'under', label:`sous-coté · moy. WM ${formatted}`, color:'#4ade80' };
+        if (ratio > 1.25) return { ...common, status:'over', label:`surcoté · moy. WM ${formatted}`, color:'#ef4444' };
+        return { ...common, status:'fair', label:`dans la zone · moy. WM ${formatted}`, color:'#888' };
     }
 
-    // Traite la file d'attente, une carte à la fois avec délai aléatoire (anti-flood)
-    async function processSalesQueue(onUpdate) {
-        if (salesFetchRunning) return;
-        salesFetchRunning = true;
-        while (salesFetchQueue.length > 0) {
-            const cardId = salesFetchQueue.shift();
-            salesFetchQueued.delete(cardId);
-            if (getCachedSales(cardId)) continue; // déjà en cache valide entre-temps
-            await fetchCardSales(cardId);
-            if (onUpdate) onUpdate();
-            // Délai aléatoire 2-4s entre chaque requête pour étaler la charge
-            await new Promise(r => setTimeout(r, 2000 + Math.random() * 2000));
-        }
-        salesFetchRunning = false;
-    }
+    // v2.8.0 — Hunter dynamique : la SEULE référence d'achat est
+    // la moyenne officielle WikiMasters de la carte + rareté.
+    //
+    // Même garde-fou historique : moyenne WM ≥ 500 requise.
+    const HUNTER_DYNAMIC_MIN_REFERENCE = 500;
 
-    function queueSalesFetch(cardId) {
-        if (!cardId || salesFetchQueued.has(cardId) || getCachedSales(cardId)) return;
-        salesFetchQueued.add(cardId);
-        salesFetchQueue.push(cardId);
-    }
-
-    // Calcule le statut de valorisation d'une enchère par rapport à son historique.
-    // Retourne :
-    //   - null               → pas encore chargé (afficher ⋯)
-    //   - { status:'none' }  → chargé mais aucune vente
-    //   - { status:'few'|'under'|'fair'|'over', ... } → données disponibles
-    function computeValuation(currentPrice, cardId) {
-        const entry = getCachedSales(cardId);
-        if (!entry) return null; // pas en cache → en cours de chargement
-        if (entry.count === 0) {
-            return { status: 'none', label: 'aucune vente', color: '#555', median: 0, count: 0, tip: 'Aucune vente enregistrée pour cette carte' };
-        }
-        // Tooltip détaillé commun à tous les statuts
-        const fmt = (n) => (n == null ? '?' : Number(n).toLocaleString('fr-FR'));
-        const tip = `${entry.count} vente(s)`
-            + ` · dernier ${fmt(entry.last)} 💰`
-            + ` · moy. ${fmt(entry.avg)} 💰`
-            + ` · méd. ${fmt(entry.median)} 💰`
-            + ` · min ${fmt(entry.min)} 💰`
-            + ` · max ${fmt(entry.max)} 💰`;
-        if (entry.count < 3) {
-            return { status: 'few', label: `~${entry.median} (${entry.count} vente${entry.count > 1 ? 's' : ''})`, color: '#666', median: entry.median, count: entry.count, tip };
-        }
-        const ratio = currentPrice / entry.median;
-        if (ratio < 0.75) {
-            return { status: 'under', label: `sous-coté · méd. ${entry.median}`, color: '#4ade80', median: entry.median, count: entry.count, tip };
-        } else if (ratio > 1.25) {
-            return { status: 'over', label: `surcoté · méd. ${entry.median}`, color: '#ef4444', median: entry.median, count: entry.count, tip };
-        } else {
-            return { status: 'fair', label: `dans la moy. · méd. ${entry.median}`, color: '#888', median: entry.median, count: entry.count, tip };
-        }
-    }
-
-    // Hunter dynamique : en-dessous de cette médiane, aucun achat automatique.
-    // 500 est autorisé ; 499 et moins sont ignorés.
-    const HUNTER_DYNAMIC_MIN_MEDIAN = 500;
-
-    // v2.3.9 : plafond dynamique plus conservateur. Le ratio reste configurable,
-    // mais le résultat est arrondi vers le BAS à la dizaine à partir de 100 Wbid.
-    // Exemple : médiane 942 × 75% = 706,5 → plafond réel 700.
-    function dynamicHunterCapFromMedian(median) {
-        const med = Number(median);
-        if (!Number.isFinite(med) || med <= 0) return 0;
+    // Plafond dynamique = ratio configuré × moyenne officielle WM,
+    // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
+    // Exemple : moyenne WM 942 × 75% = 706,5 → plafond réel 700.
+    function dynamicHunterCapFromReference(reference) {
+        const ref = Number(reference);
+        if (!Number.isFinite(ref) || ref <= 0) return 0;
         const ratio = Number(getSetting('autoSnipeAdaptiveRatio'));
         if (!Number.isFinite(ratio) || ratio <= 0) return 0;
-        const raw = med * ratio;
+        const raw = ref * ratio;
         return raw >= 100
             ? Math.max(10, Math.floor(raw / 10) * 10)
             : Math.max(1, Math.floor(raw));
     }
 
-
     function getHunterPricingReference(cardId, rarity = '') {
-        const rr = String(rarity || '').toUpperCase();
-
-        let local = getCachedSales(cardId, rr);
-        if (!local) {
-            try { local = getLocalMarketStats(cardId, rr); } catch (e) { }
-        }
-
-        const count = Number(local?.count || 0);
-        const med = Number(local?.median || 0);
-
-        if (count >= 3 && Number.isFinite(med) && med > 0) {
-            return {
-                value: med,
-                kind: 'median',
-                label: 'méd.',
-                reasonLabel: 'médiane',
-                localCount: count
-            };
-        }
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (!cardId || !rr) return null;
 
         const wmAverage = getWmOfficialAverage(cardId, rr);
-        if (Number.isFinite(wmAverage) && wmAverage > 0) {
-            return {
-                value: wmAverage,
-                kind: 'wm_average',
-                label: 'moy. WM',
-                reasonLabel: 'moyenne WM',
-                localCount: count
-            };
-        }
+        if (!Number.isFinite(wmAverage) || wmAverage <= 0) return null;
 
-        return null;
+        // Aucune statistique locale n'intervient dans cette décision.
+        return {
+            value: wmAverage,
+            kind: 'wm_average',
+            label: 'moy. WM',
+            reasonLabel: 'moyenne WM',
+            cardId,
+            rarity: rr
+        };
     }
 
     async function preloadWmOfficialSummariesForHunter(list) {
@@ -4776,13 +4561,12 @@
 
         for (const a of list) {
             if (!a || !automaticBidTimeAllowed(a)) continue;
+
             const cardId = a.card?.id ?? a.card_id;
             const rarity = globalAuctionRarity(a);
-            if (!cardId || seen.has(cardId)) continue;
+            if (!cardId || !rarity || seen.has(cardId)) continue;
 
-            let local = null;
-            try { local = getLocalMarketStats(cardId, rarity); } catch (e) { }
-            if (Number(local?.count || 0) >= 3 && Number(local?.median || 0) > 0) continue;
+            // IMPORTANT : la moyenne officielle WM doit être chargée pour chaque décision.
             if (getWmOfficialAverage(cardId, rarity) != null) continue;
 
             seen.add(cardId);
@@ -4794,6 +4578,7 @@
 
         const WORKERS = 4;
         let idx = 0;
+
         async function worker() {
             while (idx < ids.length) {
                 const id = ids[idx++];
@@ -4801,14 +4586,16 @@
                 await new Promise(r => setTimeout(r, 100));
             }
         }
-        await Promise.all(Array.from({ length: Math.min(WORKERS, ids.length) }, worker));
+
+        await Promise.all(
+            Array.from({ length: Math.min(WORKERS, ids.length) }, worker)
+        );
     }
 
-    // Une enchère déjà armée par le Hunter dynamique peut survivre à un F5.
-    // On réapplique donc aussi le filtre de médiane lors des RIPOSTES, pas seulement
-    // lors de la première mise. Les auto-bids manuels / prioritaires / ciblés ne sont
-    // volontairement pas concernés.
-    const dynamicMedianBlockLogged = new Set();
+    // Une enchère Hunter dynamique peut survivre à un F5.
+    // À CHAQUE continuation/riposte, son plafond est recalculé exclusivement
+    // depuis la moyenne officielle WM. Un ancien plafond n'est jamais conservé.
+    const dynamicOfficialAverageBlockLogged = new Set();
 
     function dynamicHunterContinuationAllowed(auction) {
         if (!auction?.id) return false;
@@ -4820,28 +4607,30 @@
         const rarity = globalAuctionRarity(auction) || candidate.rarity || '';
         const ref = getHunterPricingReference(cardId, rarity);
 
-        if (ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_MEDIAN) {
-            dynamicMedianBlockLogged.delete(auction.id);
+        if (ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_REFERENCE) {
+            dynamicOfficialAverageBlockLogged.delete(auction.id);
 
-            const freshCap = dynamicHunterCapFromMedian(ref.value);
-            const oldCap = getAutoBidMax(auction.id);
-            if (freshCap > 0 && (oldCap == null || oldCap > freshCap)) {
-                setAutoBidMax(auction.id, freshCap);
+            const freshCap = dynamicHunterCapFromReference(ref.value);
+
+            // v2.7.0 : remplace TOUJOURS l'ancien plafond.
+            // Il pouvait provenir d'une ancienne référence locale d'une version précédente.
+            if (freshCap > 0) {
+                const oldCap = getAutoBidMax(auction.id);
+                if (oldCap !== freshCap) setAutoBidMax(auction.id, freshCap);
+                return true;
             }
-            return freshCap > 0;
         }
 
         if (autoBidSet.delete(auction.id)) saveAutoBidSet();
         setAutoBidMax(auction.id, null);
 
-        if (!dynamicMedianBlockLogged.has(auction.id)) {
-            dynamicMedianBlockLogged.add(auction.id);
+        if (!dynamicOfficialAverageBlockLogged.has(auction.id)) {
+            dynamicOfficialAverageBlockLogged.add(auction.id);
             const value = ref?.value ?? '?';
-            const label = ref?.reasonLabel || 'référence prix';
             wmLog(
                 `🛑 Hunter dynamique coupé : <b>${auction.card?.wikipedia_title || candidate.title || '?'}</b> ` +
-                `[${rarity || '?'}] · ${label} <b>${value} 💰</b> &lt; ${HUNTER_DYNAMIC_MIN_MEDIAN} 💰 ` +
-                `ou donnée indisponible.`
+                `[${rarity || '?'}] · moyenne WM <b>${value} 💰</b> ` +
+                `&lt; ${HUNTER_DYNAMIC_MIN_REFERENCE} 💰 ou indisponible.`
             );
         }
 
@@ -4849,15 +4638,10 @@
     }
 
 
-    // Décide si une enchère doit déclencher un auto-snipe, selon le mode configuré.
-    // Retourne { snipe: bool, reason: string, cap: number }.
-    // `cap` = le seuil retenu pour CETTE enchère (fixe, ou dérivé de la médiane en dynamique).
-    // Il sert de plafond au Hunter agressif : miser plus haut que le seuil qui a rendu la
-    // carte intéressante n'aurait aucun sens.
-    //   - mode 'fixed'    : snipe si prix <= seuil fixe (autoSnipePrice)
-    //   - mode 'adaptive' : snipe si prix <= ratio × médiane marché de la carte.
-    //                       Si pas d'historique (cache absent ou 0 vente), on retombe
-    //                       sur le seuil fixe comme garde-fou.
+    // Décide si une enchère doit déclencher un auto-snipe.
+    // Mode dynamique v2.7.0 :
+    //   prix actuel <= ratio × MOYENNE OFFICIELLE WIKIMASTERS.
+    // Si la moyenne WM est absente : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
         const mode = getSetting('autoSnipeMode');
@@ -4870,26 +4654,26 @@
             if (!ref || !Number.isFinite(Number(ref.value)) || Number(ref.value) <= 0) {
                 return {
                     snipe: false,
-                    reason: `prix de référence indisponible${rarity ? ` (${rarity})` : ''}`,
+                    reason: `moyenne WM indisponible${rarity ? ` (${rarity})` : ''}`,
                     cap: 0
                 };
             }
 
-            if (Number(ref.value) < HUNTER_DYNAMIC_MIN_MEDIAN) {
+            if (Number(ref.value) < HUNTER_DYNAMIC_MIN_REFERENCE) {
                 return {
                     snipe: false,
-                    reason: `${ref.reasonLabel} < ${HUNTER_DYNAMIC_MIN_MEDIAN} (${ref.value})`,
+                    reason: `moyenne WM < ${HUNTER_DYNAMIC_MIN_REFERENCE} (${ref.value})`,
                     cap: 0
                 };
             }
 
             const ratio = getSetting('autoSnipeAdaptiveRatio');
-            const threshold = dynamicHunterCapFromMedian(ref.value);
+            const threshold = dynamicHunterCapFromReference(ref.value);
 
             if (currentBid <= threshold) {
                 return {
                     snipe: true,
-                    reason: `≤ ${Math.round(ratio * 100)}% ${ref.label} (${ref.value}) · plafond ${threshold}`,
+                    reason: `≤ ${Math.round(ratio * 100)}% moy. WM (${ref.value}) · plafond ${threshold}`,
                     cap: threshold,
                     pricingReference: ref
                 };
@@ -4897,7 +4681,7 @@
 
             return {
                 snipe: false,
-                reason: `> ${Math.round(ratio * 100)}% ${ref.label} (${ref.value}) · plafond ${threshold}`,
+                reason: `> ${Math.round(ratio * 100)}% moy. WM (${ref.value}) · plafond ${threshold}`,
                 cap: threshold,
                 pricingReference: ref
             };
@@ -5019,7 +4803,7 @@
         logTrash: true,
         logAutobid: true,
         autoSnipePrice: 100,
-        autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = sous la médiane marché
+        autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = % moyenne officielle WM
         autoSnipeAdaptiveRatio: 0.75,     // v2.3.9 : plafond Hunter dynamique plus conservateur
         minBalanceForAutoSnipe: 2000,
         autoRetagEnabled: true,
@@ -5543,7 +5327,7 @@
             <div style="margin:2px 0 10px;padding:8px;border-radius:6px;border:1px solid rgba(34,211,238,0.18);background:rgba(34,211,238,0.035);">
                 <div style="font-size:9px;color:#22d3ee;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px;">
                     🌐 Recherche globale
-                    <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(indépendante des Standards · historique local)</span>
+                    <span style="color:#666;text-transform:none;letter-spacing:0;font-size:9px;">(indépendante des Standards)</span>
                 </div>
                 <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px;">${globalRarityChecks}</div>
                 <div style="display:flex;gap:5px;margin-bottom:7px;">
@@ -5551,7 +5335,7 @@
                     <button onclick="window.wmGlobalRarityNone()" style="padding:2px 7px;border-radius:4px;border:1px solid rgba(255,255,255,0.1);background:rgba(255,255,255,0.03);color:#777;font-size:9px;cursor:pointer;">Aucune</button>
                 </div>
                 <div style="font-size:9px;color:#666;line-height:1.4;margin-bottom:8px;">
-                    Observe silencieusement <b>toutes</b> les annonces des raretés cochées, sans tenir compte des mots-clés Standards. Ces observations alimentent l'historique local par <b>carte + rareté</b>.
+                    Affiche et fournit au Hunter <b>toutes</b> les annonces des raretés cochées, sans tenir compte des mots-clés Standards.
                 </div>
                 <div style="border-top:1px solid rgba(255,255,255,0.07);padding-top:7px;">
                     <div style="font-size:9px;color:#fbbf24;text-transform:uppercase;letter-spacing:.7px;margin-bottom:5px;">⚡ Source du Hunter dynamique</div>
@@ -6766,6 +6550,29 @@
         saveAutoBidMax();
     }
 
+    // v2.7.0 migration : un plafond hunter_dynamic persisté par une ancienne version
+    // peut avoir été calculé sur une ancienne référence locale. On le supprime une fois, sans toucher
+    // aux candidats eux-mêmes. Le prochain scan les réévaluera exclusivement sur moyenne WM.
+    try {
+        const migrationKey = 'wm_migration_v270_hunter_wm_only';
+        if (!localStorage.getItem(migrationKey)) {
+            let changedSet = false;
+            let changedMax = false;
+
+            for (const [auctionId, candidate] of autoFlipCandidates.entries()) {
+                if (candidate?.source !== 'hunter_dynamic') continue;
+
+                if (autoBidSet.delete(auctionId)) changedSet = true;
+                if (autoBidMaxMap.delete(auctionId)) changedMax = true;
+            }
+
+            if (changedSet) saveAutoBidSet();
+            if (changedMax) saveAutoBidMax();
+
+            localStorage.setItem(migrationKey, '1');
+        }
+    } catch (e) { }
+
     /* ── Chasseur ciblé : auto-désactivation après obtention ──
        Associe une enchère armée par le Chasseur ciblé au texte de l'entrée qui l'a armée,
        UNIQUEMENT pour les entrées avec `autoDisable` actif (inutile de suivre les autres).
@@ -7209,7 +7016,7 @@
         // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique · réf.≥${HUNTER_DYNAMIC_MIN_MEDIAN} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
+            return `⚡ Hunter dynamique · moy.WM≥${HUNTER_DYNAMIC_MIN_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -7222,7 +7029,7 @@
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
-            await preloadWmOfficialSummariesForHunter(list).catch(() => { });
+            await preloadWmOfficialSummariesForHunter(list).catch(() => {});
         }
 
         if (hunterAggressive) return runHunterFourbePass(list);
@@ -8299,24 +8106,6 @@
             // Met à jour la somme des bids engagés dans le header
             updateBidsSumDisplay();
 
-            // Lance le chargement étalé des historiques de ventes manquants.
-            // À chaque historique récupéré, on re-render juste les badges concernés
-            // (re-render léger de la liste avec le cache courant).
-            if (salesFetchQueue.length > 0 && !salesFetchRunning) {
-                processSalesQueue(() => {
-                    renderMarketHits(marketAlertEl, lastHitsCache, []);
-
-                    // L'historique vient peut-être d'être chargé :
-                    // on redonne les enchères au Hunter dynamique.
-                    if (autoSnipeEnabled) {
-                        const pool = getSetting('autoSnipeMode') === 'adaptive'
-                            ? getHunterDynamicCandidatePool(lastAllMarketAuctions)
-                            : [...lastHitsCache];
-                        if (pool.length > 0) runHunterAutoBidPass(pool).catch(() => { });
-                    }
-                });
-            }
-
             // Notif dans le titre de l'onglet
             const hitCount = activeHitsMap.size;
             document.title = hitCount > 0 ? `(${hitCount}) WikiMasters` : 'WikiMasters';
@@ -8476,10 +8265,9 @@
             const isOutbid = outbidSet.has(a.id);
 
             // Badge de valorisation (sous-coté / dans la moyenne / surcoté)
-            // basé sur l'historique des ventes de cette carte.
+            // basé sur la moyenne officielle WikiMasters de cette carte + rareté.
             const cardId = a.card?.id ?? a.card_id;
-            queueSalesFetch(cardId); // historique local/officiel complet si disponible
-            queueWmOfficialSummaryFetch(cardId); // moyenne WM scope=summary, accessible non-PRO
+            queueWmOfficialSummaryFetch(cardId); // moyenne WM officielle
             const val = computeValuation(bid, cardId, globalAuctionRarity(a));
             const valBadge = val
                 ? `<span style="
@@ -8491,7 +8279,7 @@
                     title="${val.tip}">
                     ${val.status === 'under' ? '📉' : val.status === 'over' ? '📈' : val.status === 'few' ? '❔' : val.status === 'none' ? '🚫' : '➖'} ${val.label}
                   </span>`
-                : `<span style="display:inline-block;font-size:9px;color:#444;vertical-align:middle;" title="Chargement de l'historique…">⋯</span>`;
+                : `<span style="display:inline-block;font-size:9px;color:#444;vertical-align:middle;" title="Chargement de la moyenne WM…">⋯</span>`;
 
             // Couleur de la rareté en hex (#RRGGBB) pour la bande de droite
             const rarHex = r.color || '#888';
@@ -8642,7 +8430,7 @@
                                 border:1px solid ${modeUi.border};border-radius:4px;background:${modeUi.bg};color:${modeUi.color};
                                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${modeUi.label}</button>
                             <input id="wm-autobidmax-${a.id}" type="number" min="0" value="${capVal ?? ''}"
-                                placeholder="${(() => { const e = getCachedSales(a.card?.id ?? a.card_id, globalAuctionRarity(a)); return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max'; })()}"
+                                placeholder="${(() => { const e = getCachedSales(a.card?.id ?? a.card_id, globalAuctionRarity(a)); return (e && e.avg > 0) ? '~' + e.avg : 'max'; })()}"
                                 title="Plafond : au-delà de ce montant, l'automatisme se coupe pour cette enchère. Vide = sans plafond."
                                 oninput="window.wmOnAutoBidMax('${a.id}', this.value, false)"
                                 onchange="window.wmOnAutoBidMax('${a.id}', this.value, true)"
@@ -8813,13 +8601,13 @@
                     <input id="wm-autobidmax-${a.id}" type="number" min="0" placeholder="${(() => {
                     const cid = a.card?.id ?? a.card_id;
                     const e = getCachedSales(cid, globalAuctionRarity(a));
-                    return (e && e.count > 0 && e.median > 0) ? '~' + e.median : 'max';
+                    return (e && e.avg > 0) ? '~' + e.avg : 'max';
                 })()}"
                         value="${getAutoBidMax(a.id) ?? ''}"
                         title="Plafond auto-bid : au-delà de ce montant, l'auto-bid se coupe pour cette enchère. Laisse vide pour ne PAS plafonner (auto-bid illimité).${(() => {
                     const cid = a.card?.id ?? a.card_id;
                     const e = getCachedSales(cid, globalAuctionRarity(a));
-                    return (e && e.count > 0) ? ' Médiane marché indicative : ' + e.median + ' 💰' : '';
+                    return (e && e.avg > 0) ? ' Moyenne officielle WM indicative : ' + e.avg + ' 💰' : '';
                 })()}"
                         oninput="window.wmOnAutoBidMax('${a.id}', this.value, false)"
                         onchange="window.wmOnAutoBidMax('${a.id}', this.value, true)"
@@ -10730,8 +10518,8 @@
     }
 
     // Prix de mise en vente d'une carte. Par défaut : valeur manuelle du tableau par rareté.
-    // Si "prix marché" est activé ET qu'on a un historique de ventes (avg) : on applique
-    // avg × (pourcentage réglé). Sinon (aucune vente connue) → repli sur le tableau.
+    // Si "prix marché" est activé ET qu'une moyenne officielle WM existe : on applique
+    // moyenne WM × (pourcentage réglé). Sinon → repli sur le tableau.
     async function resolveSellBasePrice(rarity, cardId) {
         const manual = getSellPrice(rarity);
         let result;
@@ -10739,7 +10527,7 @@
             result = { price: manual, source: 'table' };
         } else {
             let entry = getCachedSales(cardId, rarity);
-            if (!entry) entry = await fetchCardSales(cardId, rarity); // historique de cette rareté en mode local
+            if (!entry) entry = await fetchCardSales(cardId, rarity); // moyenne officielle WM fraîche
             if (entry && entry.count > 0 && Number.isFinite(entry.avg) && entry.avg > 0) {
                 const pct = getSetting('sellMarketPricePct');
                 let price = Math.max(1, Math.round(entry.avg * (pct / 100)));
@@ -11950,7 +11738,7 @@
                     if (i + CONC < toFetch.length) await new Promise(r => setTimeout(r, 200 + Math.random() * 200));
                 }
             }
-            // 3) Trie tout le pool par valeur réelle (avg marché, sinon prix de tableau).
+            // 3) Trie tout le pool par moyenne WM (sinon prix de tableau).
             shuffled.sort((a, b) => valueOf(b) - valueOf(a));
         } else if (strategy === 'rarity') {
             shuffled.sort((a, b) => (RARITY_ORDER[rarityOf(b)] ?? -1) - (RARITY_ORDER[rarityOf(a)] ?? -1));
@@ -12350,7 +12138,7 @@
 
     // v2.5.2 — Auth Supabase partagée.
     // Cette fonction avait été supprimée accidentellement en v2.5.0 lors du remplacement
-    // de findCurrentUserCardId(), ce qui cassait Market Watcher, historique local,
+    // de findCurrentUserCardId(), ce qui cassait Market Watcher,
     // syncWonAuctions, tags et toutes les lectures RLS.
     //
     // Elle vit désormais près des constantes Supabase, indépendamment de Trash/Flip.
@@ -13582,7 +13370,7 @@
 
     /* ── Bouton 🔭 par enchère (Market Watcher) ──
        Sur demande explicite (clic), pas automatique : contrairement au badge de valorisation
-       (queueSalesFetch, pré-chargé pour toutes les annonces visibles), ce contrôle coûte DEUX
+       (moyenne WM préchargée pour les annonces visibles), ce contrôle coûte DEUX
        appels réseau par carte — inutile de les déclencher pour des dizaines d'annonces que
        l'utilisateur ne compte pas forcément enchérir. Cache court (5 min) : évite de re-fetcher
        si la carte réapparaît après un re-tri ou un double-clic accidentel.
@@ -14529,7 +14317,7 @@
             .wm-pb input[type=number]::-webkit-inner-spin-button,
             .wm-pb input[type=number]::-webkit-outer-spin-button { -webkit-appearance:none; margin:0; }
             .wm-pb input[type=number] { -moz-appearance:textfield; }
-            /* Placeholder médiane des champs max auto-bid : jaune atténué (plus lisible que le gris par défaut) */
+            /* Placeholder moyenne WM des champs max auto-bid : jaune atténué. */
             .wm-pb input[id^="wm-autobidmax-"]::placeholder { color:rgba(251,191,36,0.55); opacity:1; }
 
             .wm-btn { display:block; width:100%; padding:7px; border:none; border-radius:6px; font-family:'Rajdhani',sans-serif; font-size:13px; font-weight:700; letter-spacing:1px; cursor:pointer; transition:all 0.2s; text-align:center; }
@@ -14767,27 +14555,17 @@
                     <div id="wm-keywords-panel" style="display:none;margin-bottom:8px;"></div>
                     <div class="wm-sep"></div>
 
-                    <!-- v2.4.3 : médiane à la volée directement dans l'interface -->
-                    <div style="margin-bottom:8px;padding:7px;border:1px solid rgba(168,85,247,.22);border-radius:6px;background:rgba(168,85,247,.035);">
-                        <div class="wm-lbl" style="margin:0 0 5px;color:#c4b5fd;">📊 Médiane rapide</div>
+                    <!-- v2.8.0 : moyenne officielle WikiMasters à la volée -->
+                    <div style="margin-bottom:8px;padding:7px;border:1px solid rgba(6,182,212,.22);border-radius:6px;background:rgba(6,182,212,.035);">
+                        <div class="wm-lbl" style="margin:0 0 5px;color:#67e8f9;">💰 Prix WM rapide</div>
                         <div style="display:flex;gap:5px;align-items:center;">
-                            <input id="wm-median-lookup" type="text" autocomplete="off" spellcheck="false"
-                                placeholder="Nom de la carte…"
-                                style="flex:1;min-width:0;padding:4px 7px;border-radius:4px;border:1px solid rgba(168,85,247,.35);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                            <select id="wm-median-rarity"
-                                style="width:58px;padding:4px 3px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                                <option value="">Toutes</option>
-                                <option value="L">L</option>
-                                <option value="UR">UR</option>
-                                <option value="SR">SR</option>
-                                <option value="R">R</option>
-                                <option value="PC">PC</option>
-                                <option value="C">C</option>
+                            <input id="wm-price-lookup" type="text" autocomplete="off" spellcheck="false" placeholder="Nom de la carte…" style="flex:1;min-width:0;padding:4px 7px;border-radius:4px;border:1px solid rgba(6,182,212,.35);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                            <select id="wm-price-rarity" style="width:58px;padding:4px 3px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
+                                <option value="">Toutes</option><option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option><option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
                             </select>
-                            <button id="wm-median-btn"
-                                style="padding:4px 8px;border-radius:4px;border:1px solid rgba(168,85,247,.45);background:rgba(168,85,247,.10);color:#d8b4fe;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">Médiane</button>
+                            <button id="wm-price-btn" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(6,182,212,.45);background:rgba(6,182,212,.10);color:#67e8f9;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">Prix WM</button>
                         </div>
-                        <div id="wm-median-result" style="margin-top:5px;min-height:13px;font-size:10px;color:#777;line-height:1.45;">Tape une carte puis Entrée.</div>
+                        <div id="wm-price-result" style="margin-top:5px;min-height:13px;font-size:10px;color:#777;line-height:1.45;">Tape une carte puis Entrée.</div>
                     </div>
 
                     <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
@@ -14873,7 +14651,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = <b>moyenne officielle WikiMasters</b> moins <b>5%</b> par défaut · jamais sous la marge mini. La médiane locale reste affichée à titre informatif uniquement. Victoire auto → tag <b>vente</b>.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = <b>moyenne officielle WikiMasters</b> moins <b>5%</b> par défaut · jamais sous la marge mini. Victoire auto → tag <b>vente</b>.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -15024,11 +14802,11 @@
                     <div class="wm-set-title">Comportement</div>
                     <div class="wm-set-sub">Hunter : mode de décision</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="fixed"><span>Seuil fixe (mise si prix ≤ valeur définie)</span></label>
-                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique (médiane locale n≥3, sinon moyenne officielle WM)</span></label>
+                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique (moyenne officielle WikiMasters uniquement)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la référence servant de plafond d’achat. Référence = médiane locale si n≥3, sinon moyenne officielle WikiMasters. Ex. 75% de 942 → plafond 700, arrondi vers le bas à la dizaine.</div>
-                    <input id="wm-set-autosnipe-ratio" type="number" min="1" max="200" step="5" class="wm-input">
+                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la moyenne officielle WikiMasters servant de plafond d’achat. Ex. moyenne WM 942 × 75% → plafond 700, arrondi vers le bas à la dizaine.</div>
+                    <input id="wm-set-autosnipe-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Délai humanisé avant une mise (ms). Plus bas = mises plus rapides mais moins « humaines ». <b>0 = instantané</b>. Ignoré quand l'enchère se termine bientôt (snipe toujours instantané).</div>
@@ -15399,57 +15177,31 @@
             };
         }
 
-        // v2.4.3 — Médiane rapide directement dans le Market Watcher.
-        const medianLookupInput = document.getElementById('wm-median-lookup');
-        const medianRaritySelect = document.getElementById('wm-median-rarity');
-        const medianLookupBtn = document.getElementById('wm-median-btn');
-        const medianLookupResult = document.getElementById('wm-median-result');
+        // v2.8.0 — Prix officiel WikiMasters directement dans le Market Watcher.
+        const priceLookupInput = document.getElementById('wm-price-lookup');
+        const priceRaritySelect = document.getElementById('wm-price-rarity');
+        const priceLookupBtn = document.getElementById('wm-price-btn');
+        const priceLookupResult = document.getElementById('wm-price-result');
 
-        async function runMedianLookupUi() {
-            if (!medianLookupInput || !medianLookupResult) return;
-            const q = String(medianLookupInput.value || '').trim();
-            const rarity = String(medianRaritySelect?.value || '').trim().toUpperCase();
-
-            if (!q) {
-                medianLookupResult.innerHTML = '<span style="color:#777;">Tape le nom d’une carte.</span>';
-                medianLookupInput.focus();
-                return;
-            }
-
-            if (medianLookupBtn) {
-                medianLookupBtn.disabled = true;
-                medianLookupBtn.textContent = '…';
-            }
-            medianLookupResult.innerHTML = '<span style="color:#777;">Recherche…</span>';
-
+        async function runOfficialPriceLookupUi() {
+            if (!priceLookupInput || !priceLookupResult) return;
+            const q = String(priceLookupInput.value || '').trim();
+            const rarity = String(priceRaritySelect?.value || '').trim().toUpperCase();
+            if (!q) { priceLookupResult.innerHTML = '<span style="color:#777;">Tape le nom d’une carte.</span>'; priceLookupInput.focus(); return; }
+            if (priceLookupBtn) { priceLookupBtn.disabled = true; priceLookupBtn.textContent = '…'; }
+            priceLookupResult.innerHTML = '<span style="color:#777;">Recherche…</span>';
             try {
-                const rows = await window.wmMedian(q, rarity, true);
-                medianLookupResult.innerHTML = quickMedianRowsHtml(rows, q);
+                const rows = await window.wmPrice(q, rarity, true);
+                priceLookupResult.innerHTML = quickOfficialPriceRowsHtml(rows, q);
             } catch (e) {
-                medianLookupResult.innerHTML =
-                    `<span style="color:#ef4444;">Erreur : ${htmlEsc(e?.message || String(e))}</span>`;
+                priceLookupResult.innerHTML = `<span style="color:#ef4444;">Erreur : ${htmlEsc(e?.message || String(e))}</span>`;
             } finally {
-                if (medianLookupBtn) {
-                    medianLookupBtn.disabled = false;
-                    medianLookupBtn.textContent = 'Médiane';
-                }
+                if (priceLookupBtn) { priceLookupBtn.disabled = false; priceLookupBtn.textContent = 'Prix WM'; }
             }
         }
-
-        if (medianLookupBtn) medianLookupBtn.onclick = runMedianLookupUi;
-        if (medianLookupInput) {
-            medianLookupInput.onkeydown = (e) => {
-                if (e.key === 'Enter') {
-                    e.preventDefault();
-                    runMedianLookupUi();
-                }
-            };
-        }
-        if (medianRaritySelect) {
-            medianRaritySelect.onchange = () => {
-                if (String(medianLookupInput?.value || '').trim()) runMedianLookupUi();
-            };
-        }
+        if (priceLookupBtn) priceLookupBtn.onclick = runOfficialPriceLookupUi;
+        if (priceLookupInput) priceLookupInput.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); runOfficialPriceLookupUi(); } };
+        if (priceRaritySelect) priceRaritySelect.onchange = () => { if (String(priceLookupInput?.value || '').trim()) runOfficialPriceLookupUi(); };
 
         // Barre de recherche du watcher : filtre live des annonces affichées
         const marketSearchInput = document.getElementById('wm-market-search');
@@ -15616,7 +15368,7 @@
                     .then(result => {
                         if (result?.wins > 0) wakeFlipSeller();
                     })
-                    .catch(() => { });
+                    .catch(() => {});
             }
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
@@ -15626,13 +15378,13 @@
             // réellement un fetch que si le dernier snapshot a ≥ 2 min.
             refreshTrackedFlipOfficialAverages(false).catch(() => { });
 
-            renderFlipHistory(); // médiane / moyenne WM / âge rafraîchis en continu
+            renderFlipHistory(); // moyenne WM / âge rafraîchis en continu
         }, 15000);
         // Au chargement, les anciens Flips sans snapshot frais sont actualisés rapidement.
-        setTimeout(() => refreshTrackedFlipOfficialAverages(false).catch(() => { }), 2500);
+        setTimeout(() => refreshTrackedFlipOfficialAverages(false).catch(() => {}), 2500);
 
-        // L'affichage seul est très léger : entre deux cycles réseau, l'âge, la médiane
-        // informative et la dernière moyenne WM reçue se rafraîchissent sans requête.
+        // L'affichage seul est très léger : entre deux cycles réseau, l'âge et la dernière
+        // moyenne WM reçue se rafraîchissent sans requête.
         setInterval(() => renderFlipHistory(), 5000);
 
         /* ════════ HEADER CONTROLS ════════ */
@@ -15760,7 +15512,7 @@
             if (pct > 200) pct = 200;
             autoSnipeRatioInput.value = pct;
             setSetting('autoSnipeAdaptiveRatio', pct / 100);
-            wmLog(`🎯 Hunter dynamique : seuil à ${pct}% de la référence (médiane locale n≥3, sinon moyenne WM)`);
+            wmLog(`🎯 Hunter dynamique : plafond à ${pct}% de la moyenne officielle WM uniquement`);
         };
 
         // Délai humanisé avant une mise
@@ -17372,7 +17124,7 @@
                 // Même si fetchSellingState() échoue, un achat auto doit entrer dans Flip Seller.
                 if (Date.now() - lastWonSync > 60000) {
                     lastWonSync = Date.now();
-                    syncWonAuctions().catch(() => { });
+                    syncWonAuctions().catch(() => {});
                 }
 
                 const st = await fetchSellingState();
@@ -18843,2014 +18595,24 @@
     };
 
     /* ══════════════════════════════════════════════════════════════════════
-    v2.2 — HISTORIQUE LOCAL DES VENTES OBSERVÉES (CARTE + RARETÉ)
-    ══════════════════════════════════════════════════════════════════════ */
-
-    const LOCAL_MARKET_HISTORY_KEY = 'wm_local_market_history_v1';
-    const LOCAL_MARKET_PENDING_KEY = 'wm_local_market_pending_v1';
-
-    const LOCAL_MARKET_HISTORY_WINDOW_MS =
-        30 * 24 * 60 * 60 * 1000;
-
-    const LOCAL_MARKET_HISTORY_KEEP_MS =
-        31 * 24 * 60 * 60 * 1000;
-
-    const LOCAL_MARKET_PENDING_KEEP_MS =
-        6 * 60 * 60 * 1000;
-
-    const LOCAL_MARKET_HISTORY_MAX = 12000;
-    const LOCAL_MARKET_PENDING_MAX = 15000;
-
-
-    let localMarketHistory = [];
-    let localMarketPending = {};
-
-    let localMarketHistoryIds =
-        new Set();
-
-    let localMarketByCard =
-        new Map();
-
-    let localMarketPendingSaveTimer =
-        null;
-
-    let localMarketReconcileRunning =
-        false;
-
-    let localMarketLastPrune =
-        0;
-
-
-    /*
-        * null  = API historique officielle pas encore testée
-        * true  = compte PRO / API accessible
-        * false = API refusée avec pro_required
-        */
-    let salesApiAccess = null;
-
-    let salesApiAccessLogDone =
-        false;
-
-
-
-    /* ============================================================
-        CHARGEMENT LOCALSTORAGE
-        ============================================================ */
-
+       v2.8.0 — PRIX OFFICIEL UNIQUEMENT
+       ══════════════════════════════════════════════════════════════════════ */
     try {
-
-        const raw =
-            JSON.parse(
-                localStorage.getItem(
-                    LOCAL_MARKET_HISTORY_KEY
-                ) || '[]'
-            );
-
-        if (Array.isArray(raw)) {
-            localMarketHistory = raw;
+        const cleanupKey = 'wm_cleanup_v280_old_local_price_history';
+        if (!localStorage.getItem(cleanupKey)) {
+            localStorage.removeItem('wm_local_market_history_v1');
+            localStorage.removeItem('wm_local_market_pending_v1');
+            localStorage.removeItem('wm_sales_cache_30d_v1');
+            localStorage.setItem(cleanupKey, '1');
         }
+    } catch (e) { }
 
-    } catch (e) {
-
-        localMarketHistory = [];
-    }
-
-
-    try {
-
-        const raw =
-            JSON.parse(
-                localStorage.getItem(
-                    LOCAL_MARKET_PENDING_KEY
-                ) || '{}'
-            );
-
-        if (
-            raw &&
-            typeof raw === 'object' &&
-            !Array.isArray(raw)
-        ) {
-            // v2.2 : format compact { c, r, e }. Les anciens champs p/s n'étaient jamais
-            // utilisés comme prix final et sont retirés pour pouvoir observer des milliers
-            // d'enchères globales sans gonfler inutilement le localStorage.
-            const normalized = {};
-            for (const [id, obs] of Object.entries(raw)) {
-                const c = obs?.c;
-                const e = Number(obs?.e);
-                if (!id || !c || !Number.isFinite(e)) continue;
-                normalized[id] = {
-                    c,
-                    r: String(obs?.r || '').toUpperCase(),
-                    e
-                };
-            }
-            localMarketPending = normalized;
-        }
-
-    } catch (e) {
-
-        localMarketPending = {};
-    }
-
-
-
-    /* ============================================================
-        SAUVEGARDE
-        ============================================================ */
-
-    function saveLocalMarketHistory() {
-
-        try {
-
-            localStorage.setItem(
-                LOCAL_MARKET_HISTORY_KEY,
-                JSON.stringify(
-                    localMarketHistory
-                )
-            );
-
-        } catch (e) {
-
-            console.warn(
-                '[WikiMasters][local-history] sauvegarde impossible:',
-                e
-            );
-        }
-    }
-
-
-    function saveLocalMarketPendingNow() {
-
-        try {
-
-            localStorage.setItem(
-                LOCAL_MARKET_PENDING_KEY,
-                JSON.stringify(
-                    localMarketPending
-                )
-            );
-
-        } catch (e) {
-
-            console.warn(
-                '[WikiMasters][local-history] sauvegarde pending impossible:',
-                e
-            );
-        }
-    }
-
-
-    function queueLocalMarketPendingSave() {
-
-        if (
-            localMarketPendingSaveTimer
-        ) {
-            return;
-        }
-
-
-        localMarketPendingSaveTimer =
-            setTimeout(
-                () => {
-
-                    localMarketPendingSaveTimer =
-                        null;
-
-                    saveLocalMarketPendingNow();
-
-                },
-                400
-            );
-    }
-
-
-
-    /* ============================================================
-        INDEX HISTORIQUE PAR CARTE
-        ============================================================ */
-
-    function rebuildLocalMarketIndex() {
-
-        localMarketHistoryIds =
-            new Set();
-
-        localMarketByCard =
-            new Map();
-
-
-        const cutoff =
-            Date.now() -
-            LOCAL_MARKET_HISTORY_WINDOW_MS;
-
-
-        for (
-            const sale
-            of localMarketHistory
-        ) {
-
-            if (
-                !sale ||
-                !sale.a ||
-                !sale.c
-            ) {
-                continue;
-            }
-
-
-            const price =
-                Number(
-                    sale.p
-                );
-
-
-            const ts =
-                Number(
-                    sale.t
-                );
-
-
-            if (
-                !Number.isFinite(price) ||
-                price <= 0
-            ) {
-                continue;
-            }
-
-
-            if (
-                !Number.isFinite(ts) ||
-                ts < cutoff
-            ) {
-                continue;
-            }
-
-
-            localMarketHistoryIds.add(
-                sale.a
-            );
-
-
-            let arr =
-                localMarketByCard.get(
-                    sale.c
-                );
-
-
-            if (!arr) {
-
-                arr = [];
-
-                localMarketByCard.set(
-                    sale.c,
-                    arr
-                );
-            }
-
-
-            arr.push(
-                sale
-            );
-        }
-
-
-        for (
-            const arr
-            of localMarketByCard.values()
-        ) {
-
-            arr.sort(
-                (a, b) =>
-                    Number(b.t) -
-                    Number(a.t)
-            );
-        }
-    }
-
-
-
-    /* ============================================================
-        PURGE
-        ============================================================ */
-
-    function pruneLocalMarketHistory(
-        force = false
-    ) {
-
-        const now =
-            Date.now();
-
-
-        if (
-            !force &&
-            now -
-            localMarketLastPrune
-            <
-            60 * 60 * 1000
-        ) {
-
-            return;
-        }
-
-
-        localMarketLastPrune =
-            now;
-
-
-        const historyCutoff =
-            now -
-            LOCAL_MARKET_HISTORY_KEEP_MS;
-
-
-        const pendingCutoff =
-            now -
-            LOCAL_MARKET_PENDING_KEEP_MS;
-
-
-        const before =
-            localMarketHistory.length;
-
-
-        localMarketHistory =
-            localMarketHistory
-
-                .filter(
-                    s =>
-                        s &&
-                        Number.isFinite(
-                            Number(s.t)
-                        )
-                        &&
-                        Number(s.t)
-                        >=
-                        historyCutoff
-                )
-
-                .sort(
-                    (a, b) =>
-                        Number(a.t) -
-                        Number(b.t)
-                );
-
-
-        if (
-            localMarketHistory.length >
-            LOCAL_MARKET_HISTORY_MAX
-        ) {
-
-            localMarketHistory =
-                localMarketHistory.slice(
-                    -LOCAL_MARKET_HISTORY_MAX
-                );
-        }
-
-
-        let pendingChanged =
-            false;
-
-
-        for (
-            const [id, obs]
-            of
-            Object.entries(
-                localMarketPending
-            )
-        ) {
-
-            const endTs =
-                Number(
-                    obs?.e
-                );
-
-
-            if (
-                !Number.isFinite(endTs) ||
-                endTs <
-                pendingCutoff
-            ) {
-
-                delete localMarketPending[
-                    id
-                ];
-
-                pendingChanged =
-                    true;
-            }
-        }
-
-
-        const pendingEntries =
-            Object.entries(
-                localMarketPending
-            );
-
-
-        if (
-            pendingEntries.length >
-            LOCAL_MARKET_PENDING_MAX
-        ) {
-
-            pendingEntries
-
-                .sort(
-                    (a, b) =>
-                        Number(
-                            a[1]?.e || 0
-                        )
-                        -
-                        Number(
-                            b[1]?.e || 0
-                        )
-                )
-
-                .slice(
-                    0,
-                    pendingEntries.length -
-                    LOCAL_MARKET_PENDING_MAX
-                )
-
-                .forEach(
-                    ([id]) =>
-                        delete localMarketPending[id]
-                );
-
-
-            pendingChanged =
-                true;
-        }
-
-
-        if (
-            localMarketHistory.length
-            !==
-            before
-        ) {
-
-            saveLocalMarketHistory();
-        }
-
-
-        if (
-            pendingChanged
-        ) {
-
-            saveLocalMarketPendingNow();
-        }
-
-
-        rebuildLocalMarketIndex();
-    }
-
-
-    rebuildLocalMarketIndex();
-
-    pruneLocalMarketHistory(
-        true
-    );
-
-
-
-    /* ============================================================
-        STATISTIQUES LOCALES D'UNE CARTE
-        ============================================================ */
-
-    function getLocalMarketStats(
-        cardId,
-        rarity = ''
-    ) {
-        if (!cardId) return null;
-
-        const wantedRarity = String(rarity || '').trim().toUpperCase();
-        const cutoff = Date.now() - LOCAL_MARKET_HISTORY_WINDOW_MS;
-
-        const sales = (localMarketByCard.get(cardId) || []).filter(s => {
-            if (Number(s.t) < cutoff) return false;
-            if (!wantedRarity) return true; // appels génériques hérités : agrégat de compatibilité
-            return String(s.r || '').toUpperCase() === wantedRarity;
-        });
-
-        const prices = sales
-            .map(s => Number(s.p))
-            .filter(p => Number.isFinite(p) && p > 0);
-
-        if (prices.length === 0) {
-            return {
-                median: 0,
-                count: 0,
-                last: null,
-                avg: null,
-                min: null,
-                max: null,
-                fetchedAt: Date.now(),
-                source: 'local',
-                rarity: wantedRarity || null
-            };
-        }
-
-        const recent = [...sales].sort((a, b) => Number(b.t) - Number(a.t));
-        return {
-            median: median(prices),
-            count: prices.length,
-            last: Number(recent[0].p),
-            avg: Math.round(prices.reduce((sum, p) => sum + p, 0) / prices.length),
-            min: Math.min(...prices),
-            max: Math.max(...prices),
-            fetchedAt: Date.now(),
-            source: 'local',
-            rarity: wantedRarity || null
-        };
-    }
-
-
-    /* ============================================================
-        ARCHIVE UNE VENTE CONFIRMÉE
-        ============================================================ */
-
-    function recordLocalMarketSale(
-        auctionId,
-        obs,
-        finalPrice,
-        settledAt
-    ) {
-
-        if (
-            !auctionId ||
-            !obs?.c
-        ) {
-
-            return false;
-        }
-
-
-        /*
-            * Anti-doublon absolu par ID d'enchère.
-            */
-        if (
-            localMarketHistoryIds.has(
-                auctionId
-            )
-        ) {
-
-            delete localMarketPending[
-                auctionId
-            ];
-
-            queueLocalMarketPendingSave();
-
-            return false;
-        }
-
-
-        const price =
-            Number(
-                finalPrice
-            );
-
-
-        let timestamp =
-
-            settledAt instanceof Date
-
-                ?
-
-                settledAt.getTime()
-
-                :
-
-                Number(
-                    settledAt
-                );
-
-
-        if (
-            !Number.isFinite(price) ||
-            price <= 0
-        ) {
-
-            return false;
-        }
-
-
-        if (
-            !Number.isFinite(
-                timestamp
-            )
-        ) {
-
-            timestamp =
-                Date.now();
-        }
-
-
-        /*
-            * Format compact pour limiter la taille du localStorage :
-            *
-            * a = auction ID
-            * c = card ID
-            * r = rareté figée/observée au moment de l'enchère
-            * p = final price
-            * t = settled timestamp
-            */
-        const sale = {
-
-            a:
-                auctionId,
-
-            c:
-                obs.c,
-
-            r:
-                String(obs.r || '').toUpperCase(),
-
-            p:
-                price,
-
-            t:
-                timestamp
-        };
-
-
-        localMarketHistory.push(
-            sale
-        );
-
-
-        localMarketHistoryIds.add(
-            auctionId
-        );
-
-
-        let arr =
-            localMarketByCard.get(
-                obs.c
-            );
-
-
-        if (!arr) {
-
-            arr = [];
-
-            localMarketByCard.set(
-                obs.c,
-                arr
-            );
-        }
-
-
-        arr.unshift(
-            sale
-        );
-
-
-        delete localMarketPending[
-            auctionId
-        ];
-
-
-        pruneLocalMarketHistory(
-            false
-        );
-
-
-        saveLocalMarketHistory();
-
-        queueLocalMarketPendingSave();
-
-
-        return true;
-    }
-
-
-
-    /* ============================================================
-        OBSERVATION D'UNE ENCHÈRE
-        ============================================================ */
-
-    function observeLocalMarketAuction(
-        auction,
-        freshSync = false
-    ) {
-        if (!auction?.id) return;
-
-        const cardId = auction.card?.id ?? auction.card_id;
-        if (!cardId) return;
-
-        const endTs = new Date(auction.end_at || NaN).getTime();
-        if (!Number.isFinite(endTs)) return;
-
-        if (localMarketHistoryIds.has(auction.id)) {
-            delete localMarketPending[auction.id];
-            return;
-        }
-
-        const prev = localMarketPending[auction.id] || {};
-        // Les lectures Hot Lane groupées ne portent pas toujours la carte/rareté : dans ce cas
-        // on conserve la rareté capturée lors du scan global initial.
-        const rarity = globalAuctionRarity(auction) || String(prev.r || '').toUpperCase();
-
-        // v2.2 : aucune écriture si cardId/rareté/end_at sont inchangés. current_bid n'est PAS
-        // stocké : seul final_price serveur peut entrer dans l'historique.
-        if (
-            prev.c === cardId &&
-            String(prev.r || '').toUpperCase() === rarity &&
-            Number(prev.e) === endTs
-        ) {
-            return;
-        }
-
-        localMarketPending[auction.id] = {
-            c: cardId,
-            r: rarity,
-            e: endTs
-        };
-        queueLocalMarketPendingSave();
-    }
-
-
-    /* ============================================================
-        OBSERVE LES HITS DU MARKET WATCHER
-        ============================================================ */
-
-    function observeLocalMarketHits(
-        hits
-    ) {
-        if (!Array.isArray(hits)) return;
-
-        for (const auction of hits) {
-            if (!localHistoryShouldObserve(auction)) continue;
-            observeLocalMarketAuction(auction, false);
-        }
-
-        pruneLocalMarketHistory(false);
-    }
-
-
-    /* ============================================================
-        ÉTAT FRAIS REÇU PAR LA HOT-LANE v1.7
-        ============================================================ */
-
-    function observeFreshLocalAuction(
-        fresh
-    ) {
-
-        if (
-            !fresh?.id
-        ) {
-            return;
-        }
-
-
-        const previous =
-            localMarketPending[
-            fresh.id
-            ];
-
-
-        /*
-            * On ne commence pas à surveiller arbitrairement
-            * une enchère jamais affichée dans le Market Watcher.
-            */
-        if (!previous) {
-            return;
-        }
-
-
-        const cached =
-            lastHitsCache.find(
-                h =>
-                    h
-                    &&
-                    h.id === fresh.id
-            );
-
-
-        const merged = {
-
-            ...(cached || {}),
-
-            ...fresh,
-
-            card:
-                fresh.card
-                ||
-                cached?.card
-                ||
-                null,
-
-            card_id:
-                fresh.card_id
-                ||
-                cached?.card_id
-                ||
-                previous.c,
-
-            snapshot_rarity:
-                fresh.snapshot_rarity
-                ||
-                cached?.snapshot_rarity
-                ||
-                previous.r
-        };
-
-
-        observeLocalMarketAuction(
-            merged,
-            true
-        );
-
-
-        /*
-            * Cas idéal :
-            * une synchro fraîche contient déjà final_price.
-            */
-        const finalPrice =
-            Number(
-                fresh.final_price
-            );
-
-
-        if (
-            Number.isFinite(
-                finalPrice
-            )
-            &&
-            finalPrice > 0
-        ) {
-
-            const settledTs =
-
-                fresh.settled_at
-
-                    ?
-
-                    new Date(
-                        fresh.settled_at
-                    )
-                        .getTime()
-
-                    :
-
-                    new Date(
-                        fresh.end_at
-                        ||
-                        NaN
-                    )
-                        .getTime();
-
-
-            if (
-                recordLocalMarketSale(
-                    fresh.id,
-                    localMarketPending[fresh.id]
-                    ||
-                    previous,
-                    finalPrice,
-                    settledTs
-                )
-            ) {
-
-                wmLog(
-                    `📚 Historique local : ` +
-                    `vente confirmée à ` +
-                    `<b>${finalPrice} 💰</b>.`
-                );
-            }
-        }
-    }
-
-
-
-    /* ============================================================
-        RÉCONCILIATION DES ENCHÈRES TERMINÉES
-        ============================================================ */
-
-    async function reconcileLocalMarketHistory(
-        allLiveAuctions
-    ) {
-
-        if (
-            localMarketReconcileRunning
-            ||
-            !Array.isArray(
-                allLiveAuctions
-            )
-        ) {
-
-            return;
-        }
-
-
-        localMarketReconcileRunning =
-            true;
-
-
-        try {
-
-            const now =
-                serverNow();
-
-
-            const liveIds =
-                new Set(
-                    allLiveAuctions
-
-                        .map(
-                            a =>
-                                a?.id
-                        )
-
-                        .filter(
-                            Boolean
-                        )
-                );
-
-
-            /*
-                * Une enchère devient candidate uniquement si :
-                *
-                * - elle avait été observée ;
-                * - elle n'est plus dans le scan complet ;
-                * - son end_at connu est dépassé.
-                */
-            const candidates =
-                Object.entries(
-                    localMarketPending
-                )
-
-                    .filter(
-                        ([id, obs]) => {
-
-                            if (
-                                liveIds.has(
-                                    id
-                                )
-                            ) {
-                                return false;
-                            }
-
-
-                            const endTs =
-                                Number(
-                                    obs?.e
-                                );
-
-
-                            return (
-
-                                Number.isFinite(
-                                    endTs
-                                )
-
-                                &&
-
-                                endTs <=
-                                now - 500
-                            );
-                        }
-                    )
-
-                    .sort(
-                        (a, b) =>
-                            Number(
-                                a[1]?.e || 0
-                            )
-                            -
-                            Number(
-                                b[1]?.e || 0
-                            )
-                    )
-
-                    .slice(
-                        0,
-                        100
-                    );
-
-
-            if (
-                candidates.length === 0
-            ) {
-
-                return;
-            }
-
-
-            const ids =
-                candidates.map(
-                    ([id]) =>
-                        id
-                );
-
-
-            /*
-                * IMPORTANT :
-                *
-                * on relit les lignes EXACTES des enchères observées.
-                *
-                * On ne fait aucune recherche historique générale.
-                */
-            const rows =
-                await fetchAuctionsByIds(
-                    ids
-                );
-
-
-            if (
-                !(rows instanceof Map)
-            ) {
-
-                return;
-            }
-
-
-            let archived =
-                0;
-
-
-            let pendingChanged =
-                false;
-
-
-            for (
-                const [auctionId, obs]
-                of candidates
-            ) {
-
-                const row =
-                    rows.get(
-                        auctionId
-                    );
-
-
-                /*
-                    * Impossible de relire la ligne :
-                    * on n'invente rien.
-                    */
-                if (!row) {
-                    continue;
-                }
-
-
-                const rowEndTs =
-                    new Date(
-                        row.end_at
-                        ||
-                        NaN
-                    )
-                        .getTime();
-
-
-
-                /* --------------------------------------------------
-                    TIMER PROLONGÉ
-                    -------------------------------------------------- */
-
-                if (
-                    isActiveSellingStatus(
-                        row.status
-                    )
-
-                    &&
-
-                    Number.isFinite(
-                        rowEndTs
-                    )
-
-                    &&
-
-                    rowEndTs >
-                    serverNow()
-                ) {
-
-                    localMarketPending[
-                        auctionId
-                    ] = {
-                        ...obs,
-                        e: rowEndTs
-                    };
-
-
-                    pendingChanged =
-                        true;
-
-
-                    continue;
-                }
-
-
-
-                /* --------------------------------------------------
-                    VENTE CONFIRMÉE
-                    -------------------------------------------------- */
-
-                const finalPrice =
-                    Number(
-                        row.final_price
-                    );
-
-
-                /*
-                    * C'EST LA SEULE BRANCHE NORMALE
-                    * QUI CRÉE UNE VENTE LOCALE.
-                    */
-                if (
-                    Number.isFinite(
-                        finalPrice
-                    )
-
-                    &&
-
-                    finalPrice > 0
-                ) {
-
-                    const settledTs =
-
-                        row.settled_at
-
-                            ?
-
-                            new Date(
-                                row.settled_at
-                            )
-                                .getTime()
-
-                            :
-
-                            rowEndTs;
-
-
-                    if (
-                        recordLocalMarketSale(
-                            auctionId,
-                            obs,
-                            finalPrice,
-                            settledTs
-                        )
-                    ) {
-
-                        archived++;
-                    }
-
-
-                    continue;
-                }
-
-
-
-                /* --------------------------------------------------
-                    SETTLEMENT PAS ENCORE FINI
-                    -------------------------------------------------- */
-
-                if (
-                    row.winner_id
-                    !=
-                    null
-                ) {
-
-                    /*
-                        * Un gagnant existe mais final_price
-                        * n'est pas encore écrit :
-                        *
-                        * on attend le prochain scan.
-                        */
-                    continue;
-                }
-
-
-
-                /* --------------------------------------------------
-                    INVENDUE / ANNULÉE
-                    -------------------------------------------------- */
-
-                if (
-                    Number.isFinite(
-                        rowEndTs
-                    )
-
-                    &&
-
-                    rowEndTs <=
-                    serverNow() -
-                    5000
-
-                    &&
-
-                    row.winner_id
-                    ==
-                    null
-
-                    &&
-
-                    row.final_price
-                    ==
-                    null
-                ) {
-
-                    delete localMarketPending[
-                        auctionId
-                    ];
-
-
-                    pendingChanged =
-                        true;
-                }
-            }
-
-
-            if (
-                pendingChanged
-            ) {
-
-                queueLocalMarketPendingSave();
-            }
-
-
-            if (
-                archived > 0
-            ) {
-
-                wmLog(
-                    `📚 Historique local : ` +
-                    `<b>${archived}</b> ` +
-                    `nouvelle(s) vente(s) ` +
-                    `confirmée(s) par final_price.`
-                );
-            }
-
-
-        } catch (e) {
-
-            console.warn(
-                '[WikiMasters][local-history] reconcile error:',
-                e
-            );
-
-        } finally {
-
-            localMarketReconcileRunning =
-                false;
-        }
-    }
-
-
-
-    /* ============================================================
-        API HISTORIQUE OFFICIELLE / FALLBACK LOCAL
-        ============================================================ */
-
-    const getCachedSalesOfficial_v18 =
-        getCachedSales;
-
-
-    getCachedSales =
-        function (
-            cardId,
-            rarity = ''
-        ) {
-
-            if (!cardId) {
-                return null;
-            }
-
-
-            /*
-                * Au premier lancement :
-                * on force un vrai test de permission.
-                */
-            if (
-                salesApiAccess ===
-                null
-            ) {
-
-                return null;
-            }
-
-
-            /*
-                * Compte PRO :
-                * historique officiel.
-                */
-            if (
-                salesApiAccess ===
-                true
-            ) {
-
-                return getCachedSalesOfficial_v18(
-                    cardId
-                );
-            }
-
-
-            /*
-                * Non-PRO :
-                * historique local.
-                */
-            return getLocalMarketStats(
-                cardId,
-                rarity
-            );
-        };
-
-
-
-    /* ============================================================
-        FETCH HISTORIQUE
-        ============================================================ */
-
-    fetchCardSales =
-        async function (
-            cardId,
-            rarity = ''
-        ) {
-
-            if (!cardId) {
-                return null;
-            }
-
-
-            /*
-                * On sait déjà que le compte
-                * n'a pas accès à /sales.
-                */
-            if (
-                salesApiAccess ===
-                false
-            ) {
-
-                return getLocalMarketStats(
-                    cardId,
-                    rarity
-                );
-            }
-
-
-            try {
-
-                const res =
-                    await fetch(
-                        `https://www.wiki-masters.com/api/marketplace/cards/${cardId}/sales`,
-                        {
-                            credentials:
-                                "include"
-                        }
-                    );
-
-
-
-                /* --------------------------------------------------
-                    NON PRO
-                    -------------------------------------------------- */
-
-                if (
-                    res.status ===
-                    403
-                ) {
-
-                    const body =
-                        await res
-                            .json()
-                            .catch(
-                                () => ({})
-                            );
-
-
-                    if (
-                        body?.code ===
-                        'pro_required'
-                    ) {
-
-                        salesApiAccess =
-                            false;
-
-
-                        /*
-                            * Inutile de continuer la file API.
-                            */
-                        salesFetchQueue.length =
-                            0;
-
-
-                        salesFetchQueued.clear();
-
-
-                        if (
-                            !salesApiAccessLogDone
-                        ) {
-
-                            salesApiAccessLogDone =
-                                true;
-
-
-                            wmLog(
-                                `📚 API historique officielle ` +
-                                `réservée aux comptes PRO · ` +
-                                `bascule sur ` +
-                                `<b>l’historique local v2.2 (carte + rareté)</b>.`
-                            );
-                        }
-
-
-                        return getLocalMarketStats(
-                            cardId,
-                            rarity
-                        );
-                    }
-
-
-                    return null;
-                }
-
-
-
-                if (!res.ok) {
-                    return null;
-                }
-
-
-
-                /* --------------------------------------------------
-                    COMPTE PRO
-                    -------------------------------------------------- */
-
-                salesApiAccess =
-                    true;
-
-
-                const data =
-                    await res.json();
-
-
-                const cutoff =
-                    Date.now()
-                    -
-                    (
-                        30 *
-                        24 *
-                        60 *
-                        60 *
-                        1000
-                    );
-
-
-                /*
-                    * Number() permet également de gérer un éventuel
-                    * final_price renvoyé sous forme de string JSON.
-                    */
-                const sales =
-                    (
-                        data.sales
-                        ||
-                        []
-                    )
-
-                        .map(
-                            s => ({
-
-                                ...s,
-
-                                final_price:
-                                    Number(
-                                        s.final_price
-                                    )
-                            })
-                        )
-
-                        .filter(
-                            s => {
-
-                                if (
-                                    !Number.isFinite(
-                                        s.final_price
-                                    )
-                                ) {
-                                    return false;
-                                }
-
-
-                                if (
-                                    !s.settled_at
-                                ) {
-                                    return false;
-                                }
-
-
-                                const ts =
-                                    new Date(
-                                        s.settled_at
-                                    )
-                                        .getTime();
-
-
-                                return (
-
-                                    Number.isFinite(
-                                        ts
-                                    )
-
-                                    &&
-
-                                    ts >=
-                                    cutoff
-                                );
-                            }
-                        );
-
-
-                const prices =
-                    sales.map(
-                        s =>
-                            s.final_price
-                    );
-
-
-                const recent =
-                    sales
-
-                        .slice()
-
-                        .sort(
-                            (a, b) =>
-
-                                new Date(
-                                    b.settled_at
-                                )
-                                    .getTime()
-
-                                -
-
-                                new Date(
-                                    a.settled_at
-                                )
-                                    .getTime()
-                        );
-
-
-                const entry = {
-
-                    median:
-                        median(
-                            prices
-                        ),
-
-                    count:
-                        prices.length,
-
-                    last:
-                        recent.length
-
-                            ?
-
-                            recent[0]
-                                .final_price
-
-                            :
-
-                            null,
-
-                    avg:
-                        prices.length
-
-                            ?
-
-                            Math.round(
-
-                                prices.reduce(
-                                    (sum, p) =>
-                                        sum + p,
-                                    0
-                                )
-
-                                /
-
-                                prices.length
-                            )
-
-                            :
-
-                            null,
-
-                    min:
-                        prices.length
-
-                            ?
-
-                            Math.min(
-                                ...prices
-                            )
-
-                            :
-
-                            null,
-
-                    max:
-                        prices.length
-
-                            ?
-
-                            Math.max(
-                                ...prices
-                            )
-
-                            :
-
-                            null,
-
-                    fetchedAt:
-                        Date.now(),
-
-                    source:
-                        'official'
-                };
-
-
-                salesCache[
-                    cardId
-                ] =
-                    entry;
-
-
-                saveSalesCache();
-
-
-                return entry;
-
-
-            } catch (e) {
-
-                return null;
-            }
-        };
-
-
-
-    /* ============================================================
-        FILE DE CHARGEMENT HISTORIQUE
-        ============================================================ */
-
-    processSalesQueue =
-        async function (
-            onUpdate
-        ) {
-
-            if (
-                salesFetchRunning
-            ) {
-                return;
-            }
-
-
-            /*
-                * En mode local il n'y a absolument aucune
-                * requête par carte à effectuer.
-                */
-            if (
-                salesApiAccess ===
-                false
-            ) {
-
-                salesFetchQueue.length =
-                    0;
-
-
-                salesFetchQueued.clear();
-
-
-                if (onUpdate) {
-                    onUpdate();
-                }
-
-
-                return;
-            }
-
-
-            salesFetchRunning =
-                true;
-
-
-            try {
-
-                while (
-                    salesFetchQueue.length >
-                    0
-                ) {
-
-                    const cardId =
-                        salesFetchQueue.shift();
-
-
-                    salesFetchQueued.delete(
-                        cardId
-                    );
-
-
-                    if (
-                        salesApiAccess ===
-                        true
-
-                        &&
-
-                        getCachedSalesOfficial_v18(
-                            cardId
-                        )
-                    ) {
-
-                        continue;
-                    }
-
-
-                    await fetchCardSales(
-                        cardId
-                    );
-
-
-                    if (onUpdate) {
-                        onUpdate();
-                    }
-
-
-                    /*
-                        * Le premier fetch vient de découvrir
-                        * que le compte n'est pas PRO.
-                        */
-                    if (
-                        salesApiAccess ===
-                        false
-                    ) {
-
-                        salesFetchQueue.length =
-                            0;
-
-
-                        salesFetchQueued.clear();
-
-
-                        break;
-                    }
-
-
-                    await new Promise(
-                        r =>
-                            setTimeout(
-                                r,
-                                2000 +
-                                Math.random() *
-                                2000
-                            )
-                    );
-                }
-
-            } finally {
-
-                salesFetchRunning =
-                    false;
-            }
-        };
-
-
-
-    /* ============================================================
-        BADGE DE VALORISATION
-        ============================================================ */
-
-    computeValuation =
-        function (
-            currentPrice,
-            cardId,
-            rarity = ''
-        ) {
-
-            const rr = String(rarity || '').toUpperCase();
-            let entry = getCachedSales(cardId, rr);
-
-            // Lorsque le test /sales PRO n'est pas encore terminé, l'historique local existe
-            // quand même : ne pas masquer une médiane déjà observée.
-            if (!entry) {
-                try { entry = getLocalMarketStats(cardId, rr); } catch (e) { }
-            }
-
-            const wmAverage = getWmOfficialAverage(cardId, rr);
-            const localCount = Number(entry?.count || 0);
-            const localMedian = Number(entry?.median || 0);
-
-            const reliableLocal =
-                localCount >= 3 &&
-                Number.isFinite(localMedian) &&
-                localMedian > 0;
-
-            let reference = null;
-            let referenceKind = null;
-            let referenceLabel = null;
-
-            if (reliableLocal) {
-                reference = localMedian;
-                referenceKind = 'median';
-                referenceLabel = `méd. ${localMedian}`;
-            } else if (Number.isFinite(wmAverage) && wmAverage > 0) {
-                reference = wmAverage;
-                referenceKind = 'wm_average';
-                referenceLabel = `moy. WM ${wmAverage}`;
-            }
-
-            const fmt = n =>
-                n == null || !Number.isFinite(Number(n))
-                    ? '?'
-                    : Number(n).toLocaleString('fr-FR');
-
-            const localTip = localCount > 0
-                ? `${localCount} vente(s) locale(s) · dernier ${fmt(entry?.last)} 💰 · méd. ${fmt(entry?.median)} 💰`
-                : 'aucune vente locale observée';
-
-            const wmTip = Number.isFinite(wmAverage)
-                ? `moyenne officielle WikiMasters ${fmt(wmAverage)} 💰`
-                : 'moyenne WikiMasters non chargée / indisponible';
-
-            const tip = `${localTip} · ${wmTip}`;
-
-            if (!reference) {
-                if (localCount > 0) {
-                    return {
-                        status: 'few',
-                        label: `~${fmt(localMedian)} (${localCount} vente${localCount > 1 ? 's' : ''})`,
-                        color: '#666',
-                        median: localMedian,
-                        count: localCount,
-                        wmAverage,
-                        tip
-                    };
-                }
-                return null;
-            }
-
-            const ratio = Number(currentPrice) / reference;
-
-            if (ratio < 0.75) {
-                return {
-                    status: 'under',
-                    label: `sous-coté · ${referenceLabel}`,
-                    color: '#4ade80',
-                    median: reliableLocal ? localMedian : 0,
-                    count: localCount,
-                    wmAverage,
-                    reference,
-                    referenceKind,
-                    tip
-                };
-            }
-
-            if (ratio > 1.25) {
-                return {
-                    status: 'over',
-                    label: `surcoté · ${referenceLabel}`,
-                    color: '#ef4444',
-                    median: reliableLocal ? localMedian : 0,
-                    count: localCount,
-                    wmAverage,
-                    reference,
-                    referenceKind,
-                    tip
-                };
-            }
-
-            return {
-                status: 'fair',
-                label: `dans la zone · ${referenceLabel}`,
-                color: '#888',
-                median: reliableLocal ? localMedian : 0,
-                count: localCount,
-                wmAverage,
-                reference,
-                referenceKind,
-                tip
-            };
-        };
-
-
-
-    /* ============================================================
-        HOOK 1 :
-        LES HITS AFFICHÉS SONT OBSERVÉS
-        ============================================================ */
-
-    const renderMarketHits_v17 =
-        renderMarketHits;
-
-
-    renderMarketHits =
-        function (
-            marketAlertEl,
-            hits,
-            newHits
-        ) {
-
-            observeLocalMarketHits(
-                hits
-            );
-
-
-            return renderMarketHits_v17(
-                marketAlertEl,
-                hits,
-                newHits
-            );
-        };
-
-
-
-    /* ============================================================
-        HOOK 2 :
-        APRÈS CHAQUE SCAN COMPLET → RÉCONCILIATION
-        ============================================================ */
-
-    const fetchAllMarketAuctions_v17 =
-        fetchAllMarketAuctions;
-
-
-    fetchAllMarketAuctions =
-        async function (
-            onProgress
-        ) {
-
-            const result =
-                await fetchAllMarketAuctions_v17(
-                    onProgress
-                );
-
-
-            const allAuctions = result?.auctions || [];
-
-            // Le scan complet est déjà téléchargé par le Market Watcher : aucune requête
-            // supplémentaire. observeLocalMarketHits filtre ensuite Standards + Global.
-            observeLocalMarketHits(allAuctions);
-
-            /* Ne bloque pas le rendu du Market Watcher. */
-            reconcileLocalMarketHistory(
-                allAuctions
-            )
-                .catch(
-                    () => { }
-                );
-
-
-            return result;
-        };
-
-
-
-    /* ============================================================
-        HOOK 3 :
-        LES SYNCHROS TIMER v1.7 ALIMENTENT AUSSI LE LOCAL
-        ============================================================ */
-
-    const applyFreshAuctionState_v17 =
-        applyFreshAuctionState;
-
-
-    applyFreshAuctionState =
-        function (
-            fresh,
-            options
-        ) {
-
-            const merged =
-                applyFreshAuctionState_v17(
-                    fresh,
-                    options
-                );
-
-
-            observeFreshLocalAuction(
-                fresh
-            );
-
-
-            return merged;
-        };
-
-
-
-    /* ============================================================
-        OUTILS CONSOLE
-        ============================================================ */
-
-
-    /* ============================================================
-       RECHERCHE MÉDIANE À LA VOLÉE
-       Console :
-         await wmMedian("Jupiter")
-         await wmMedian("Jupiter", "UR")
-       ============================================================ */
-
-    async function findCardsByTitleForMedian(title) {
+    async function findCardsByTitleForOfficialPrice(title) {
         const q = String(title || '').trim();
         if (!q) return [];
-
         const found = new Map();
-
-        // 1) Cache marketplace déjà chargé : zéro requête supplémentaire.
         try {
-            const pools = [
-                ...(Array.isArray(lastAllMarketAuctions) ? lastAllMarketAuctions : []),
-                ...(Array.isArray(lastHitsCache) ? lastHitsCache : [])
-            ];
+            const pools = [...(Array.isArray(lastAllMarketAuctions) ? lastAllMarketAuctions : []), ...(Array.isArray(lastHitsCache) ? lastHitsCache : [])];
             for (const a of pools) {
                 const c = a?.card || a;
                 const cardId = c?.id || a?.card_id;
@@ -20858,410 +18620,72 @@
                 if (!cardId || !t) continue;
                 if (t.toLocaleLowerCase('fr-FR').includes(q.toLocaleLowerCase('fr-FR'))) {
                     const rarity = String(a?.snapshot_rarity || c?.rarity || '').toUpperCase();
-                    found.set(`${cardId}|${rarity}`, {
-                        cardId,
-                        title: t,
-                        rarity
-                    });
+                    found.set(`${cardId}|${rarity}`, { cardId, title:t, rarity });
                 }
             }
         } catch (e) { }
-
-        // 2) Catalogue Supabase pour pouvoir chercher une carte même absente du market actuel.
         try {
             const escaped = q.replace(/[%_*]/g, s => '\\' + s);
-            const rows = await supabaseSelect(
-                `cards?wikipedia_title=ilike.*${encodeURIComponent(escaped)}*&select=id,wikipedia_title,rarity&limit=50`
-            );
-            if (Array.isArray(rows)) {
-                for (const c of rows) {
-                    if (!c?.id) continue;
-                    const rarity = String(c?.rarity || '').toUpperCase();
-                    found.set(`${c.id}|${rarity}`, {
-                        cardId: c.id,
-                        title: c.wikipedia_title || q,
-                        rarity
-                    });
-                }
+            const rows = await supabaseSelect(`cards?wikipedia_title=ilike.*${encodeURIComponent(escaped)}*&select=id,wikipedia_title,rarity&limit=50`);
+            if (Array.isArray(rows)) for (const c of rows) {
+                if (!c?.id) continue;
+                const rarity = String(c?.rarity || '').toUpperCase();
+                found.set(`${c.id}|${rarity}`, { cardId:c.id, title:c.wikipedia_title || q, rarity });
             }
         } catch (e) { }
-
-        // Exact titre d'abord, puis correspondances partielles.
-        const arr = [...found.values()];
-        const ql = q.toLocaleLowerCase('fr-FR');
-        return arr.sort((a, b) => {
-            const ae = String(a.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
-            const be = String(b.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
-            if (ae !== be) return ae - be;
-            return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
+        const arr=[...found.values()], ql=q.toLocaleLowerCase('fr-FR');
+        return arr.sort((a,b)=>{
+            const ae=String(a.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
+            const be=String(b.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
+            if(ae!==be)return ae-be;
+            return String(a.title||'').localeCompare(String(b.title||''),'fr');
         });
     }
 
-    function quickMedianRowsHtml(rows, query = '') {
-        if (!Array.isArray(rows) || rows.length === 0) {
-            return `<span style="color:#f59e0b;">Aucune donnée pour « ${htmlEsc(query)} ».</span>`;
-        }
-
-        return rows.slice(0, 12).map(r => {
-            const count = Number(r?.ventes || 0);
-            const med = Number(r?.mediane);
-            const last = Number(r?.derniere);
-            const wmAvg = Number(r?.moyenneWM);
-            const reliable = count >= 3 && Number.isFinite(med) && med > 0;
-
-            const localHtml = Number.isFinite(med) && med > 0 && count > 0
-                ? `méd. <b style="color:#d8b4fe;">${med.toLocaleString('fr-FR')}</b> · ` +
-                (reliable
-                    ? `<span style="color:#4ade80;">n=${count}</span>`
-                    : `<span style="color:#fbbf24;">n=${count} ⚠ fragile</span>`)
-                : `<span style="color:#666;">méd. locale —</span>`;
-
-            const wmHtml = Number.isFinite(wmAvg) && wmAvg > 0
-                ? `moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>`
-                : `<span style="color:#555;">moy. WM —</span>`;
-
-            const lastHtml = Number.isFinite(last) && last > 0
-                ? ` · dern. <b style="color:#aaa;">${last.toLocaleString('fr-FR')}</b>`
-                : '';
-
-            const cap = Number(r?.capHunter);
-            const refLabel = r?.referenceSource === 'median'
-                ? 'médiane locale'
-                : r?.referenceSource === 'wm_average'
-                    ? 'moyenne WM'
-                    : null;
-
-            const capHtml = Number.isFinite(cap) && cap > 0
-                ? ` · cap Hunter <b style="color:#4ade80;">${cap.toLocaleString('fr-FR')}</b>` +
-                (refLabel ? ` <span style="color:#555;">(${refLabel})</span>` : '')
-                : '';
-
-            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);">
-                <div>
-                    <b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b>
-                    <span style="color:#c4b5fd;"> [${htmlEsc(r?.rarete || '?')}]</span>
-                </div>
-                <div style="color:#888;">
-                    ${localHtml} · ${wmHtml}${lastHtml}${capHtml}
-                </div>
-            </div>`;
+    function quickOfficialPriceRowsHtml(rows, query = '') {
+        if (!Array.isArray(rows) || rows.length === 0) return `<span style="color:#f59e0b;">Aucune donnée pour « ${htmlEsc(query)} ».</span>`;
+        return rows.slice(0,12).map(r=>{
+            const wmAvg=Number(r?.moyenneWM), cap=Number(r?.capHunter);
+            const wmHtml=Number.isFinite(wmAvg)&&wmAvg>0?`moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>`:`<span style="color:#555;">moy. WM —</span>`;
+            const capHtml=Number.isFinite(cap)&&cap>0?` · cap Hunter <b style="color:#4ade80;">${cap.toLocaleString('fr-FR')}</b>`:` · <span style="color:#555;">cap Hunter —</span>`;
+            const eligibility=r?.achatPossible?'':Number.isFinite(wmAvg)&&wmAvg>0?` · <span style="color:#f59e0b;">Hunter bloqué &lt; ${HUNTER_DYNAMIC_MIN_REFERENCE}</span>`:'';
+            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);"><div><b style="color:#eee;">${htmlEsc(r?.carte||'?')}</b><span style="color:#67e8f9;"> [${htmlEsc(r?.rarete||'?')}]</span></div><div style="color:#888;">${wmHtml}${capHtml}${eligibility}</div></div>`;
         }).join('');
     }
 
-    window.wmMedian = async function (title, rarity = '', silent = false) {
-        const q = String(title || '').trim();
-        const wantedRarity = String(rarity || '').trim().toUpperCase();
-
-        if (!q) {
-            console.warn('Usage : await wmMedian("Jupiter") ou await wmMedian("Jupiter", "UR")');
-            return [];
-        }
-
-        const cards = await findCardsByTitleForMedian(q);
-        if (cards.length === 0) {
-            if (!silent) console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`);
-            return [];
-        }
-
-        // Une seule requête summary par card_id, même si plusieurs raretés sont affichées.
-        await Promise.all(
-            [...new Set(cards.map(c => c.cardId).filter(Boolean))]
-                .map(id => fetchWmOfficialSummary(id).catch(() => null))
-        );
-
-        const results = [];
-        const dedup = new Set();
-
-        for (const c of cards) {
-            const official = getCachedWmOfficialSummary(c.cardId);
-            const officialRarities = Object.keys(official?.summary || {});
-            const rarities = wantedRarity
-                ? [wantedRarity]
-                : [...new Set([c.rarity, ...officialRarities].filter(Boolean).map(r => String(r).toUpperCase()))];
-
-            for (const rr of rarities) {
-                const key = `${c.cardId}|${rr}`;
-                if (dedup.has(key)) continue;
-                dedup.add(key);
-
-                let stats = null;
-                try { stats = getLocalMarketStats(c.cardId, rr); } catch (e) { }
-
-                const count = Number(stats?.count || 0);
-                const med = Number(stats?.median || 0);
-                const wmAvg = getWmOfficialAverage(c.cardId, rr);
-
-                let refValue = null;
-                let referenceSource = null;
-
-                if (count >= 3 && Number.isFinite(med) && med > 0) {
-                    refValue = med;
-                    referenceSource = 'median';
-                } else if (Number.isFinite(wmAvg) && wmAvg > 0) {
-                    refValue = wmAvg;
-                    referenceSource = 'wm_average';
-                }
-
-                results.push({
-                    carte: official?.title || c.title,
-                    rarete: rr || '?',
-                    mediane: count > 0 && Number.isFinite(med) && med > 0 ? med : null,
-                    ventes: count,
-                    moyenneWM: Number.isFinite(wmAvg) ? wmAvg : null,
-                    derniere: Number.isFinite(Number(stats?.last)) ? Number(stats.last) : null,
-                    min: Number.isFinite(Number(stats?.min)) ? Number(stats.min) : null,
-                    max: Number.isFinite(Number(stats?.max)) ? Number(stats.max) : null,
-                    fiable: count >= 3 ? 'oui' : 'non',
-                    reference: refValue,
-                    referenceSource,
-                    capHunter: Number.isFinite(refValue) && refValue > 0
-                        ? dynamicHunterCapFromMedian(refValue)
-                        : null
-                });
+    window.wmPrice = async function(title, rarity='', silent=false) {
+        const q=String(title||'').trim(), wantedRarity=String(rarity||'').trim().toUpperCase();
+        if(!q){console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")');return[];}
+        const cards=await findCardsByTitleForOfficialPrice(q);
+        if(cards.length===0){if(!silent)console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`);return[];}
+        await Promise.all([...new Set(cards.map(c=>c.cardId).filter(Boolean))].map(id=>fetchWmOfficialSummary(id,true).catch(()=>null)));
+        const results=[],dedup=new Set();
+        for(const c of cards){
+            const official=getCachedWmOfficialSummary(c.cardId), officialRarities=Object.keys(official?.summary||{});
+            const rarities=wantedRarity?[wantedRarity]:[...new Set([c.rarity,...officialRarities].filter(Boolean).map(r=>String(r).toUpperCase()))];
+            for(const rr of rarities){
+                const key=`${c.cardId}|${rr}`;if(dedup.has(key))continue;dedup.add(key);
+                const wmAvg=getWmOfficialAverage(c.cardId,rr), valid=Number.isFinite(wmAvg)&&wmAvg>0;
+                results.push({carte:official?.title||c.title,cardId:c.cardId,rarete:rr||'?',moyenneWM:valid?wmAvg:null,capHunter:valid?dynamicHunterCapFromReference(wmAvg):null,achatPossible:!!(valid&&wmAvg>=HUNTER_DYNAMIC_MIN_REFERENCE)});
             }
         }
-
-        const ql = q.toLocaleLowerCase('fr-FR');
-        const exact = results.filter(
-            r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql
-        );
-        const shown = exact.length ? exact : results.slice(0, 20);
-
-        if (!silent) {
+        const ql=q.toLocaleLowerCase('fr-FR'), exact=results.filter(r=>String(r.carte||'').toLocaleLowerCase('fr-FR')===ql), shown=exact.length?exact:results.slice(0,20);
+        if(!silent){
             console.table(shown);
-            const lines = shown
-                .filter(r => Number.isFinite(Number(r.reference)) && Number(r.reference) > 0)
-                .map(r =>
-                    `[${r.rarete}] méd. ${r.mediane ?? '—'} (n=${r.ventes}) · ` +
-                    `moy.WM ${r.moyenneWM ?? '—'} · cap ${r.capHunter ?? '—'}`
-                );
-            wmLog(
-                lines.length
-                    ? `📊 Prix à la volée : <b>${q}</b> → ${lines.join(' · ')}`
-                    : `📊 Prix à la volée : <b>${q}</b> → aucune référence exploitable`
-            );
+            const lines=shown.filter(r=>Number.isFinite(Number(r.moyenneWM))&&Number(r.moyenneWM)>0).map(r=>`[${r.rarete}] moy.WM ${r.moyenneWM} · cap ${r.capHunter??'—'}`);
+            wmLog(lines.length?`💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}`:`💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
         }
-
         return shown;
     };
-
-    window.med = window.wmMedian;
-
-    // Alias court si tu veux aller très vite dans la console.
-
-    window.wmLocalHistoryInfo =
-        function () {
-
-            const cutoff =
-                Date.now() -
-                LOCAL_MARKET_HISTORY_WINDOW_MS;
-
-
-            const valid =
-                localMarketHistory.filter(
-                    s =>
-                        Number(s.t)
-                        >=
-                        cutoff
-                );
-
-
-            const info = {
-
-                salesApiAccess,
-
-                ventesLocales30j:
-                    valid.length,
-
-                cartesDistinctes30j:
-                    new Set(valid.map(s => s.c)).size,
-
-                couplesCarteRarete30j:
-                    new Set(valid.filter(s => s.r).map(s => `${s.c}|${s.r}`)).size,
-
-                ventesLegacySansRarete:
-                    valid.filter(s => !s.r).length,
-
-                raretesGlobales:
-                    [...GLOBAL_SEARCH_RARITIES].join(', ') || '(aucune)',
-
-                sourceHunterDynamique:
-                    hunterDynamicSourceLabel(),
-
-                encheresEnObservation:
-                    Object.keys(
-                        localMarketPending
-                    ).length,
-
-                premiereVenteLocale:
-                    valid.length
-
-                        ?
-
-                        new Date(
-                            Math.min(
-                                ...valid.map(
-                                    s =>
-                                        Number(s.t)
-                                )
-                            )
-                        )
-                            .toLocaleString(
-                                'fr-FR'
-                            )
-
-                        :
-
-                        null,
-
-                derniereVenteLocale:
-                    valid.length
-
-                        ?
-
-                        new Date(
-                            Math.max(
-                                ...valid.map(
-                                    s =>
-                                        Number(s.t)
-                                )
-                            )
-                        )
-                            .toLocaleString(
-                                'fr-FR'
-                            )
-
-                        :
-
-                        null
-            };
-
-
-            console.table(
-                info
-            );
-
-
-            return info;
-        };
-
-
-
-    window.wmLocalHistoryFor =
-        function (
-            cardId,
-            rarity = ''
-        ) {
-
-            const sales =
-                (
-                    localMarketByCard.get(
-                        cardId
-                    )
-                    ||
-                    []
-                )
-
-                    .filter(
-                        s =>
-                            Number(s.t) >= Date.now() - LOCAL_MARKET_HISTORY_WINDOW_MS &&
-                            (!rarity || String(s.r || '').toUpperCase() === String(rarity).toUpperCase())
-                    )
-
-                    .map(
-                        s => ({
-
-                            auctionId:
-                                s.a,
-
-                            cardId:
-                                s.c,
-
-                            rarity:
-                                s.r || '(legacy inconnue)',
-
-                            finalPrice:
-                                s.p,
-
-                            settledAt:
-                                new Date(
-                                    Number(s.t)
-                                )
-                                    .toLocaleString(
-                                        'fr-FR'
-                                    )
-                        })
-                    );
-
-
-            console.table(
-                sales
-            );
-
-
-            return sales;
-        };
-
-
-
-    window.wmClearLocalHistory =
-        function () {
-
-            if (
-                !confirm(
-                    'Effacer tout l’historique local v2.2 et les enchères actuellement observées ?'
-                )
-            ) {
-
-                return false;
-            }
-
-
-            localMarketHistory =
-                [];
-
-
-            localMarketPending =
-                {};
-
-
-            localMarketHistoryIds =
-                new Set();
-
-
-            localMarketByCard =
-                new Map();
-
-
-            localStorage.removeItem(
-                LOCAL_MARKET_HISTORY_KEY
-            );
-
-
-            localStorage.removeItem(
-                LOCAL_MARKET_PENDING_KEY
-            );
-
-
-            wmLog(
-                '🗑️ Historique local v2.2 effacé.'
-            );
-
-
-            return true;
-        };
-
-
+    window.prix = window.wmPrice;
 
     /* ============================================================
         MESSAGE DE DÉMARRAGE
         ============================================================ */
 
     wmLog(
-        `📚 Historique local v2.2 prêt · ` +
-        `<b>${localMarketHistory.length}</b> ` +
-        `vente(s) conservée(s) · ` +
-        `collecte Standards + Recherche globale · stats séparées par rareté · entrée Hunter ≤5 min.`
+        `💰 v2.8.0 : prix automatiques basés uniquement sur la moyenne officielle WikiMasters · ` +
+        `ancien collecteur local désactivé.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
