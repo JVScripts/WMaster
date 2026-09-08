@@ -623,7 +623,7 @@
                         saveFlipLedger();
                         renderFlipHistory();
                     }
-                }).catch(() => {});
+                }).catch(() => { });
             }, delay);
         }
     }
@@ -2156,11 +2156,11 @@
         reconcileAutoFlipCandidatesById()
             .then(result => {
                 if (result?.wins > 0) {
-                    retryPendingFlipTags().catch(() => {});
+                    retryPendingFlipTags().catch(() => { });
                     wakeFlipSeller();
                 }
             })
-            .catch(() => {});
+            .catch(() => { });
     }, 15_000);
 
     async function retryPendingFlipTags() {
@@ -3878,8 +3878,8 @@
 
     window.wmFlipDeepResolve = async function () {
         const n = await deepResolvePendingFlipRecords(true);
-        await retryPendingFlipTags().catch(() => {});
-        await syncManualFlipTags().catch(() => {});
+        await retryPendingFlipTags().catch(() => { });
+        await syncManualFlipTags().catch(() => { });
         renderFlipHistory();
         console.log(`[WikiMasters][Flip] résolution profonde forcée : ${n} exemplaire(s) retrouvé(s).`);
         return n;
@@ -4449,7 +4449,7 @@
         if (!cardId || getCachedWmOfficialSummary(cardId) || wmOfficialSummaryQueued.has(cardId)) return;
         wmOfficialSummaryQueued.add(cardId);
         wmOfficialSummaryQueue.push(cardId);
-        processWmOfficialSummaryQueue().catch(() => {});
+        processWmOfficialSummaryQueue().catch(() => { });
     }
 
     async function processWmOfficialSummaryQueue() {
@@ -4509,17 +4509,17 @@
         const ratio = Number(currentPrice) / avg;
         const formatted = avg.toLocaleString('fr-FR');
         const tip = `Moyenne officielle WikiMasters : ${formatted} 💰`;
-        const common = { count:1, wmAverage:avg, reference:avg, referenceKind:'wm_average', tip };
-        if (ratio < 0.75) return { ...common, status:'under', label:`sous-coté · moy. WM ${formatted}`, color:'#4ade80' };
-        if (ratio > 1.25) return { ...common, status:'over', label:`surcoté · moy. WM ${formatted}`, color:'#ef4444' };
-        return { ...common, status:'fair', label:`dans la zone · moy. WM ${formatted}`, color:'#888' };
+        const common = { count: 1, wmAverage: avg, reference: avg, referenceKind: 'wm_average', tip };
+        if (ratio < 0.75) return { ...common, status: 'under', label: `sous-coté · moy. WM ${formatted}`, color: '#4ade80' };
+        if (ratio > 1.25) return { ...common, status: 'over', label: `surcoté · moy. WM ${formatted}`, color: '#ef4444' };
+        return { ...common, status: 'fair', label: `dans la zone · moy. WM ${formatted}`, color: '#888' };
     }
 
     // v2.8.0 — Hunter dynamique : la SEULE référence d'achat est
     // la moyenne officielle WikiMasters de la carte + rareté.
     //
     // Même garde-fou historique : moyenne WM ≥ 500 requise.
-    const HUNTER_DYNAMIC_MIN_REFERENCE = 500;
+    const HUNTER_DYNAMIC_MIN_REFERENCE = 1500;
 
     // Plafond dynamique = ratio configuré × moyenne officielle WM,
     // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
@@ -7029,7 +7029,7 @@
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
-            await preloadWmOfficialSummariesForHunter(list).catch(() => {});
+            await preloadWmOfficialSummariesForHunter(list).catch(() => { });
         }
 
         if (hunterAggressive) return runHunterFourbePass(list);
@@ -15368,7 +15368,7 @@
                     .then(result => {
                         if (result?.wins > 0) wakeFlipSeller();
                     })
-                    .catch(() => {});
+                    .catch(() => { });
             }
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
@@ -15381,7 +15381,7 @@
             renderFlipHistory(); // moyenne WM / âge rafraîchis en continu
         }, 15000);
         // Au chargement, les anciens Flips sans snapshot frais sont actualisés rapidement.
-        setTimeout(() => refreshTrackedFlipOfficialAverages(false).catch(() => {}), 2500);
+        setTimeout(() => refreshTrackedFlipOfficialAverages(false).catch(() => { }), 2500);
 
         // L'affichage seul est très léger : entre deux cycles réseau, l'âge et la dernière
         // moyenne WM reçue se rafraîchissent sans requête.
@@ -17124,7 +17124,7 @@
                 // Même si fetchSellingState() échoue, un achat auto doit entrer dans Flip Seller.
                 if (Date.now() - lastWonSync > 60000) {
                     lastWonSync = Date.now();
-                    syncWonAuctions().catch(() => {});
+                    syncWonAuctions().catch(() => { });
                 }
 
                 const st = await fetchSellingState();
@@ -18620,7 +18620,7 @@
                 if (!cardId || !t) continue;
                 if (t.toLocaleLowerCase('fr-FR').includes(q.toLocaleLowerCase('fr-FR'))) {
                     const rarity = String(a?.snapshot_rarity || c?.rarity || '').toUpperCase();
-                    found.set(`${cardId}|${rarity}`, { cardId, title:t, rarity });
+                    found.set(`${cardId}|${rarity}`, { cardId, title: t, rarity });
                 }
             }
         } catch (e) { }
@@ -18630,50 +18630,50 @@
             if (Array.isArray(rows)) for (const c of rows) {
                 if (!c?.id) continue;
                 const rarity = String(c?.rarity || '').toUpperCase();
-                found.set(`${c.id}|${rarity}`, { cardId:c.id, title:c.wikipedia_title || q, rarity });
+                found.set(`${c.id}|${rarity}`, { cardId: c.id, title: c.wikipedia_title || q, rarity });
             }
         } catch (e) { }
-        const arr=[...found.values()], ql=q.toLocaleLowerCase('fr-FR');
-        return arr.sort((a,b)=>{
-            const ae=String(a.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
-            const be=String(b.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
-            if(ae!==be)return ae-be;
-            return String(a.title||'').localeCompare(String(b.title||''),'fr');
+        const arr = [...found.values()], ql = q.toLocaleLowerCase('fr-FR');
+        return arr.sort((a, b) => {
+            const ae = String(a.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
+            const be = String(b.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
+            if (ae !== be) return ae - be;
+            return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
         });
     }
 
     function quickOfficialPriceRowsHtml(rows, query = '') {
         if (!Array.isArray(rows) || rows.length === 0) return `<span style="color:#f59e0b;">Aucune donnée pour « ${htmlEsc(query)} ».</span>`;
-        return rows.slice(0,12).map(r=>{
-            const wmAvg=Number(r?.moyenneWM), cap=Number(r?.capHunter);
-            const wmHtml=Number.isFinite(wmAvg)&&wmAvg>0?`moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>`:`<span style="color:#555;">moy. WM —</span>`;
-            const capHtml=Number.isFinite(cap)&&cap>0?` · cap Hunter <b style="color:#4ade80;">${cap.toLocaleString('fr-FR')}</b>`:` · <span style="color:#555;">cap Hunter —</span>`;
-            const eligibility=r?.achatPossible?'':Number.isFinite(wmAvg)&&wmAvg>0?` · <span style="color:#f59e0b;">Hunter bloqué &lt; ${HUNTER_DYNAMIC_MIN_REFERENCE}</span>`:'';
-            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);"><div><b style="color:#eee;">${htmlEsc(r?.carte||'?')}</b><span style="color:#67e8f9;"> [${htmlEsc(r?.rarete||'?')}]</span></div><div style="color:#888;">${wmHtml}${capHtml}${eligibility}</div></div>`;
+        return rows.slice(0, 12).map(r => {
+            const wmAvg = Number(r?.moyenneWM), cap = Number(r?.capHunter);
+            const wmHtml = Number.isFinite(wmAvg) && wmAvg > 0 ? `moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>` : `<span style="color:#555;">moy. WM —</span>`;
+            const capHtml = Number.isFinite(cap) && cap > 0 ? ` · cap Hunter <b style="color:#4ade80;">${cap.toLocaleString('fr-FR')}</b>` : ` · <span style="color:#555;">cap Hunter —</span>`;
+            const eligibility = r?.achatPossible ? '' : Number.isFinite(wmAvg) && wmAvg > 0 ? ` · <span style="color:#f59e0b;">Hunter bloqué &lt; ${HUNTER_DYNAMIC_MIN_REFERENCE}</span>` : '';
+            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);"><div><b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b><span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span></div><div style="color:#888;">${wmHtml}${capHtml}${eligibility}</div></div>`;
         }).join('');
     }
 
-    window.wmPrice = async function(title, rarity='', silent=false) {
-        const q=String(title||'').trim(), wantedRarity=String(rarity||'').trim().toUpperCase();
-        if(!q){console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")');return[];}
-        const cards=await findCardsByTitleForOfficialPrice(q);
-        if(cards.length===0){if(!silent)console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`);return[];}
-        await Promise.all([...new Set(cards.map(c=>c.cardId).filter(Boolean))].map(id=>fetchWmOfficialSummary(id,true).catch(()=>null)));
-        const results=[],dedup=new Set();
-        for(const c of cards){
-            const official=getCachedWmOfficialSummary(c.cardId), officialRarities=Object.keys(official?.summary||{});
-            const rarities=wantedRarity?[wantedRarity]:[...new Set([c.rarity,...officialRarities].filter(Boolean).map(r=>String(r).toUpperCase()))];
-            for(const rr of rarities){
-                const key=`${c.cardId}|${rr}`;if(dedup.has(key))continue;dedup.add(key);
-                const wmAvg=getWmOfficialAverage(c.cardId,rr), valid=Number.isFinite(wmAvg)&&wmAvg>0;
-                results.push({carte:official?.title||c.title,cardId:c.cardId,rarete:rr||'?',moyenneWM:valid?wmAvg:null,capHunter:valid?dynamicHunterCapFromReference(wmAvg):null,achatPossible:!!(valid&&wmAvg>=HUNTER_DYNAMIC_MIN_REFERENCE)});
+    window.wmPrice = async function (title, rarity = '', silent = false) {
+        const q = String(title || '').trim(), wantedRarity = String(rarity || '').trim().toUpperCase();
+        if (!q) { console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")'); return []; }
+        const cards = await findCardsByTitleForOfficialPrice(q);
+        if (cards.length === 0) { if (!silent) console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`); return []; }
+        await Promise.all([...new Set(cards.map(c => c.cardId).filter(Boolean))].map(id => fetchWmOfficialSummary(id, true).catch(() => null)));
+        const results = [], dedup = new Set();
+        for (const c of cards) {
+            const official = getCachedWmOfficialSummary(c.cardId), officialRarities = Object.keys(official?.summary || {});
+            const rarities = wantedRarity ? [wantedRarity] : [...new Set([c.rarity, ...officialRarities].filter(Boolean).map(r => String(r).toUpperCase()))];
+            for (const rr of rarities) {
+                const key = `${c.cardId}|${rr}`; if (dedup.has(key)) continue; dedup.add(key);
+                const wmAvg = getWmOfficialAverage(c.cardId, rr), valid = Number.isFinite(wmAvg) && wmAvg > 0;
+                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null, capHunter: valid ? dynamicHunterCapFromReference(wmAvg) : null, achatPossible: !!(valid && wmAvg >= HUNTER_DYNAMIC_MIN_REFERENCE) });
             }
         }
-        const ql=q.toLocaleLowerCase('fr-FR'), exact=results.filter(r=>String(r.carte||'').toLocaleLowerCase('fr-FR')===ql), shown=exact.length?exact:results.slice(0,20);
-        if(!silent){
+        const ql = q.toLocaleLowerCase('fr-FR'), exact = results.filter(r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql), shown = exact.length ? exact : results.slice(0, 20);
+        if (!silent) {
             console.table(shown);
-            const lines=shown.filter(r=>Number.isFinite(Number(r.moyenneWM))&&Number(r.moyenneWM)>0).map(r=>`[${r.rarete}] moy.WM ${r.moyenneWM} · cap ${r.capHunter??'—'}`);
-            wmLog(lines.length?`💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}`:`💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
+            const lines = shown.filter(r => Number.isFinite(Number(r.moyenneWM)) && Number(r.moyenneWM) > 0).map(r => `[${r.rarete}] moy.WM ${r.moyenneWM} · cap ${r.capHunter ?? '—'}`);
+            wmLog(lines.length ? `💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}` : `💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
         }
         return shown;
     };
