@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.8.1';
+    const WM_VERSION = '2.8.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
