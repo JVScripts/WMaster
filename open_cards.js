@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.8.0';
+    const WM_VERSION = '2.8.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3539,6 +3539,34 @@
         return rows;
     };
 
+    window.wmHunterFreshnessDiag = function (cardId, rarity = '') {
+        const rr = String(rarity || '').trim().toUpperCase();
+        const raw = wmOfficialSummaryCache?.[cardId] || null;
+        const fetchedAt = Number(raw?.fetchedAt || 0);
+        const ageMs = fetchedAt ? Date.now() - fetchedAt : null;
+        const avg = Number(raw?.summary?.[rr]?.average);
+
+        const result = {
+            version: WM_VERSION,
+            cardId,
+            rarete: rr,
+            moyenneWMCache: Number.isFinite(avg) ? avg : null,
+            ageCacheSec: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
+            seuilMini: HUNTER_DYNAMIC_MIN_REFERENCE,
+            cacheAssezFrais: Number.isFinite(ageMs)
+                ? ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
+                : false,
+            hunterAutoriseAvecCeCache: !!(
+                Number.isFinite(avg) &&
+                avg >= HUNTER_DYNAMIC_MIN_REFERENCE &&
+                Number.isFinite(ageMs) &&
+                ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
+            )
+        };
+        console.table(result);
+        return result;
+    };
+
     window.wmHunterPriceDiag = async function (cardId, rarity = '') {
         const rr = String(rarity || '').trim().toUpperCase();
         if (cardId) await fetchWmOfficialSummary(cardId, true).catch(() => null);
@@ -3548,7 +3576,11 @@
             cardId,
             rarete: rr,
             moyenneWM: ref?.value ?? null,
-            sourceUtiliseePourAchat: ref ? 'moyenne officielle WikiMasters' : 'aucune',
+            ageMoyenneSec: ref ? Math.round(Number(ref.ageMs || 0) / 1000) : null,
+            seuilMiniMoyenneWM: HUNTER_DYNAMIC_MIN_REFERENCE,
+            maxAgeReferenceSec: Math.round(HUNTER_WM_REFERENCE_MAX_AGE_MS / 1000),
+            maxAgeAvantMiseSec: Math.round(HUNTER_WM_PRE_BID_MAX_AGE_MS / 1000),
+            sourceUtiliseePourAchat: ref ? 'moyenne officielle WikiMasters fraîche' : 'aucune',
             ratioPct: Math.round(Number(getSetting('autoSnipeAdaptiveRatio')) * 100),
             plafondHunter: ref ? dynamicHunterCapFromReference(ref.value) : null,
             achatPossible: !!(ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_REFERENCE)
@@ -4518,8 +4550,13 @@
     // v2.8.0 — Hunter dynamique : la SEULE référence d'achat est
     // la moyenne officielle WikiMasters de la carte + rareté.
     //
-    // Même garde-fou historique : moyenne WM ≥ 500 requise.
+    // v2.8.1 — garde-fou Hunter :
+    // - moyenne officielle WM >= 1500
+    // - une référence vieille de plus de 60 s n'est jamais utilisée pour décider d'acheter
+    // - juste avant un POST de mise dynamique, on exige une référence âgée de <= 5 s
     const HUNTER_DYNAMIC_MIN_REFERENCE = 1500;
+    const HUNTER_WM_REFERENCE_MAX_AGE_MS = 60 * 1000;
+    const HUNTER_WM_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
     // Plafond dynamique = ratio configuré × moyenne officielle WM,
     // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
@@ -4539,18 +4576,58 @@
         const rr = String(rarity || '').trim().toUpperCase();
         if (!cardId || !rr) return null;
 
-        const wmAverage = getWmOfficialAverage(cardId, rr);
+        // IMPORTANT : getCachedWmOfficialSummary() accepte jusqu'à 6 h pour le reste du bot.
+        // Le Hunter, lui, lit directement l'entrée et impose sa propre fraîcheur.
+        const entry = wmOfficialSummaryCache?.[cardId] || null;
+        if (!entry) return null;
+
+        const fetchedAt = Number(entry.fetchedAt || 0);
+        const ageMs = Date.now() - fetchedAt;
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > HUNTER_WM_REFERENCE_MAX_AGE_MS) {
+            return null;
+        }
+
+        const wmAverage = Number(entry?.summary?.[rr]?.average);
         if (!Number.isFinite(wmAverage) || wmAverage <= 0) return null;
 
-        // Aucune statistique locale n'intervient dans cette décision.
         return {
             value: wmAverage,
             kind: 'wm_average',
             label: 'moy. WM',
             reasonLabel: 'moyenne WM',
             cardId,
-            rarity: rr
+            rarity: rr,
+            fetchedAt,
+            ageMs
         };
+    }
+
+    async function ensureFreshHunterReference(
+        auction,
+        maxAgeMs = HUNTER_WM_REFERENCE_MAX_AGE_MS
+    ) {
+        if (!auction) return null;
+
+        const cardId = auction.card?.id ?? auction.card_id;
+        const rarity = globalAuctionRarity(auction);
+        if (!cardId || !rarity) return null;
+
+        const cached = wmOfficialSummaryCache?.[cardId] || null;
+        const ageMs = cached
+            ? Date.now() - Number(cached.fetchedAt || 0)
+            : Infinity;
+
+        if (!cached || !Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) {
+            // Force = true : surtout ne pas réutiliser le cache général 6 h.
+            const fresh = await fetchWmOfficialSummary(cardId, true).catch(() => null);
+            if (!fresh) return null;
+        }
+
+        const ref = getHunterPricingReference(cardId, rarity);
+        if (!ref) return null;
+        if (Number(ref.value) < HUNTER_DYNAMIC_MIN_REFERENCE) return null;
+
+        return ref;
     }
 
     async function preloadWmOfficialSummariesForHunter(list) {
@@ -4566,8 +4643,18 @@
             const rarity = globalAuctionRarity(a);
             if (!cardId || !rarity || seen.has(cardId)) continue;
 
-            // IMPORTANT : la moyenne officielle WM doit être chargée pour chaque décision.
-            if (getWmOfficialAverage(cardId, rarity) != null) continue;
+            // Le cache général peut dater de plusieurs heures : le Hunter le refuse.
+            const cached = wmOfficialSummaryCache?.[cardId] || null;
+            const ageMs = cached
+                ? Date.now() - Number(cached.fetchedAt || 0)
+                : Infinity;
+
+            if (
+                cached &&
+                Number.isFinite(ageMs) &&
+                ageMs >= 0 &&
+                ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
+            ) continue;
 
             seen.add(cardId);
             ids.push(cardId);
@@ -4582,7 +4669,7 @@
         async function worker() {
             while (idx < ids.length) {
                 const id = ids[idx++];
-                await fetchWmOfficialSummary(id).catch(() => null);
+                await fetchWmOfficialSummary(id, true).catch(() => null);
                 await new Promise(r => setTimeout(r, 100));
             }
         }
@@ -4605,15 +4692,30 @@
 
         const cardId = auction.card?.id ?? auction.card_id ?? candidate.cardId;
         const rarity = globalAuctionRarity(auction) || candidate.rarity || '';
+
+        const raw = wmOfficialSummaryCache?.[cardId] || null;
+        const rawAgeMs = raw
+            ? Date.now() - Number(raw.fetchedAt || 0)
+            : Infinity;
+
+        // Référence absente/périmée : on PAUSE la riposte, on recharge en arrière-plan,
+        // mais on ne détruit pas l'armement tant qu'on ne connaît pas la vraie moyenne.
+        if (
+            !raw ||
+            !Number.isFinite(rawAgeMs) ||
+            rawAgeMs < 0 ||
+            rawAgeMs > HUNTER_WM_REFERENCE_MAX_AGE_MS
+        ) {
+            fetchWmOfficialSummary(cardId, true).catch(() => null);
+            return false;
+        }
+
         const ref = getHunterPricingReference(cardId, rarity);
 
         if (ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_REFERENCE) {
             dynamicOfficialAverageBlockLogged.delete(auction.id);
 
             const freshCap = dynamicHunterCapFromReference(ref.value);
-
-            // v2.7.0 : remplace TOUJOURS l'ancien plafond.
-            // Il pouvait provenir d'une ancienne référence locale d'une version précédente.
             if (freshCap > 0) {
                 const oldCap = getAutoBidMax(auction.id);
                 if (oldCap !== freshCap) setAutoBidMax(auction.id, freshCap);
@@ -4621,15 +4723,17 @@
             }
         }
 
+        // Ici la moyenne est FRAÎCHE et elle est réellement sous le seuil
+        // (ou la rareté n'a plus de moyenne) : on coupe le Hunter dynamique.
         if (autoBidSet.delete(auction.id)) saveAutoBidSet();
         setAutoBidMax(auction.id, null);
 
         if (!dynamicOfficialAverageBlockLogged.has(auction.id)) {
             dynamicOfficialAverageBlockLogged.add(auction.id);
-            const value = ref?.value ?? '?';
+            const value = ref?.value ?? Number(raw?.summary?.[String(rarity).toUpperCase()]?.average) ?? '?';
             wmLog(
                 `🛑 Hunter dynamique coupé : <b>${auction.card?.wikipedia_title || candidate.title || '?'}</b> ` +
-                `[${rarity || '?'}] · moyenne WM <b>${value} 💰</b> ` +
+                `[${rarity || '?'}] · moyenne WM fraîche <b>${value} 💰</b> ` +
                 `&lt; ${HUNTER_DYNAMIC_MIN_REFERENCE} 💰 ou indisponible.`
             );
         }
@@ -7059,6 +7163,15 @@
             const listingRarity = globalAuctionRarity(fresh);
             if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) return null;
 
+            if (getSetting('autoSnipeMode') === 'adaptive') {
+                const freshRef = await ensureFreshHunterReference(
+                    fresh,
+                    HUNTER_WM_PRE_BID_MAX_AGE_MS
+                );
+                // Fail-safe : impossible de vérifier une moyenne >= 1500 => aucune mise.
+                if (!freshRef) return null;
+            }
+
             const decision = shouldAutoSnipe(fresh);
             if (!decision.snipe) return null;
 
@@ -7200,7 +7313,7 @@
         return placed;
     }
 
-    function runHunterFourbePass(list) {
+    async function runHunterFourbePass(list) {
         if (!Array.isArray(list)) return 0;
         let armed = 0;
         for (const a of list) {
@@ -7211,6 +7324,15 @@
             if (snipeSet.has(a.id) || autoBidSet.has(a.id)) continue;
             if (iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) continue;
             if (isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a))) continue; // déjà possédée DANS cette rareté
+
+            if (getSetting('autoSnipeMode') === 'adaptive') {
+                const freshRef = await ensureFreshHunterReference(
+                    a,
+                    HUNTER_WM_REFERENCE_MAX_AGE_MS
+                );
+                if (!freshRef) continue;
+            }
+
             const decision = shouldAutoSnipe(a);
             if (!decision.snipe) continue;
             if (!armHunterFourbe(a, decision.cap)) continue;
@@ -8057,6 +8179,21 @@
                 }
 
                 applyFreshAuctionState(freshBidAuction, { render: false, logExtension: true });
+
+                const normalCandidate = autoFlipCandidates.get(freshBidAuction.id);
+                if (normalCandidate?.source === 'hunter_dynamic') {
+                    const freshRef = await ensureFreshHunterReference(
+                        freshBidAuction,
+                        HUNTER_WM_PRE_BID_MAX_AGE_MS
+                    );
+                    if (!freshRef) {
+                        // dynamicHunterContinuationAllowed() coupera l'armement si la
+                        // moyenne fraîche est réellement sous 1500 ; sinon simple pause.
+                        dynamicHunterContinuationAllowed(freshBidAuction);
+                        bidLockSet.delete(a.id);
+                        continue;
+                    }
+                }
 
                 if (!dynamicHunterContinuationAllowed(freshBidAuction)
                     || !automaticBidTimeAllowed(freshBidAuction)
@@ -9583,6 +9720,23 @@
             // rallonge le timer d'1 min). Si je mène déjà, rien à faire. Si l'adversaire
             // re-surenchérit sous 10s, le timer se rallonge → nouvelle fenêtre → nouveau snipe.
             if (snipeSet.has(a.id) && endTs > 0 && !bidLockSet.has(a.id)) {
+                // Si ce Fourbe a été armé par le Hunter dynamique, son seuil WM
+                // doit être revérifié au moment réel du snipe.
+                if (
+                    hunterFourbeMap.has(a.id) &&
+                    getSetting('autoSnipeMode') === 'adaptive'
+                ) {
+                    const freshRef = await ensureFreshHunterReference(
+                        a,
+                        HUNTER_WM_PRE_BID_MAX_AGE_MS
+                    );
+                    if (!freshRef) {
+                        disarmHunterFourbe(a.id);
+                        saveSnipeSet();
+                        saveHunterFourbe();
+                        continue;
+                    }
+                }
                 const remaining = endTs - serverNow(); // temps restant côté SERVEUR (corrige l'horloge PC)
                 const fireMs = (getSetting('snipeSecondsBefore') + 1) * 1000; // marge réseau ~1s
                 // Le mode Fourbe est un choix EXPLICITE de l'utilisateur (bouton ou mot-clé) →
@@ -9670,7 +9824,20 @@
                 // Riposte instantanée si auto-bid activé sur cette enchère ET sous le plafond.
                 // ⚠️ NE PAS faire `continue` si le plafond est atteint : ça sauterait la MàJ de
                 // leadingBidsMap plus bas → l'outbid serait re-détecté au tick suivant.
+                let hunterHotFresh = true;
+                const hunterHotCandidate = autoFlipCandidates.get(a.id);
+                if (hunterHotCandidate?.source === 'hunter_dynamic') {
+                    hunterHotFresh = !!(await ensureFreshHunterReference(
+                        a,
+                        HUNTER_WM_PRE_BID_MAX_AGE_MS
+                    ));
+                    if (!hunterHotFresh) {
+                        dynamicHunterContinuationAllowed(a);
+                    }
+                }
+
                 if (autoBidSet.has(a.id)
+                    && hunterHotFresh
                     && dynamicHunterContinuationAllowed(a)
                     && automaticBidTimeAllowed(a)
                     && wikibidousBalance > 0
@@ -9718,7 +9885,17 @@
                                         if (retryFresh) {
                                             applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
 
-                                            if (dynamicHunterContinuationAllowed(retryFresh)
+                                            let retryHunterFresh = true;
+                                            const retryHunterCandidate = autoFlipCandidates.get(retryFresh.id);
+                                            if (retryHunterCandidate?.source === 'hunter_dynamic') {
+                                                retryHunterFresh = !!(await ensureFreshHunterReference(
+                                                    retryFresh,
+                                                    HUNTER_WM_PRE_BID_MAX_AGE_MS
+                                                ));
+                                            }
+
+                                            if (retryHunterFresh
+                                                && dynamicHunterContinuationAllowed(retryFresh)
                                                 && automaticBidTimeAllowed(retryFresh)
                                                 && !iAmLeading(retryFresh)
                                                 && !autoBidBlockedByUncertainSelfState(retryFresh)) {
