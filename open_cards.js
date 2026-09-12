@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.0.0';
+    const WM_VERSION = '3.0.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3783,42 +3783,68 @@
 
     window.wmHunterFreshnessDiag = function (cardId, rarity = '') {
         const rr = String(rarity || '').trim().toUpperCase();
-        const raw = wmOfficialSummaryCache?.[cardId] || null;
-        const fetchedAt = Number(raw?.fetchedAt || 0);
-        const ageMs = fetchedAt ? Date.now() - fetchedAt : null;
-        const avg = Number(raw?.summary?.[rr]?.average);
+        const recent = getCachedRecentMarket(
+            cardId,
+            rr,
+            Number.MAX_SAFE_INTEGER
+        );
+
+        const robust = Number(recent?.robustAverage);
+        const ageMs = Number(recent?.ageMs);
 
         const result = {
             version: WM_VERSION,
             cardId,
             rarete: rr,
-            moyenneWMCache: Number.isFinite(avg) ? avg : null,
-            ageCacheSec: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
-            seuilMini: HUNTER_DYNAMIC_MIN_REFERENCE,
-            seuilMaxi: HUNTER_DYNAMIC_MAX_REFERENCE,
-            cacheAssezFrais: Number.isFinite(ageMs)
-                ? ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
-                : false,
+            ventesRecentes: recent?.count ?? 0,
+            moyenneRobusteRecente:
+                Number.isFinite(robust)
+                    ? Math.round(robust * 10) / 10
+                    : null,
+            seuilStrict: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
+            ageCacheSec:
+                Number.isFinite(ageMs)
+                    ? Math.round(ageMs / 1000)
+                    : null,
+            assezDeVentes: !!recent?.eligible,
+            moyenneAssezHaute: hunterRecentReferenceAllowed(robust),
+            cacheAssezFrais:
+                Number.isFinite(ageMs)
+                    ? ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+                    : false,
             hunterAutoriseAvecCeCache: !!(
-                hunterReferenceInRange(avg) &&
+                recent?.ok &&
+                recent?.eligible &&
+                hunterRecentReferenceAllowed(robust) &&
                 Number.isFinite(ageMs) &&
-                ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
+                ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
             )
         };
+
         console.table(result);
         return result;
-    };
+    };;
 
     window.wmHunterPriceDiag = async function (cardId, rarity = '') {
         const rr = String(rarity || '').trim().toUpperCase();
 
-        const recent = await fetchRecentMarket(cardId, rr, true).catch(() => null);
-
-        if (recent?.ok && !recent.eligible) {
-            await fetchWmOfficialSummary(cardId, true).catch(() => null);
-        }
+        const recent = await fetchRecentMarket(
+            cardId,
+            rr,
+            true
+        ).catch(() => null);
 
         const ref = getHunterPricingReference(cardId, rr);
+        const robust = Number(recent?.robustAverage);
+
+        let blocage = null;
+        if (!recent?.ok) {
+            blocage = 'Recent Market inaccessible';
+        } else if (!recent?.eligible) {
+            blocage = `seulement ${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES} ventes`;
+        } else if (!hunterRecentReferenceAllowed(robust)) {
+            blocage = `moyenne robuste ${Math.round(robust)} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
+        }
 
         const result = {
             version: WM_VERSION,
@@ -3826,26 +3852,26 @@
             rarete: rr,
             ventesRecentes: recent?.count ?? null,
             prixRecents: recent?.prices ?? [],
-            moyenneRobusteRecente: recent?.eligible
-                ? Math.round(Number(recent.robustAverage) * 10) / 10
-                : null,
+            moyenneRobusteRecente:
+                Number.isFinite(robust)
+                    ? Math.round(robust * 10) / 10
+                    : null,
             retireBasse: recent?.removedLow ?? null,
             retireHaute: recent?.removedHigh ?? null,
-            sourceUtiliseePourAchat: ref?.kind ?? 'aucune',
-            referenceAchat: ref?.value ?? null,
+            seuilAchatRecent: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
+            sourceUtiliseePourAchat: ref ? 'recent_market' : 'aucune',
             ratioPct: ref
                 ? Math.round(hunterRatioForReferenceKind(ref.kind) * 100)
                 : null,
             plafondHunter: ref
                 ? dynamicHunterCapFromReference(ref.value, ref.kind)
                 : null,
-            moyenneWM: getWmOfficialAverage(cardId, rr),
-            fallbackWmFourchette: `${HUNTER_DYNAMIC_MIN_REFERENCE}-${HUNTER_DYNAMIC_MAX_REFERENCE}`
+            blocage
         };
 
         console.table(result);
         return result;
-    };;
+    };;;
 
     window.wmFlipLayoutDiag = function () {
         const hist = document.getElementById('wm-flip-history');
@@ -3930,6 +3956,8 @@
             sourceMiseEnVente: 'Recent Market >=6 ventes, sinon moyenne WM fraîche',
             recentMinVentes: RECENT_MARKET_MIN_SALES,
             recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
+            recentHunterMinimum: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
+            hunterFallbackAchat: 'aucun',
             recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}%`,
             fallbackWmFlip: `${getFlipInitialWmPct()}% → ${getFlipRelist1WmPct()}% → ${getFlipRelist2WmPct()}%`,
             refreshApresAchat: 'immédiat + 2.5 s + 8 s',
@@ -4825,8 +4853,9 @@
          - moyenne du reste
 
        Hunter :
-         >=6 ventes -> 70% de cette moyenne robuste
-         <6 ventes  -> fallback 40% moyenne WM fraîche
+         >=6 ventes ET moyenne robuste > 500 -> 70% de cette moyenne robuste
+         sinon -> AUCUNE mise automatique dynamique
+         la moyenne WM n'est jamais utilisée pour décider d'un achat
 
        Flip :
          >=6 ventes -> 100% / 95% / 90%
@@ -4972,7 +5001,7 @@
             const snap = buildRecentMarketSnapshot(probe, id, rr);
 
             // On garde en cache les réponses HTTP 200, y compris <6 ventes :
-            // cela permet un fallback WM sans refaire 10 requêtes par minute.
+            // le Hunter peut ainsi bloquer immédiatement sans refaire la requête.
             if (snap.ok) recentMarketCache.set(key, snap);
 
             return snap;
@@ -5004,39 +5033,35 @@
         return `marché récent ${Math.round(snap.robustAverage)}`;
     }
 
-    // v2.8.0 — Hunter dynamique : la SEULE référence d'achat est
-    // la moyenne officielle WikiMasters de la carte + rareté.
+    // v3.0.1 — Hunter dynamique RECENT MARKET UNIQUEMENT.
+    // Conditions obligatoires :
+    // - au moins RECENT_MARKET_MIN_SALES ventes valides
+    // - moyenne robuste STRICTEMENT supérieure à 500
+    // - référence récente <= 60 s pour décider
+    // - référence récente <= 5 s juste avant une mise
     //
-    // v2.8.2 — garde-fou Hunter :
-    // - moyenne officielle WM comprise entre 500 et 1500 INCLUS
-    // - une référence vieille de plus de 60 s n'est jamais utilisée pour décider d'acheter
-    // - juste avant un POST de mise dynamique, on exige une référence âgée de <= 5 s
-    const HUNTER_DYNAMIC_MIN_REFERENCE = 500;
-    const HUNTER_DYNAMIC_MAX_REFERENCE = 1500;
-    const HUNTER_WM_REFERENCE_MAX_AGE_MS = 60 * 1000;
-    const HUNTER_WM_PRE_BID_MAX_AGE_MS = 5 * 1000;
+    // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
+    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 500;
+    const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
+    const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
-    function hunterReferenceInRange(value) {
+    function hunterRecentReferenceAllowed(value) {
         const v = Number(value);
-        return (
-            Number.isFinite(v) &&
-            v >= HUNTER_DYNAMIC_MIN_REFERENCE &&
-            v <= HUNTER_DYNAMIC_MAX_REFERENCE
-        );
+        return Number.isFinite(v) && v > HUNTER_RECENT_MIN_ROBUST_AVERAGE;
     }
 
-    // Plafond dynamique = ratio configuré × moyenne officielle WM,
-    // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
-    // Exemple : moyenne WM 1 100 × 40% = 440 → plafond réel 440.
     function hunterRatioForReferenceKind(kind) {
-        return kind === 'recent_market'
-            ? Number(getSetting('autoSnipeRecentRatio'))
-            : Number(getSetting('autoSnipeAdaptiveRatio'));
+        // Fail-safe : toute source autre que Recent Market vaut 0.
+        if (kind !== 'recent_market') return 0;
+        return Number(getSetting('autoSnipeRecentRatio'));
     }
 
-    function dynamicHunterCapFromReference(reference, kind = 'wm_average') {
+    function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
         const ref = Number(reference);
-        if (!Number.isFinite(ref) || ref <= 0) return 0;
+        if (
+            kind !== 'recent_market' ||
+            !hunterRecentReferenceAllowed(ref)
+        ) return 0;
 
         const ratio = hunterRatioForReferenceKind(kind);
         if (!Number.isFinite(ratio) || ratio <= 0) return 0;
@@ -5051,66 +5076,40 @@
         const rr = String(rarity || '').trim().toUpperCase();
         if (!cardId || !rr) return null;
 
-        // 1) PRIORITÉ : marché récent, seulement si la lecture API récente est fraîche
-        // et contient >= 6 ventes.
         const recent = getCachedRecentMarket(
             cardId,
             rr,
-            HUNTER_WM_REFERENCE_MAX_AGE_MS
+            HUNTER_RECENT_REFERENCE_MAX_AGE_MS
         );
 
-        if (recent?.ok && recent.eligible) {
-            return {
-                value: Number(recent.robustAverage),
-                kind: 'recent_market',
-                label: 'marché récent',
-                reasonLabel: 'moyenne robuste récente',
-                cardId,
-                rarity: rr,
-                fetchedAt: Number(recent.fetchedAt || 0),
-                ageMs: Number(recent.ageMs || 0),
-                salesCount: recent.count,
-                prices: recent.prices,
-                trimmedPrices: recent.trimmedPrices,
-                removedLow: recent.removedLow,
-                removedHigh: recent.removedHigh
-            };
-        }
-
-        // Si on n'a pas encore une lecture récente valide de `auctions`, on ne
-        // retombe PAS silencieusement sur WM : l'ensure async doit d'abord la faire.
-        if (!recent?.ok) return null;
-
-        // 2) <6 ventes visibles : fallback moyenne WM fraîche, avec la fourchette 500–1500.
-        const entry = wmOfficialSummaryCache?.[cardId] || null;
-        if (!entry) return null;
-
-        const fetchedAt = Number(entry.fetchedAt || 0);
-        const ageMs = Date.now() - fetchedAt;
-        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > HUNTER_WM_REFERENCE_MAX_AGE_MS) {
+        if (
+            !recent?.ok ||
+            !recent.eligible ||
+            !hunterRecentReferenceAllowed(recent.robustAverage)
+        ) {
             return null;
         }
 
-        const wmAverage = Number(entry?.summary?.[rr]?.average);
-        if (!Number.isFinite(wmAverage) || wmAverage <= 0) return null;
-        if (!hunterReferenceInRange(wmAverage)) return null;
-
         return {
-            value: wmAverage,
-            kind: 'wm_average',
-            label: 'moy. WM fallback',
-            reasonLabel: 'moyenne WM fallback',
+            value: Number(recent.robustAverage),
+            kind: 'recent_market',
+            label: 'marché récent',
+            reasonLabel: 'moyenne robuste récente',
             cardId,
             rarity: rr,
-            fetchedAt,
-            ageMs,
-            salesCount: recent.count || 0
+            fetchedAt: Number(recent.fetchedAt || 0),
+            ageMs: Number(recent.ageMs || 0),
+            salesCount: recent.count,
+            prices: recent.prices,
+            trimmedPrices: recent.trimmedPrices,
+            removedLow: recent.removedLow,
+            removedHigh: recent.removedHigh
         };
     }
 
     async function ensureFreshHunterReference(
         auction,
-        maxAgeMs = HUNTER_WM_REFERENCE_MAX_AGE_MS
+        maxAgeMs = HUNTER_RECENT_REFERENCE_MAX_AGE_MS
     ) {
         if (!auction) return null;
 
@@ -5118,49 +5117,39 @@
         const rarity = globalAuctionRarity(auction);
         if (!cardId || !rarity) return null;
 
-        // Toujours vérifier d'abord `auctions`.
         const recent = await ensureFreshRecentMarket(
             cardId,
             rarity,
             maxAgeMs
         );
 
-        // Une panne de la source Recent Market est fail-safe : aucune mise dynamique.
-        if (!recent?.ok) return null;
-
-        if (recent.eligible) {
-            return {
-                value: Number(recent.robustAverage),
-                kind: 'recent_market',
-                label: 'marché récent',
-                reasonLabel: 'moyenne robuste récente',
-                cardId,
-                rarity,
-                fetchedAt: Number(recent.fetchedAt || Date.now()),
-                ageMs: Number(recent.ageMs || 0),
-                salesCount: recent.count,
-                prices: recent.prices,
-                trimmedPrices: recent.trimmedPrices,
-                removedLow: recent.removedLow,
-                removedHigh: recent.removedHigh
-            };
+        // Fail-safe : API inaccessible, <6 ventes ou robuste <=500 => aucune mise.
+        if (
+            !recent?.ok ||
+            !recent.eligible ||
+            !hunterRecentReferenceAllowed(recent.robustAverage)
+        ) {
+            return null;
         }
 
-        // <6 ventes : seulement ici on charge/utilise la moyenne WM.
-        const cached = wmOfficialSummaryCache?.[cardId] || null;
-        const ageMs = cached
-            ? Date.now() - Number(cached.fetchedAt || 0)
-            : Infinity;
-
-        if (!cached || !Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) {
-            const fresh = await fetchWmOfficialSummary(cardId, true).catch(() => null);
-            if (!fresh) return null;
-        }
-
-        return getHunterPricingReference(cardId, rarity);
+        return {
+            value: Number(recent.robustAverage),
+            kind: 'recent_market',
+            label: 'marché récent',
+            reasonLabel: 'moyenne robuste récente',
+            cardId,
+            rarity,
+            fetchedAt: Number(recent.fetchedAt || Date.now()),
+            ageMs: Number(recent.ageMs || 0),
+            salesCount: recent.count,
+            prices: recent.prices,
+            trimmedPrices: recent.trimmedPrices,
+            removedLow: recent.removedLow,
+            removedHigh: recent.removedHigh
+        };
     }
 
-    async function preloadWmOfficialSummariesForHunter(list) {
+    async function preloadRecentMarketForHunter(list) {
         if (!Array.isArray(list) || getSetting('autoSnipeMode') !== 'adaptive') return;
 
         const targets = [];
@@ -5180,11 +5169,11 @@
             const recent = getCachedRecentMarket(
                 cardId,
                 rarity,
-                HUNTER_WM_REFERENCE_MAX_AGE_MS
+                HUNTER_RECENT_REFERENCE_MAX_AGE_MS
             );
-            const ref = getHunterPricingReference(cardId, rarity);
 
-            if (recent?.ok && ref) continue;
+            // Même une réponse récente non-éligible est suffisante pour décider "pas de mise".
+            if (recent?.ok) continue;
 
             targets.push({ cardId, rarity });
             if (targets.length >= 24) break;
@@ -5199,27 +5188,11 @@
             while (idx < targets.length) {
                 const t = targets[idx++];
 
-                const recent = await ensureFreshRecentMarket(
+                await ensureFreshRecentMarket(
                     t.cardId,
                     t.rarity,
-                    HUNTER_WM_REFERENCE_MAX_AGE_MS
-                );
-
-                if (recent?.ok && !recent.eligible) {
-                    const wm = wmOfficialSummaryCache?.[t.cardId] || null;
-                    const wmAge = wm
-                        ? Date.now() - Number(wm.fetchedAt || 0)
-                        : Infinity;
-
-                    if (
-                        !wm ||
-                        !Number.isFinite(wmAge) ||
-                        wmAge < 0 ||
-                        wmAge > HUNTER_WM_REFERENCE_MAX_AGE_MS
-                    ) {
-                        await fetchWmOfficialSummary(t.cardId, true).catch(() => null);
-                    }
-                }
+                    HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+                ).catch(() => null);
 
                 await new Promise(r => setTimeout(r, 100));
             }
@@ -5235,7 +5208,7 @@
 
     // Une enchère Hunter dynamique peut survivre à un F5.
     // À CHAQUE continuation/riposte, son plafond est recalculé exclusivement
-    // depuis la moyenne officielle WM. Un ancien plafond n'est jamais conservé.
+    // depuis le Recent Market. Un ancien plafond n'est jamais conservé.
     const dynamicOfficialAverageBlockLogged = new Set();
 
     function dynamicHunterContinuationAllowed(auction) {
@@ -5253,7 +5226,7 @@
         if (!ref) {
             ensureFreshHunterReference(
                 auction,
-                HUNTER_WM_REFERENCE_MAX_AGE_MS
+                HUNTER_RECENT_REFERENCE_MAX_AGE_MS
             ).catch(() => null);
             return false;
         }
@@ -5274,9 +5247,10 @@
 
 
     // Décide si une enchère doit déclencher un auto-snipe.
-    // Mode dynamique v2.7.0 :
-    //   prix actuel <= ratio × MOYENNE OFFICIELLE WIKIMASTERS.
-    // Si la moyenne WM est absente : AUCUNE mise dynamique.
+    // Mode dynamique v3.0.1 :
+    //   prix actuel <= ratio × moyenne robuste récente,
+    //   avec >=6 ventes et moyenne robuste STRICTEMENT > 500.
+    // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
         const mode = getSetting('autoSnipeMode');
@@ -5284,12 +5258,30 @@
         if (mode === 'adaptive') {
             const cardId = auction.card?.id ?? auction.card_id;
             const rarity = globalAuctionRarity(auction);
+            const recent = getCachedRecentMarket(
+                cardId,
+                rarity,
+                HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+            );
             const ref = getHunterPricingReference(cardId, rarity);
 
-            if (!ref || !Number.isFinite(Number(ref.value)) || Number(ref.value) <= 0) {
+            if (!ref) {
+                let reason = 'référence Recent Market indisponible';
+
+                if (recent?.ok) {
+                    if (!recent.eligible) {
+                        reason =
+                            `historique insuffisant (${recent.count ?? 0}/${RECENT_MARKET_MIN_SALES} ventes)`;
+                    } else if (!hunterRecentReferenceAllowed(recent.robustAverage)) {
+                        const robust = Number(recent.robustAverage);
+                        reason =
+                            `moyenne robuste ${Number.isFinite(robust) ? Math.round(robust) : '—'} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
+                    }
+                }
+
                 return {
                     snipe: false,
-                    reason: `référence récente indisponible${rarity ? ` (${rarity})` : ''}`,
+                    reason,
                     cap: 0
                 };
             }
@@ -5297,9 +5289,8 @@
             const ratio = hunterRatioForReferenceKind(ref.kind);
             const threshold = dynamicHunterCapFromReference(ref.value, ref.kind);
             const pct = Math.round(ratio * 100);
-            const src = ref.kind === 'recent_market'
-                ? `${ref.salesCount} ventes · robuste ${Math.round(ref.value)}`
-                : `fallback WM ${Math.round(ref.value)}`;
+            const src =
+                `${ref.salesCount} ventes · robuste ${Math.round(ref.value)}`;
 
             if (currentBid <= threshold) {
                 return {
@@ -5381,7 +5372,6 @@
         logAutobid: 'wm_log_autobid',
         autoSnipePrice: 'wm_autosnipe_price',
         autoSnipeMode: 'wm_autosnipe_mode',
-        autoSnipeAdaptiveRatio: 'wm_autosnipe_adaptive_ratio',
         autoSnipeRecentRatio: 'wm_autosnipe_recent_ratio',
         minBalanceForAutoSnipe: 'wm_autosnipe_min_balance',
         autoRetagEnabled: 'wm_autoretag_enabled',
@@ -5435,8 +5425,7 @@
         logTrash: true,
         logAutobid: true,
         autoSnipePrice: 100,
-        autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = % moyenne officielle WM
-        autoSnipeAdaptiveRatio: 0.40,     // fallback si <6 ventes récentes
+        autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = Recent Market uniquement
         autoSnipeRecentRatio: 0.70,       // v3.0 : 70% de la moyenne robuste récente
         minBalanceForAutoSnipe: 2000,
         autoRetagEnabled: true,
@@ -5503,25 +5492,10 @@
         }
     }
 
-    // v2.9.0 : nouveau positionnement marché = 40% de la moyenne WM.
-    // Migration uniquement des valeurs connues comme anciens défauts / réglage précédent
-    // utilisé pour cette stratégie (85%, 75% ou 50%). Les autres valeurs personnalisées restent.
+    // v3.0.1 : l'ancien fallback Hunter basé sur la moyenne WM est supprimé.
     try {
-        const migrationKey = 'wm_migration_v290_hunter_ratio_40';
-        const k = SETTINGS_KEYS.autoSnipeAdaptiveRatio;
-        if (!localStorage.getItem(migrationKey)) {
-            const raw = localStorage.getItem(k);
-            const n = raw === null ? null : Number(raw);
-            if (
-                raw === null ||
-                Math.abs(n - 0.85) < 1e-9 ||
-                Math.abs(n - 0.75) < 1e-9 ||
-                Math.abs(n - 0.50) < 1e-9
-            ) {
-                localStorage.setItem(k, '0.40');
-            }
-            localStorage.setItem(migrationKey, '1');
-        }
+        localStorage.removeItem('wm_autosnipe_adaptive_ratio');
+        localStorage.removeItem('wm_migration_v290_hunter_ratio_40');
     } catch (e) { }
 
     // Migration : purge des clés devenues obsolètes (anciennes versions du script)
@@ -7661,8 +7635,7 @@
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
             const recentPct = Math.round(Number(getSetting('autoSnipeRecentRatio')) * 100);
-            const wmPct = Math.round(Number(getSetting('autoSnipeAdaptiveRatio')) * 100);
-            return `⚡ Hunter Recent ${recentPct}% · WM ${wmPct}% fallback · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
+            return `⚡ Hunter Recent ${recentPct}% · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -7675,7 +7648,7 @@
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
-            await preloadWmOfficialSummariesForHunter(list).catch(() => { });
+            await preloadRecentMarketForHunter(list).catch(() => { });
         }
 
         if (hunterAggressive) return runHunterFourbePass(list);
@@ -7708,7 +7681,7 @@
             if (getSetting('autoSnipeMode') === 'adaptive') {
                 const freshRef = await ensureFreshHunterReference(
                     fresh,
-                    Math.min(HUNTER_WM_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                    Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                 );
                 // Fail-safe : impossible de vérifier une moyenne >= 1500 => aucune mise.
                 if (!freshRef) return null;
@@ -7870,7 +7843,7 @@
             if (getSetting('autoSnipeMode') === 'adaptive') {
                 const freshRef = await ensureFreshHunterReference(
                     a,
-                    HUNTER_WM_REFERENCE_MAX_AGE_MS
+                    HUNTER_RECENT_REFERENCE_MAX_AGE_MS
                 );
                 if (!freshRef) continue;
             }
@@ -8726,7 +8699,7 @@
                 if (normalCandidate?.source === 'hunter_dynamic') {
                     const freshRef = await ensureFreshHunterReference(
                         freshBidAuction,
-                        HUNTER_WM_PRE_BID_MAX_AGE_MS
+                        HUNTER_RECENT_PRE_BID_MAX_AGE_MS
                     );
                     if (!freshRef) {
                         // dynamicHunterContinuationAllowed() coupera l'armement si la
@@ -10270,7 +10243,7 @@
                 ) {
                     const freshRef = await ensureFreshHunterReference(
                         a,
-                        HUNTER_WM_PRE_BID_MAX_AGE_MS
+                        HUNTER_RECENT_PRE_BID_MAX_AGE_MS
                     );
                     if (!freshRef) {
                         disarmHunterFourbe(a.id);
@@ -10371,7 +10344,7 @@
                 if (hunterHotCandidate?.source === 'hunter_dynamic') {
                     hunterHotFresh = !!(await ensureFreshHunterReference(
                         a,
-                        Math.min(HUNTER_WM_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                        Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                     ));
                     if (!hunterHotFresh) {
                         dynamicHunterContinuationAllowed(a);
@@ -10432,7 +10405,7 @@
                                             if (retryHunterCandidate?.source === 'hunter_dynamic') {
                                                 retryHunterFresh = !!(await ensureFreshHunterReference(
                                                     retryFresh,
-                                                    Math.min(HUNTER_WM_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                                                    Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                                                 ));
                                             }
 
@@ -13650,12 +13623,14 @@
                 ? Math.round((robustRounded / wm) * 1000) / 10
                 : null;
 
-        const hunterRecentCap = robust.eligible
-            ? dynamicHunterCapFromReference(
-                robust.robustAverage,
-                'recent_market'
-            )
-            : null;
+        const hunterRecentCap =
+            robust.eligible &&
+                hunterRecentReferenceAllowed(robust.robustAverage)
+                ? dynamicHunterCapFromReference(
+                    robust.robustAverage,
+                    'recent_market'
+                )
+                : null;
 
         return {
             version: WM_VERSION,
@@ -13672,6 +13647,11 @@
             venteBasseRetiree: robust.removedLow,
             venteHauteRetiree: robust.removedHigh,
             recentMarketEligible: robust.eligible,
+            hunterAchatAutorise: !!(
+                robust.eligible &&
+                hunterRecentReferenceAllowed(robust.robustAverage)
+            ),
+            seuilHunterRecent: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
             hunterRecentCap,
             moyenneWM:
                 Number.isFinite(wm) && wm > 0
@@ -15913,10 +15893,8 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Recent Market (10 dernières ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Recent Market : avec ≥${RECENT_MARKET_MIN_SALES} ventes, plafond Hunter = <b>70%</b> de la moyenne robuste (on retire 1 plus haute + 1 plus basse).</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Recent Market uniquement : il faut ≥${RECENT_MARKET_MIN_SALES} ventes ET une moyenne robuste <b>strictement supérieure à ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b>. Plafond Hunter = <b>70%</b> de cette moyenne robuste (on retire 1 plus haute + 1 plus basse). Sinon : <b>aucune mise</b>.</div>
                     <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Fallback si &lt;${RECENT_MARKET_MIN_SALES} ventes : <b>40%</b> de la moyenne WM fraîche (fourchette WM ${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE}).</div>
-                    <input id="wm-set-autosnipe-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Délai humanisé avant une mise (ms). Plus bas = mises plus rapides mais moins « humaines ». <b>0 = instantané</b>. Ignoré quand l'enchère se termine bientôt (snipe toujours instantané).</div>
@@ -16651,7 +16629,6 @@
         const logAutobidChk = document.getElementById('wm-set-log-autobid');
         const autoSnipePriceInput = document.getElementById('wm-set-autosnipe-price');
         const autoSnipeMinBalanceInput = document.getElementById('wm-set-autosnipe-min-balance');
-        const autoSnipeRatioInput = document.getElementById('wm-set-autosnipe-ratio');
         const autoSnipeRecentRatioInput = document.getElementById('wm-set-autosnipe-recent-ratio');
         const bidDelayInput = document.getElementById('wm-set-bid-delay');
         const dailyAlertChk = document.getElementById('wm-set-daily-alert');
@@ -16675,7 +16652,6 @@
         logAutobidChk.checked = getSetting('logAutobid');
         autoSnipePriceInput.value = getSetting('autoSnipePrice');
         autoSnipeMinBalanceInput.value = getSetting('minBalanceForAutoSnipe');
-        autoSnipeRatioInput.value = Math.round(getSetting('autoSnipeAdaptiveRatio') * 100);
         if (autoSnipeRecentRatioInput) {
             autoSnipeRecentRatioInput.value = Math.round(getSetting('autoSnipeRecentRatio') * 100);
         }
@@ -16700,15 +16676,12 @@
             });
             // Grise le champ non pertinent selon le mode
             const fixedRow = autoSnipePriceInput;
-            const ratioRow = autoSnipeRatioInput;
             const recentRatioRow = autoSnipeRecentRatioInput;
             if (mode === 'adaptive') {
                 fixedRow.style.opacity = '0.4';
-                ratioRow.style.opacity = '1';
                 if (recentRatioRow) recentRatioRow.style.opacity = '1';
             } else {
                 fixedRow.style.opacity = '1';
-                ratioRow.style.opacity = '0.4';
                 if (recentRatioRow) recentRatioRow.style.opacity = '0.4';
             }
         }
@@ -16721,13 +16694,13 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? '🎯 Hunter en mode <b>Recent Market</b> (70% récent · fallback 40% WM)'
+                        ? `🎯 Hunter en mode <b>Recent Market uniquement</b> (robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}, sinon aucune mise)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
                 }
             };
         });
 
-        // Ratios Hunter Recent Market + fallback WM
+        // Ratio Hunter Recent Market — seule source d'achat en mode dynamique.
         if (autoSnipeRecentRatioInput) {
             autoSnipeRecentRatioInput.onchange = () => {
                 let pct = parseInt(autoSnipeRecentRatioInput.value, 10);
@@ -16735,18 +16708,12 @@
                 if (pct > 200) pct = 200;
                 autoSnipeRecentRatioInput.value = pct;
                 setSetting('autoSnipeRecentRatio', pct / 100);
-                wmLog(`🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la moyenne robuste récente`);
+                wmLog(
+                    `🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la moyenne robuste récente ` +
+                    `si elle est <b>&gt; ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b>`
+                );
             };
         }
-
-        autoSnipeRatioInput.onchange = () => {
-            let pct = parseInt(autoSnipeRatioInput.value, 10);
-            if (!Number.isFinite(pct) || pct < 1) pct = 40;
-            if (pct > 200) pct = 200;
-            autoSnipeRatioInput.value = pct;
-            setSetting('autoSnipeAdaptiveRatio', pct / 100);
-            wmLog(`🎯 Hunter fallback : plafond à <b>${pct}%</b> de la moyenne WM fraîche`);
-        };
 
         // Délai humanisé avant une mise
         if (bidDelayInput) bidDelayInput.onchange = () => {
@@ -19876,13 +19843,26 @@
     }
 
     function quickOfficialPriceRowsHtml(rows, query = '') {
-        if (!Array.isArray(rows) || rows.length === 0) return `<span style="color:#f59e0b;">Aucune donnée pour « ${htmlEsc(query)} ».</span>`;
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return `<span style="color:#f59e0b;">Aucune donnée pour « ${htmlEsc(query)} ».</span>`;
+        }
+
         return rows.slice(0, 12).map(r => {
-            const wmAvg = Number(r?.moyenneWM), cap = Number(r?.capHunter);
-            const wmHtml = Number.isFinite(wmAvg) && wmAvg > 0 ? `moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>` : `<span style="color:#555;">moy. WM —</span>`;
-            const capHtml = Number.isFinite(cap) && cap > 0 ? ` · cap Hunter <b style="color:#4ade80;">${cap.toLocaleString('fr-FR')}</b>` : ` · <span style="color:#555;">cap Hunter —</span>`;
-            const eligibility = r?.achatPossible ? '' : Number.isFinite(wmAvg) && wmAvg > 0 ? ` · <span style="color:#f59e0b;">Hunter bloqué hors ${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE}</span>` : '';
-            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);"><div><b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b><span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span></div><div style="color:#888;">${wmHtml}${capHtml}${eligibility}</div></div>`;
+            const wmAvg = Number(r?.moyenneWM);
+            const wmHtml =
+                Number.isFinite(wmAvg) && wmAvg > 0
+                    ? `moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>`
+                    : `<span style="color:#555;">moy. WM —</span>`;
+
+            return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);">
+                <div>
+                    <b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b>
+                    <span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span>
+                </div>
+                <div style="color:#888;">
+                    ${wmHtml} · <span style="color:#555;">non utilisée pour les achats Hunter</span>
+                </div>
+            </div>`;
         }).join('');
     }
 
@@ -19944,7 +19924,8 @@
                 <div style="color:#777;">
                     moy. simple <b>${r.moyenneVentesVisibles ?? '—'}</b> ·
                     robuste <b style="color:#4ade80;">${r.moyenneRobusteRecente ?? '—'}</b> ·
-                    cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? '—'}</b> ·
+                    cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
+                    seuil <b>&gt;${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
                 </div>
             </div>`;
@@ -19964,13 +19945,13 @@
             for (const rr of rarities) {
                 const key = `${c.cardId}|${rr}`; if (dedup.has(key)) continue; dedup.add(key);
                 const wmAvg = getWmOfficialAverage(c.cardId, rr), valid = Number.isFinite(wmAvg) && wmAvg > 0;
-                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null, capHunter: valid ? dynamicHunterCapFromReference(wmAvg) : null, achatPossible: !!(valid && hunterReferenceInRange(wmAvg)) });
+                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null });
             }
         }
         const ql = q.toLocaleLowerCase('fr-FR'), exact = results.filter(r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql), shown = exact.length ? exact : results.slice(0, 20);
         if (!silent) {
             console.table(shown);
-            const lines = shown.filter(r => Number.isFinite(Number(r.moyenneWM)) && Number(r.moyenneWM) > 0).map(r => `[${r.rarete}] moy.WM ${r.moyenneWM} · cap ${r.capHunter ?? '—'}`);
+            const lines = shown.filter(r => Number.isFinite(Number(r.moyenneWM)) && Number(r.moyenneWM) > 0).map(r => `[${r.rarete}] moy.WM ${r.moyenneWM} (info vente uniquement)`);
             wmLog(lines.length ? `💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}` : `💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
         }
         return shown;
@@ -19982,8 +19963,9 @@
         ============================================================ */
 
     wmLog(
-        `🚀 v3.0.0 Recent Market : Hunter 70% moyenne robuste des 10 dernières ventes ` +
-        `(>=6), Flip 100/95/90% · fallback WM 40% et 60/55/52%.`
+        `🚀 v3.0.1 Recent-only Hunter : mise uniquement si ≥${RECENT_MARKET_MIN_SALES} ventes ` +
+        `et moyenne robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · Hunter 70% · aucun fallback WM achat · ` +
+        `Flip 100/95/90% avec fallback WM 60/55/52%.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
