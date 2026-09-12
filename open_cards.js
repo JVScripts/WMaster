@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.8.2';
+    const WM_VERSION = '2.8.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3553,12 +3553,12 @@
             moyenneWMCache: Number.isFinite(avg) ? avg : null,
             ageCacheSec: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
             seuilMini: HUNTER_DYNAMIC_MIN_REFERENCE,
+            seuilMaxi: HUNTER_DYNAMIC_MAX_REFERENCE,
             cacheAssezFrais: Number.isFinite(ageMs)
                 ? ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
                 : false,
             hunterAutoriseAvecCeCache: !!(
-                Number.isFinite(avg) &&
-                avg >= HUNTER_DYNAMIC_MIN_REFERENCE &&
+                hunterReferenceInRange(avg) &&
                 Number.isFinite(ageMs) &&
                 ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
             )
@@ -3578,12 +3578,13 @@
             moyenneWM: ref?.value ?? null,
             ageMoyenneSec: ref ? Math.round(Number(ref.ageMs || 0) / 1000) : null,
             seuilMiniMoyenneWM: HUNTER_DYNAMIC_MIN_REFERENCE,
+            seuilMaxiMoyenneWM: HUNTER_DYNAMIC_MAX_REFERENCE,
             maxAgeReferenceSec: Math.round(HUNTER_WM_REFERENCE_MAX_AGE_MS / 1000),
             maxAgeAvantMiseSec: Math.round(HUNTER_WM_PRE_BID_MAX_AGE_MS / 1000),
             sourceUtiliseePourAchat: ref ? 'moyenne officielle WikiMasters fraîche' : 'aucune',
             ratioPct: Math.round(Number(getSetting('autoSnipeAdaptiveRatio')) * 100),
             plafondHunter: ref ? dynamicHunterCapFromReference(ref.value) : null,
-            achatPossible: !!(ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_REFERENCE)
+            achatPossible: !!(ref && hunterReferenceInRange(ref.value))
         };
         console.table(result);
         return result;
@@ -4550,13 +4551,23 @@
     // v2.8.0 — Hunter dynamique : la SEULE référence d'achat est
     // la moyenne officielle WikiMasters de la carte + rareté.
     //
-    // v2.8.1 — garde-fou Hunter :
-    // - moyenne officielle WM >= 1500
+    // v2.8.2 — garde-fou Hunter :
+    // - moyenne officielle WM comprise entre 500 et 1500 INCLUS
     // - une référence vieille de plus de 60 s n'est jamais utilisée pour décider d'acheter
     // - juste avant un POST de mise dynamique, on exige une référence âgée de <= 5 s
-    const HUNTER_DYNAMIC_MIN_REFERENCE = 1500;
+    const HUNTER_DYNAMIC_MIN_REFERENCE = 500;
+    const HUNTER_DYNAMIC_MAX_REFERENCE = 1500;
     const HUNTER_WM_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_WM_PRE_BID_MAX_AGE_MS = 5 * 1000;
+
+    function hunterReferenceInRange(value) {
+        const v = Number(value);
+        return (
+            Number.isFinite(v) &&
+            v >= HUNTER_DYNAMIC_MIN_REFERENCE &&
+            v <= HUNTER_DYNAMIC_MAX_REFERENCE
+        );
+    }
 
     // Plafond dynamique = ratio configuré × moyenne officielle WM,
     // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
@@ -4625,7 +4636,7 @@
 
         const ref = getHunterPricingReference(cardId, rarity);
         if (!ref) return null;
-        if (Number(ref.value) < HUNTER_DYNAMIC_MIN_REFERENCE) return null;
+        if (!hunterReferenceInRange(ref.value)) return null;
 
         return ref;
     }
@@ -4712,7 +4723,7 @@
 
         const ref = getHunterPricingReference(cardId, rarity);
 
-        if (ref && Number(ref.value) >= HUNTER_DYNAMIC_MIN_REFERENCE) {
+        if (ref && hunterReferenceInRange(ref.value)) {
             dynamicOfficialAverageBlockLogged.delete(auction.id);
 
             const freshCap = dynamicHunterCapFromReference(ref.value);
@@ -4723,8 +4734,8 @@
             }
         }
 
-        // Ici la moyenne est FRAÎCHE et elle est réellement sous le seuil
-        // (ou la rareté n'a plus de moyenne) : on coupe le Hunter dynamique.
+        // Ici la moyenne est FRAÎCHE et elle est réellement HORS de la fourchette
+        // 500–1500 (ou la rareté n'a plus de moyenne) : on coupe le Hunter dynamique.
         if (autoBidSet.delete(auction.id)) saveAutoBidSet();
         setAutoBidMax(auction.id, null);
 
@@ -4734,7 +4745,7 @@
             wmLog(
                 `🛑 Hunter dynamique coupé : <b>${auction.card?.wikipedia_title || candidate.title || '?'}</b> ` +
                 `[${rarity || '?'}] · moyenne WM fraîche <b>${value} 💰</b> ` +
-                `&lt; ${HUNTER_DYNAMIC_MIN_REFERENCE} 💰 ou indisponible.`
+                `hors fourchette <b>${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE} 💰</b> ou indisponible.`
             );
         }
 
@@ -4767,6 +4778,14 @@
                 return {
                     snipe: false,
                     reason: `moyenne WM < ${HUNTER_DYNAMIC_MIN_REFERENCE} (${ref.value})`,
+                    cap: 0
+                };
+            }
+
+            if (Number(ref.value) > HUNTER_DYNAMIC_MAX_REFERENCE) {
+                return {
+                    snipe: false,
+                    reason: `moyenne WM > ${HUNTER_DYNAMIC_MAX_REFERENCE} (${ref.value})`,
                     cap: 0
                 };
             }
@@ -7120,7 +7139,7 @@
         // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique · moy.WM≥${HUNTER_DYNAMIC_MIN_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
+            return `⚡ Hunter dynamique · moy.WM ${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -18825,7 +18844,7 @@
             const wmAvg = Number(r?.moyenneWM), cap = Number(r?.capHunter);
             const wmHtml = Number.isFinite(wmAvg) && wmAvg > 0 ? `moy. WM <b style="color:#06b6d4;">${wmAvg.toLocaleString('fr-FR')}</b>` : `<span style="color:#555;">moy. WM —</span>`;
             const capHtml = Number.isFinite(cap) && cap > 0 ? ` · cap Hunter <b style="color:#4ade80;">${cap.toLocaleString('fr-FR')}</b>` : ` · <span style="color:#555;">cap Hunter —</span>`;
-            const eligibility = r?.achatPossible ? '' : Number.isFinite(wmAvg) && wmAvg > 0 ? ` · <span style="color:#f59e0b;">Hunter bloqué &lt; ${HUNTER_DYNAMIC_MIN_REFERENCE}</span>` : '';
+            const eligibility = r?.achatPossible ? '' : Number.isFinite(wmAvg) && wmAvg > 0 ? ` · <span style="color:#f59e0b;">Hunter bloqué hors ${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE}</span>` : '';
             return `<div style="padding:3px 0;border-top:1px solid rgba(255,255,255,.035);"><div><b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b><span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span></div><div style="color:#888;">${wmHtml}${capHtml}${eligibility}</div></div>`;
         }).join('');
     }
@@ -18843,7 +18862,7 @@
             for (const rr of rarities) {
                 const key = `${c.cardId}|${rr}`; if (dedup.has(key)) continue; dedup.add(key);
                 const wmAvg = getWmOfficialAverage(c.cardId, rr), valid = Number.isFinite(wmAvg) && wmAvg > 0;
-                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null, capHunter: valid ? dynamicHunterCapFromReference(wmAvg) : null, achatPossible: !!(valid && wmAvg >= HUNTER_DYNAMIC_MIN_REFERENCE) });
+                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null, capHunter: valid ? dynamicHunterCapFromReference(wmAvg) : null, achatPossible: !!(valid && hunterReferenceInRange(wmAvg)) });
             }
         }
         const ql = q.toLocaleLowerCase('fr-FR'), exact = results.filter(r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql), shown = exact.length ? exact : results.slice(0, 20);
