@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.9.1';
+    const WM_VERSION = '3.0.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -454,6 +454,12 @@
     const FLIP_RELIST1_WM_PCT_KEY = 'wm_flip_relist1_wm_pct';
     const FLIP_RELIST2_WM_PCT_KEY = 'wm_flip_relist2_wm_pct';
 
+    // v3.0.0 — quand >= 6 ventes récentes sont visibles dans `auctions`,
+    // elles deviennent la référence prioritaire du Flip.
+    const FLIP_INITIAL_RECENT_PCT_KEY = 'wm_flip_initial_recent_pct';
+    const FLIP_RELIST1_RECENT_PCT_KEY = 'wm_flip_relist1_recent_pct';
+    const FLIP_RELIST2_RECENT_PCT_KEY = 'wm_flip_relist2_recent_pct';
+
     // v2.6.8 : le cache général de moyenne WM reste long pour Hunter/Market Watcher,
     // mais le Flip Seller maintient sa PROPRE fraîcheur.
     const FLIP_WM_AVERAGE_REFRESH_MS = 2 * 60 * 1000;      // refresh suivi : 2 min
@@ -556,6 +562,46 @@
         return safe;
     }
 
+    function getFlipInitialRecentPct() {
+        const raw = localStorage.getItem(FLIP_INITIAL_RECENT_PCT_KEY);
+        return raw === null || raw === '' ? 100 : clampFlipWmPct(raw, 100);
+    }
+
+    function setFlipInitialRecentPct(v) {
+        const safe = clampFlipWmPct(v, 100);
+        localStorage.setItem(FLIP_INITIAL_RECENT_PCT_KEY, String(safe));
+        return safe;
+    }
+
+    function getFlipRelist1RecentPct() {
+        const raw = localStorage.getItem(FLIP_RELIST1_RECENT_PCT_KEY);
+        return raw === null || raw === '' ? 95 : clampFlipWmPct(raw, 95);
+    }
+
+    function setFlipRelist1RecentPct(v) {
+        const safe = clampFlipWmPct(v, 95);
+        localStorage.setItem(FLIP_RELIST1_RECENT_PCT_KEY, String(safe));
+        return safe;
+    }
+
+    function getFlipRelist2RecentPct() {
+        const raw = localStorage.getItem(FLIP_RELIST2_RECENT_PCT_KEY);
+        return raw === null || raw === '' ? 90 : clampFlipWmPct(raw, 90);
+    }
+
+    function setFlipRelist2RecentPct(v) {
+        const safe = clampFlipWmPct(v, 90);
+        localStorage.setItem(FLIP_RELIST2_RECENT_PCT_KEY, String(safe));
+        return safe;
+    }
+
+    function getFlipRecentSellPct(rec) {
+        const relists = Math.max(0, Number(rec?.relists) || 0);
+        if (relists <= 0) return getFlipInitialRecentPct();
+        if (relists === 1) return getFlipRelist1RecentPct();
+        return getFlipRelist2RecentPct();
+    }
+
     function getFlipWmSellPct(rec) {
         const relists = Math.max(0, Number(rec?.relists) || 0);
         if (relists <= 0) return getFlipInitialWmPct();
@@ -574,6 +620,12 @@
         const avg = Number(average);
         if (!Number.isFinite(avg) || avg <= 0) return 0;
         return roundFlipReferencePriceDown(avg * (getFlipWmSellPct(rec) / 100));
+    }
+
+    function getFlipTargetFromRecentMarket(rec, recentAverage) {
+        const avg = Number(recentAverage);
+        if (!Number.isFinite(avg) || avg <= 0) return 0;
+        return roundFlipReferencePriceDown(avg * (getFlipRecentSellPct(rec) / 100));
     }
 
     // Nettoyage de l'ancien réglage unique "Sous réf. %", qui n'est plus utilisé en 2.9.
@@ -682,6 +734,55 @@
                     }
                 }).catch(() => { });
             }, delay);
+        }
+    }
+
+    let flipRecentRefreshBusy = false;
+
+    async function refreshTrackedFlipRecentMarkets(forceAll = false) {
+        if (flipRecentRefreshBusy) return 0;
+        flipRecentRefreshBusy = true;
+
+        try {
+            const tracked = flipLedger.filter(r =>
+                r &&
+                r.cardId &&
+                r.rarity &&
+                r.status !== 'sold'
+            );
+
+            if (tracked.length === 0) return 0;
+
+            const seen = new Set();
+            let refreshed = 0;
+
+            for (const rec of tracked) {
+                const key = recentMarketKey(rec.cardId, rec.rarity);
+                if (seen.has(key)) continue;
+                seen.add(key);
+
+                const cached = getCachedRecentMarket(
+                    rec.cardId,
+                    rec.rarity,
+                    FLIP_WM_AVERAGE_REFRESH_MS
+                );
+
+                if (!forceAll && cached) continue;
+
+                const snap = await fetchRecentMarket(
+                    rec.cardId,
+                    rec.rarity,
+                    true
+                ).catch(() => null);
+
+                if (snap?.ok) refreshed++;
+                await new Promise(r => setTimeout(r, 120));
+            }
+
+            if (refreshed > 0) renderFlipHistory();
+            return refreshed;
+        } finally {
+            flipRecentRefreshBusy = false;
         }
     }
 
@@ -2435,28 +2536,63 @@
 
 
     function flipMarketRecapHtml(rec) {
+        const recent = getCachedRecentMarket(
+            rec?.cardId,
+            rec?.rarity,
+            RECENT_MARKET_FLIP_MAX_STALE_MS
+        );
+
         const storedWm = getStoredFlipOfficialAverage(rec);
         const cachedWm = getWmOfficialAverage(rec?.cardId, rec?.rarity);
-        const wmAverage = storedWm?.average ?? (Number.isFinite(Number(cachedWm)) ? Number(cachedWm) : null);
-        if (rec?.cardId && !storedWm) queueWmOfficialSummaryFetch(rec.cardId);
-        if (!Number.isFinite(wmAverage) || wmAverage <= 0) return '<span style="color:#444;">moy. WM …</span>';
-        let freshText = '';
-        if (storedWm) {
-            const ageSec = Math.floor(storedWm.ageMs / 1000);
-            freshText = ageSec < 60 ? ` · maj ${Math.max(1, ageSec)}s` : ` · maj ${Math.floor(ageSec / 60)}m`;
-        }
-        let marketDrift = '';
-        if (rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))) {
-            const target = getFlipTargetFromAverage(rec, wmAverage);
-            const lp = Number(rec.listPrice);
-            if (target > 0 && lp > 0) {
-                const pct = Math.round((lp / target - 1) * 100);
-                marketDrift = ` · <span style="color:${Math.abs(pct) <= 5 ? '#4ade80' : '#fbbf24'};">cible actuelle ${target.toLocaleString('fr-FR')} (${pct >= 0 ? '+' : ''}${pct}%)</span>`;
-            }
-        }
-        const stagePct = getFlipWmSellPct(rec);
+        const wmAverage = storedWm?.average ??
+            (Number.isFinite(Number(cachedWm)) ? Number(cachedWm) : null);
+
         const stage = getFlipWmSellStage(rec);
-        return `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b>${freshText} · ${stage} <b>${stagePct}%</b>${marketDrift}</span>`;
+
+        if (recent?.eligible) {
+            const ageSec = Math.floor(Number(recent.ageMs || 0) / 1000);
+            const ageText = ageSec < 60
+                ? `${Math.max(1, ageSec)}s`
+                : `${Math.floor(ageSec / 60)}m`;
+
+            const target = getFlipTargetFromRecentMarket(
+                rec,
+                recent.robustAverage
+            );
+            const stagePct = getFlipRecentSellPct(rec);
+
+            let drift = '';
+            if (rec.status === 'listed' && Number.isFinite(Number(rec.listPrice)) && target > 0) {
+                const lp = Number(rec.listPrice);
+                const pct = Math.round((lp / target - 1) * 100);
+                drift =
+                    ` · <span style="color:${Math.abs(pct) <= 5 ? '#4ade80' : '#fbbf24'};">` +
+                    `cible ${target.toLocaleString('fr-FR')} (${pct >= 0 ? '+' : ''}${pct}%)</span>`;
+            }
+
+            return (
+                `<span style="color:#4ade80;">récent robuste ` +
+                `<b>${Math.round(recent.robustAverage).toLocaleString('fr-FR')}</b>` +
+                ` · n=${recent.count} · maj ${ageText} · ${stage} <b>${stagePct}%</b>${drift}</span>` +
+                (Number.isFinite(wmAverage) && wmAverage > 0
+                    ? ` · <span style="color:#555;">WM ${wmAverage.toLocaleString('fr-FR')}</span>`
+                    : '')
+            );
+        }
+
+        if (rec?.cardId && !storedWm) queueWmOfficialSummaryFetch(rec.cardId);
+
+        if (!Number.isFinite(wmAverage) || wmAverage <= 0) {
+            return `<span style="color:#444;">récent ${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES} · moy. WM …</span>`;
+        }
+
+        const stagePct = getFlipWmSellPct(rec);
+        return (
+            `<span style="color:#06b6d4;">fallback WM ` +
+            `<b>${wmAverage.toLocaleString('fr-FR')}</b>` +
+            ` · récent ${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES}` +
+            ` · ${stage} <b>${stagePct}%</b></span>`
+        );
     }
 
     function flipAgeLabel(rec) {
@@ -2473,56 +2609,99 @@
         const markupPct = getFlipMarkupPct();
         const floor = Math.max(1, Math.ceil(buy * (1 + markupPct / 100)));
 
-        // v2.9.0 : chaque listing/relisting force toujours une moyenne WM fraîche.
-        const fresh = await refreshFlipOfficialAverage(rec, {
-            force: true,
-            reason: rec?.relists > 0 ? 'avant relisting' : 'avant listing',
-            save: true,
-            logChange: true
-        }).catch(() => null);
+        const cardId = rec?.cardId;
+        const rarity = rec?.rarity || '';
 
-        // Panne réseau ponctuelle : dernier snapshot Flip accepté seulement < 5 min.
-        const recentStored = getStoredFlipOfficialAverage(
-            rec,
-            FLIP_WM_AVERAGE_MAX_STALE_MS
+        // 1) Recent Market PRIORITAIRE : nouvelle requête à chaque listing/relisting.
+        const recentFresh = await fetchRecentMarket(
+            cardId,
+            rarity,
+            true
+        ).catch(() => null);
+
+        const recentStored = getCachedRecentMarket(
+            cardId,
+            rarity,
+            RECENT_MARKET_FLIP_MAX_STALE_MS
         );
 
-        const wmAverage =
-            Number.isFinite(Number(fresh?.average)) && Number(fresh.average) > 0
-                ? Number(fresh.average)
-                : recentStored?.average ?? null;
+        const recent =
+            recentFresh?.ok
+                ? recentFresh
+                : recentStored;
 
-        const reference =
-            Number.isFinite(Number(wmAverage)) && Number(wmAverage) > 0
-                ? Number(wmAverage)
-                : null;
+        let reference = null;
+        let referenceKind = null;
+        let stagePct = null;
+        let target = 0;
+        let basis = '';
 
-        const referenceKind = reference ? 'wm_average' : null;
-        const stagePct = getFlipWmSellPct(rec);
-        const stage = getFlipWmSellStage(rec);
+        if (recent?.eligible) {
+            reference = Number(recent.robustAverage);
+            referenceKind = 'recent_market';
+            stagePct = getFlipRecentSellPct(rec);
+            target = getFlipTargetFromRecentMarket(rec, reference);
+
+            basis =
+                `marché récent robuste ${Math.round(reference)} ` +
+                `(${recent.count} ventes · hors ${recent.removedLow}/${recent.removedHigh})` +
+                ` · ${getFlipWmSellStage(rec)} ${stagePct}% → ${target}`;
+
+            rec.recentMarketAverage = reference;
+            rec.recentMarketFetchedAt = Number(recent.fetchedAt || Date.now());
+            rec.recentMarketCount = Number(recent.count || 0);
+            rec.recentMarketPrices = Array.isArray(recent.prices)
+                ? recent.prices.slice(0, RECENT_MARKET_LIMIT)
+                : [];
+        } else {
+            // 2) <6 ventes : stratégie fallback 2.9 sur moyenne WM fraîche.
+            const freshWm = await refreshFlipOfficialAverage(rec, {
+                force: true,
+                reason: rec?.relists > 0 ? 'avant relisting fallback WM' : 'avant listing fallback WM',
+                save: true,
+                logChange: true
+            }).catch(() => null);
+
+            const recentWmStored = getStoredFlipOfficialAverage(
+                rec,
+                FLIP_WM_AVERAGE_MAX_STALE_MS
+            );
+
+            const wmAverage =
+                Number.isFinite(Number(freshWm?.average)) && Number(freshWm.average) > 0
+                    ? Number(freshWm.average)
+                    : recentWmStored?.average ?? null;
+
+            if (Number.isFinite(Number(wmAverage)) && Number(wmAverage) > 0) {
+                reference = Number(wmAverage);
+                referenceKind = 'wm_average';
+                stagePct = getFlipWmSellPct(rec);
+                target = getFlipTargetFromAverage(rec, reference);
+
+                basis =
+                    `fallback moyenne WM fraîche ${reference} · ` +
+                    `${getFlipWmSellStage(rec)} ${stagePct}% → ${target}` +
+                    ` · seulement ${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES} ventes récentes`;
+            } else {
+                basis =
+                    `achat +${markupPct}% · marché récent insuffisant ` +
+                    `et moyenne WM fraîche indisponible`;
+            }
+        }
 
         let price = floor;
-        let basis = `achat +${markupPct}% · moyenne WM fraîche indisponible`;
 
-        if (reference) {
-            const target = getFlipTargetFromAverage(rec, reference);
-
-            // La stratégie marché peut baisser jusqu'à 52% WM, mais jamais sous le
-            // plancher achat + marge mini.
+        if (Number.isFinite(target) && target > 0) {
             price = Math.max(floor, target);
-            basis =
-                `moyenne WM fraîche ${reference} · ${stage} ${stagePct}%` +
-                ` → ${target}` +
-                (price > target ? ` · plancher ${floor}` : '');
+            if (price > target) basis += ` · plancher ${floor}`;
 
             rec.wmCurrentTarget = target;
             rec.wmCurrentTargetPct = stagePct;
-            rec.wmCurrentTargetStage = stage;
+            rec.wmCurrentTargetStage = getFlipWmSellStage(rec);
+            rec.wmCurrentTargetSource = referenceKind;
             saveFlipLedger();
         }
 
-        // Undercut optionnel conservé : peut passer sous la cible de l'étape,
-        // mais jamais sous le plancher de marge.
         let undercut = null;
         if (getFlipUndercut()) {
             const lowest = await fetchLowestActiveListing(rec.cardId).catch(() => null);
@@ -2543,12 +2722,14 @@
             price: Math.max(1, Math.round(price)),
             floor,
             basis,
-            wmAverage,
-            wmAverageFetchedAt: Number(rec?.wmAverageFetchedAt || 0),
             reference,
             referenceKind,
-            wmSellPct: stagePct,
-            wmSellStage: stage,
+            wmAverage: referenceKind === 'wm_average' ? reference : Number(rec?.wmAverage) || null,
+            recentMarketAverage: referenceKind === 'recent_market' ? reference : recent?.robustAverage ?? null,
+            recentMarketCount: recent?.count ?? 0,
+            recentMarketPrices: recent?.prices ?? [],
+            sellPct: stagePct,
+            sellStage: getFlipWmSellStage(rec),
             undercut
         };
     }
@@ -3630,26 +3811,41 @@
 
     window.wmHunterPriceDiag = async function (cardId, rarity = '') {
         const rr = String(rarity || '').trim().toUpperCase();
-        if (cardId) await fetchWmOfficialSummary(cardId, true).catch(() => null);
+
+        const recent = await fetchRecentMarket(cardId, rr, true).catch(() => null);
+
+        if (recent?.ok && !recent.eligible) {
+            await fetchWmOfficialSummary(cardId, true).catch(() => null);
+        }
+
         const ref = getHunterPricingReference(cardId, rr);
+
         const result = {
             version: WM_VERSION,
             cardId,
             rarete: rr,
-            moyenneWM: ref?.value ?? null,
-            ageMoyenneSec: ref ? Math.round(Number(ref.ageMs || 0) / 1000) : null,
-            seuilMiniMoyenneWM: HUNTER_DYNAMIC_MIN_REFERENCE,
-            seuilMaxiMoyenneWM: HUNTER_DYNAMIC_MAX_REFERENCE,
-            maxAgeReferenceSec: Math.round(HUNTER_WM_REFERENCE_MAX_AGE_MS / 1000),
-            maxAgeAvantMiseSec: Math.round(HUNTER_WM_PRE_BID_MAX_AGE_MS / 1000),
-            sourceUtiliseePourAchat: ref ? 'moyenne officielle WikiMasters fraîche' : 'aucune',
-            ratioPct: Math.round(Number(getSetting('autoSnipeAdaptiveRatio')) * 100),
-            plafondHunter: ref ? dynamicHunterCapFromReference(ref.value) : null,
-            achatPossible: !!(ref && hunterReferenceInRange(ref.value))
+            ventesRecentes: recent?.count ?? null,
+            prixRecents: recent?.prices ?? [],
+            moyenneRobusteRecente: recent?.eligible
+                ? Math.round(Number(recent.robustAverage) * 10) / 10
+                : null,
+            retireBasse: recent?.removedLow ?? null,
+            retireHaute: recent?.removedHigh ?? null,
+            sourceUtiliseePourAchat: ref?.kind ?? 'aucune',
+            referenceAchat: ref?.value ?? null,
+            ratioPct: ref
+                ? Math.round(hunterRatioForReferenceKind(ref.kind) * 100)
+                : null,
+            plafondHunter: ref
+                ? dynamicHunterCapFromReference(ref.value, ref.kind)
+                : null,
+            moyenneWM: getWmOfficialAverage(cardId, rr),
+            fallbackWmFourchette: `${HUNTER_DYNAMIC_MIN_REFERENCE}-${HUNTER_DYNAMIC_MAX_REFERENCE}`
         };
+
         console.table(result);
         return result;
-    };
+    };;
 
     window.wmFlipLayoutDiag = function () {
         const hist = document.getElementById('wm-flip-history');
@@ -3731,7 +3927,11 @@
     window.wmFlipPricingMode = function () {
         const result = {
             version: WM_VERSION,
-            sourceMiseEnVente: 'moyenne officielle WikiMasters fraîche uniquement',
+            sourceMiseEnVente: 'Recent Market >=6 ventes, sinon moyenne WM fraîche',
+            recentMinVentes: RECENT_MARKET_MIN_SALES,
+            recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
+            recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}%`,
+            fallbackWmFlip: `${getFlipInitialWmPct()}% → ${getFlipRelist1WmPct()}% → ${getFlipRelist2WmPct()}%`,
             refreshApresAchat: 'immédiat + 2.5 s + 8 s',
             refreshSuiviMin: FLIP_WM_AVERAGE_REFRESH_MS / 60000,
             refreshForceAvantChaqueListing: true,
@@ -3759,10 +3959,12 @@
             rarete: rec.rarity,
             achat: rec.buyPrice,
             moyenneWM: info.wmAverage ?? null,
+            marcheRecentRobuste: info.recentMarketAverage ?? null,
+            ventesRecentes: info.recentMarketCount ?? 0,
             reference: info.reference ?? null,
-            sourceReference: info.referenceKind ?? 'aucune_moyenne_WM',
-            etape: info.wmSellStage,
-            pctWM: info.wmSellPct,
+            sourceReference: info.referenceKind ?? 'aucune',
+            etape: info.sellStage,
+            pctReference: info.sellPct,
             plancherMarge: info.floor,
             prixCible: info.price,
             undercut: info.undercut || null,
@@ -4615,6 +4817,193 @@
         return { ...common, status: 'fair', label: `dans la zone · moy. WM ${formatted}`, color: '#888' };
     }
 
+    /* ═══════ v3.0.0 — RECENT MARKET ═══════
+       Source : 10 dernières ventes `settled_sold` visibles dans `auctions`.
+       Si >= 6 prix valides :
+         - retire UNE vente la plus basse
+         - retire UNE vente la plus haute
+         - moyenne du reste
+
+       Hunter :
+         >=6 ventes -> 70% de cette moyenne robuste
+         <6 ventes  -> fallback 40% moyenne WM fraîche
+
+       Flip :
+         >=6 ventes -> 100% / 95% / 90%
+         <6 ventes  -> fallback WM 60% / 55% / 52%
+    */
+    const RECENT_MARKET_LIMIT = 10;
+    const RECENT_MARKET_MIN_SALES = 6;
+    const RECENT_MARKET_CACHE_TTL_MS = 60 * 1000;
+    const RECENT_MARKET_PRE_ACTION_MAX_AGE_MS = 5 * 1000;
+    const RECENT_MARKET_FLIP_MAX_STALE_MS = 5 * 60 * 1000;
+
+    const recentMarketCache = new Map();
+    const recentMarketInflight = new Map();
+
+    function recentMarketKey(cardId, rarity = '') {
+        return `${String(cardId || '')}|${String(rarity || '').trim().toUpperCase()}`;
+    }
+
+    function computeRobustRecentAverage(prices) {
+        const clean = (Array.isArray(prices) ? prices : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0)
+            .slice(0, RECENT_MARKET_LIMIT);
+
+        if (clean.length < RECENT_MARKET_MIN_SALES) {
+            return {
+                eligible: false,
+                count: clean.length,
+                prices: clean,
+                trimmedPrices: [],
+                robustAverage: null,
+                simpleAverage: clean.length
+                    ? Math.round(clean.reduce((a, b) => a + b, 0) / clean.length)
+                    : null,
+                removedLow: null,
+                removedHigh: null
+            };
+        }
+
+        const work = clean.slice();
+        const min = Math.min(...work);
+        const max = Math.max(...work);
+
+        const minIdx = work.indexOf(min);
+        if (minIdx >= 0) work.splice(minIdx, 1);
+
+        const maxIdx = work.indexOf(max);
+        if (maxIdx >= 0) work.splice(maxIdx, 1);
+
+        const robustAverage = work.length
+            ? work.reduce((a, b) => a + b, 0) / work.length
+            : null;
+
+        return {
+            eligible: Number.isFinite(robustAverage) && robustAverage > 0,
+            count: clean.length,
+            prices: clean,
+            trimmedPrices: work,
+            robustAverage,
+            simpleAverage: clean.length
+                ? clean.reduce((a, b) => a + b, 0) / clean.length
+                : null,
+            removedLow: min,
+            removedHigh: max
+        };
+    }
+
+    function buildRecentMarketSnapshot(probe, cardId, rarity) {
+        if (!probe?.ok) {
+            return {
+                ok: false,
+                cardId,
+                rarity: String(rarity || '').trim().toUpperCase(),
+                error: probe?.error || 'échec API auctions',
+                httpStatus: probe?.httpStatus ?? null,
+                fetchedAt: Date.now(),
+                eligible: false,
+                count: 0,
+                prices: [],
+                trimmedPrices: [],
+                robustAverage: null
+            };
+        }
+
+        const rows = Array.isArray(probe.rows) ? probe.rows : [];
+        const prices = rows
+            .map(r => Number(r?.final_price))
+            .filter(v => Number.isFinite(v) && v > 0)
+            .slice(0, RECENT_MARKET_LIMIT);
+
+        const calc = computeRobustRecentAverage(prices);
+        const newestTs = rows.length
+            ? new Date(rows[0]?.settled_at || rows[0]?.end_at || 0).getTime()
+            : null;
+        const oldestRow = rows[Math.min(rows.length, RECENT_MARKET_LIMIT) - 1];
+        const oldestTs = oldestRow
+            ? new Date(oldestRow?.settled_at || oldestRow?.end_at || 0).getTime()
+            : null;
+
+        return {
+            ok: true,
+            cardId,
+            rarity: String(rarity || '').trim().toUpperCase(),
+            fetchedAt: Date.now(),
+            rows,
+            newestSaleAt: Number.isFinite(newestTs) ? newestTs : null,
+            oldestSaleAt: Number.isFinite(oldestTs) ? oldestTs : null,
+            ...calc
+        };
+    }
+
+    function getCachedRecentMarket(cardId, rarity = '', maxAgeMs = RECENT_MARKET_CACHE_TTL_MS) {
+        const hit = recentMarketCache.get(recentMarketKey(cardId, rarity));
+        if (!hit) return null;
+        const ageMs = Date.now() - Number(hit.fetchedAt || 0);
+        if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) return null;
+        return { ...hit, ageMs };
+    }
+
+    async function fetchRecentMarket(cardId, rarity = '', force = false) {
+        const id = String(cardId || '').trim();
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (!id || !rr) return null;
+
+        const key = recentMarketKey(id, rr);
+
+        if (!force) {
+            const cached = getCachedRecentMarket(id, rr);
+            if (cached) return cached;
+        }
+
+        if (recentMarketInflight.has(key)) {
+            return await recentMarketInflight.get(key);
+        }
+
+        const promise = (async () => {
+            const probe = await fetchLastVisibleSalesFromAuctions(
+                id,
+                rr,
+                RECENT_MARKET_LIMIT
+            );
+
+            const snap = buildRecentMarketSnapshot(probe, id, rr);
+
+            // On garde en cache les réponses HTTP 200, y compris <6 ventes :
+            // cela permet un fallback WM sans refaire 10 requêtes par minute.
+            if (snap.ok) recentMarketCache.set(key, snap);
+
+            return snap;
+        })();
+
+        recentMarketInflight.set(key, promise);
+        try {
+            return await promise;
+        } finally {
+            recentMarketInflight.delete(key);
+        }
+    }
+
+    async function ensureFreshRecentMarket(
+        cardId,
+        rarity = '',
+        maxAgeMs = RECENT_MARKET_CACHE_TTL_MS
+    ) {
+        const cached = getCachedRecentMarket(cardId, rarity, maxAgeMs);
+        if (cached) return cached;
+
+        const fresh = await fetchRecentMarket(cardId, rarity, true).catch(() => null);
+        if (!fresh?.ok) return null;
+        return { ...fresh, ageMs: 0 };
+    }
+
+    function recentMarketLabel(snap) {
+        if (!snap?.eligible || !Number.isFinite(Number(snap.robustAverage))) return null;
+        return `marché récent ${Math.round(snap.robustAverage)}`;
+    }
+
     // v2.8.0 — Hunter dynamique : la SEULE référence d'achat est
     // la moyenne officielle WikiMasters de la carte + rareté.
     //
@@ -4639,11 +5028,19 @@
     // Plafond dynamique = ratio configuré × moyenne officielle WM,
     // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
     // Exemple : moyenne WM 1 100 × 40% = 440 → plafond réel 440.
-    function dynamicHunterCapFromReference(reference) {
+    function hunterRatioForReferenceKind(kind) {
+        return kind === 'recent_market'
+            ? Number(getSetting('autoSnipeRecentRatio'))
+            : Number(getSetting('autoSnipeAdaptiveRatio'));
+    }
+
+    function dynamicHunterCapFromReference(reference, kind = 'wm_average') {
         const ref = Number(reference);
         if (!Number.isFinite(ref) || ref <= 0) return 0;
-        const ratio = Number(getSetting('autoSnipeAdaptiveRatio'));
+
+        const ratio = hunterRatioForReferenceKind(kind);
         if (!Number.isFinite(ratio) || ratio <= 0) return 0;
+
         const raw = ref * ratio;
         return raw >= 100
             ? Math.max(10, Math.floor(raw / 10) * 10)
@@ -4654,8 +5051,37 @@
         const rr = String(rarity || '').trim().toUpperCase();
         if (!cardId || !rr) return null;
 
-        // IMPORTANT : getCachedWmOfficialSummary() accepte jusqu'à 6 h pour le reste du bot.
-        // Le Hunter, lui, lit directement l'entrée et impose sa propre fraîcheur.
+        // 1) PRIORITÉ : marché récent, seulement si la lecture API récente est fraîche
+        // et contient >= 6 ventes.
+        const recent = getCachedRecentMarket(
+            cardId,
+            rr,
+            HUNTER_WM_REFERENCE_MAX_AGE_MS
+        );
+
+        if (recent?.ok && recent.eligible) {
+            return {
+                value: Number(recent.robustAverage),
+                kind: 'recent_market',
+                label: 'marché récent',
+                reasonLabel: 'moyenne robuste récente',
+                cardId,
+                rarity: rr,
+                fetchedAt: Number(recent.fetchedAt || 0),
+                ageMs: Number(recent.ageMs || 0),
+                salesCount: recent.count,
+                prices: recent.prices,
+                trimmedPrices: recent.trimmedPrices,
+                removedLow: recent.removedLow,
+                removedHigh: recent.removedHigh
+            };
+        }
+
+        // Si on n'a pas encore une lecture récente valide de `auctions`, on ne
+        // retombe PAS silencieusement sur WM : l'ensure async doit d'abord la faire.
+        if (!recent?.ok) return null;
+
+        // 2) <6 ventes visibles : fallback moyenne WM fraîche, avec la fourchette 500–1500.
         const entry = wmOfficialSummaryCache?.[cardId] || null;
         if (!entry) return null;
 
@@ -4667,16 +5093,18 @@
 
         const wmAverage = Number(entry?.summary?.[rr]?.average);
         if (!Number.isFinite(wmAverage) || wmAverage <= 0) return null;
+        if (!hunterReferenceInRange(wmAverage)) return null;
 
         return {
             value: wmAverage,
             kind: 'wm_average',
-            label: 'moy. WM',
-            reasonLabel: 'moyenne WM',
+            label: 'moy. WM fallback',
+            reasonLabel: 'moyenne WM fallback',
             cardId,
             rarity: rr,
             fetchedAt,
-            ageMs
+            ageMs,
+            salesCount: recent.count || 0
         };
     }
 
@@ -4690,28 +5118,52 @@
         const rarity = globalAuctionRarity(auction);
         if (!cardId || !rarity) return null;
 
+        // Toujours vérifier d'abord `auctions`.
+        const recent = await ensureFreshRecentMarket(
+            cardId,
+            rarity,
+            maxAgeMs
+        );
+
+        // Une panne de la source Recent Market est fail-safe : aucune mise dynamique.
+        if (!recent?.ok) return null;
+
+        if (recent.eligible) {
+            return {
+                value: Number(recent.robustAverage),
+                kind: 'recent_market',
+                label: 'marché récent',
+                reasonLabel: 'moyenne robuste récente',
+                cardId,
+                rarity,
+                fetchedAt: Number(recent.fetchedAt || Date.now()),
+                ageMs: Number(recent.ageMs || 0),
+                salesCount: recent.count,
+                prices: recent.prices,
+                trimmedPrices: recent.trimmedPrices,
+                removedLow: recent.removedLow,
+                removedHigh: recent.removedHigh
+            };
+        }
+
+        // <6 ventes : seulement ici on charge/utilise la moyenne WM.
         const cached = wmOfficialSummaryCache?.[cardId] || null;
         const ageMs = cached
             ? Date.now() - Number(cached.fetchedAt || 0)
             : Infinity;
 
         if (!cached || !Number.isFinite(ageMs) || ageMs < 0 || ageMs > maxAgeMs) {
-            // Force = true : surtout ne pas réutiliser le cache général 6 h.
             const fresh = await fetchWmOfficialSummary(cardId, true).catch(() => null);
             if (!fresh) return null;
         }
 
-        const ref = getHunterPricingReference(cardId, rarity);
-        if (!ref) return null;
-        if (!hunterReferenceInRange(ref.value)) return null;
-
-        return ref;
+        return getHunterPricingReference(cardId, rarity);
     }
 
     async function preloadWmOfficialSummariesForHunter(list) {
         if (!Array.isArray(list) || getSetting('autoSnipeMode') !== 'adaptive') return;
 
-        const ids = [];
+        const targets = [];
         const seen = new Set();
 
         for (const a of list) {
@@ -4719,41 +5171,65 @@
 
             const cardId = a.card?.id ?? a.card_id;
             const rarity = globalAuctionRarity(a);
-            if (!cardId || !rarity || seen.has(cardId)) continue;
+            if (!cardId || !rarity) continue;
 
-            // Le cache général peut dater de plusieurs heures : le Hunter le refuse.
-            const cached = wmOfficialSummaryCache?.[cardId] || null;
-            const ageMs = cached
-                ? Date.now() - Number(cached.fetchedAt || 0)
-                : Infinity;
+            const key = recentMarketKey(cardId, rarity);
+            if (seen.has(key)) continue;
+            seen.add(key);
 
-            if (
-                cached &&
-                Number.isFinite(ageMs) &&
-                ageMs >= 0 &&
-                ageMs <= HUNTER_WM_REFERENCE_MAX_AGE_MS
-            ) continue;
+            const recent = getCachedRecentMarket(
+                cardId,
+                rarity,
+                HUNTER_WM_REFERENCE_MAX_AGE_MS
+            );
+            const ref = getHunterPricingReference(cardId, rarity);
 
-            seen.add(cardId);
-            ids.push(cardId);
-            if (ids.length >= 24) break;
+            if (recent?.ok && ref) continue;
+
+            targets.push({ cardId, rarity });
+            if (targets.length >= 24) break;
         }
 
-        if (ids.length === 0) return;
+        if (targets.length === 0) return;
 
-        const WORKERS = 4;
         let idx = 0;
+        const WORKERS = 4;
 
         async function worker() {
-            while (idx < ids.length) {
-                const id = ids[idx++];
-                await fetchWmOfficialSummary(id, true).catch(() => null);
+            while (idx < targets.length) {
+                const t = targets[idx++];
+
+                const recent = await ensureFreshRecentMarket(
+                    t.cardId,
+                    t.rarity,
+                    HUNTER_WM_REFERENCE_MAX_AGE_MS
+                );
+
+                if (recent?.ok && !recent.eligible) {
+                    const wm = wmOfficialSummaryCache?.[t.cardId] || null;
+                    const wmAge = wm
+                        ? Date.now() - Number(wm.fetchedAt || 0)
+                        : Infinity;
+
+                    if (
+                        !wm ||
+                        !Number.isFinite(wmAge) ||
+                        wmAge < 0 ||
+                        wmAge > HUNTER_WM_REFERENCE_MAX_AGE_MS
+                    ) {
+                        await fetchWmOfficialSummary(t.cardId, true).catch(() => null);
+                    }
+                }
+
                 await new Promise(r => setTimeout(r, 100));
             }
         }
 
         await Promise.all(
-            Array.from({ length: Math.min(WORKERS, ids.length) }, worker)
+            Array.from(
+                { length: Math.min(WORKERS, targets.length) },
+                () => worker()
+            )
         );
     }
 
@@ -4771,51 +5247,28 @@
         const cardId = auction.card?.id ?? auction.card_id ?? candidate.cardId;
         const rarity = globalAuctionRarity(auction) || candidate.rarity || '';
 
-        const raw = wmOfficialSummaryCache?.[cardId] || null;
-        const rawAgeMs = raw
-            ? Date.now() - Number(raw.fetchedAt || 0)
-            : Infinity;
+        const ref = getHunterPricingReference(cardId, rarity);
 
-        // Référence absente/périmée : on PAUSE la riposte, on recharge en arrière-plan,
-        // mais on ne détruit pas l'armement tant qu'on ne connaît pas la vraie moyenne.
-        if (
-            !raw ||
-            !Number.isFinite(rawAgeMs) ||
-            rawAgeMs < 0 ||
-            rawAgeMs > HUNTER_WM_REFERENCE_MAX_AGE_MS
-        ) {
-            fetchWmOfficialSummary(cardId, true).catch(() => null);
+        // Pas de référence synchrone fraîche : pause et refresh async.
+        if (!ref) {
+            ensureFreshHunterReference(
+                auction,
+                HUNTER_WM_REFERENCE_MAX_AGE_MS
+            ).catch(() => null);
             return false;
         }
 
-        const ref = getHunterPricingReference(cardId, rarity);
+        dynamicOfficialAverageBlockLogged.delete(auction.id);
 
-        if (ref && hunterReferenceInRange(ref.value)) {
-            dynamicOfficialAverageBlockLogged.delete(auction.id);
-
-            const freshCap = dynamicHunterCapFromReference(ref.value);
-            if (freshCap > 0) {
-                const oldCap = getAutoBidMax(auction.id);
-                if (oldCap !== freshCap) setAutoBidMax(auction.id, freshCap);
-                return true;
-            }
+        const freshCap = dynamicHunterCapFromReference(ref.value, ref.kind);
+        if (freshCap > 0) {
+            const oldCap = getAutoBidMax(auction.id);
+            if (oldCap !== freshCap) setAutoBidMax(auction.id, freshCap);
+            return true;
         }
 
-        // Ici la moyenne est FRAÎCHE et elle est réellement HORS de la fourchette
-        // 500–1500 (ou la rareté n'a plus de moyenne) : on coupe le Hunter dynamique.
         if (autoBidSet.delete(auction.id)) saveAutoBidSet();
         setAutoBidMax(auction.id, null);
-
-        if (!dynamicOfficialAverageBlockLogged.has(auction.id)) {
-            dynamicOfficialAverageBlockLogged.add(auction.id);
-            const value = ref?.value ?? Number(raw?.summary?.[String(rarity).toUpperCase()]?.average) ?? '?';
-            wmLog(
-                `🛑 Hunter dynamique coupé : <b>${auction.card?.wikipedia_title || candidate.title || '?'}</b> ` +
-                `[${rarity || '?'}] · moyenne WM fraîche <b>${value} 💰</b> ` +
-                `hors fourchette <b>${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE} 💰</b> ou indisponible.`
-            );
-        }
-
         return false;
     }
 
@@ -4836,34 +5289,22 @@
             if (!ref || !Number.isFinite(Number(ref.value)) || Number(ref.value) <= 0) {
                 return {
                     snipe: false,
-                    reason: `moyenne WM indisponible${rarity ? ` (${rarity})` : ''}`,
+                    reason: `référence récente indisponible${rarity ? ` (${rarity})` : ''}`,
                     cap: 0
                 };
             }
 
-            if (Number(ref.value) < HUNTER_DYNAMIC_MIN_REFERENCE) {
-                return {
-                    snipe: false,
-                    reason: `moyenne WM < ${HUNTER_DYNAMIC_MIN_REFERENCE} (${ref.value})`,
-                    cap: 0
-                };
-            }
-
-            if (Number(ref.value) > HUNTER_DYNAMIC_MAX_REFERENCE) {
-                return {
-                    snipe: false,
-                    reason: `moyenne WM > ${HUNTER_DYNAMIC_MAX_REFERENCE} (${ref.value})`,
-                    cap: 0
-                };
-            }
-
-            const ratio = getSetting('autoSnipeAdaptiveRatio');
-            const threshold = dynamicHunterCapFromReference(ref.value);
+            const ratio = hunterRatioForReferenceKind(ref.kind);
+            const threshold = dynamicHunterCapFromReference(ref.value, ref.kind);
+            const pct = Math.round(ratio * 100);
+            const src = ref.kind === 'recent_market'
+                ? `${ref.salesCount} ventes · robuste ${Math.round(ref.value)}`
+                : `fallback WM ${Math.round(ref.value)}`;
 
             if (currentBid <= threshold) {
                 return {
                     snipe: true,
-                    reason: `≤ ${Math.round(ratio * 100)}% moy. WM (${ref.value}) · plafond ${threshold}`,
+                    reason: `≤ ${pct}% ${src} · plafond ${threshold}`,
                     cap: threshold,
                     pricingReference: ref
                 };
@@ -4871,7 +5312,7 @@
 
             return {
                 snipe: false,
-                reason: `> ${Math.round(ratio * 100)}% moy. WM (${ref.value}) · plafond ${threshold}`,
+                reason: `> ${pct}% ${src} · plafond ${threshold}`,
                 cap: threshold,
                 pricingReference: ref
             };
@@ -4941,6 +5382,7 @@
         autoSnipePrice: 'wm_autosnipe_price',
         autoSnipeMode: 'wm_autosnipe_mode',
         autoSnipeAdaptiveRatio: 'wm_autosnipe_adaptive_ratio',
+        autoSnipeRecentRatio: 'wm_autosnipe_recent_ratio',
         minBalanceForAutoSnipe: 'wm_autosnipe_min_balance',
         autoRetagEnabled: 'wm_autoretag_enabled',
         sellTagName: 'wm_sell_tag_name',
@@ -4994,7 +5436,8 @@
         logAutobid: true,
         autoSnipePrice: 100,
         autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = % moyenne officielle WM
-        autoSnipeAdaptiveRatio: 0.40,     // v2.9.0 : marché observé ~50-55% WM, achat visé ~40%
+        autoSnipeAdaptiveRatio: 0.40,     // fallback si <6 ventes récentes
+        autoSnipeRecentRatio: 0.70,       // v3.0 : 70% de la moyenne robuste récente
         minBalanceForAutoSnipe: 2000,
         autoRetagEnabled: true,
         sellTagName: 'Trash',
@@ -7217,7 +7660,9 @@
         // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
-            return `⚡ Hunter dynamique · moy.WM ${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
+            const recentPct = Math.round(Number(getSetting('autoSnipeRecentRatio')) * 100);
+            const wmPct = Math.round(Number(getSetting('autoSnipeAdaptiveRatio')) * 100);
+            return `⚡ Hunter Recent ${recentPct}% · WM ${wmPct}% fallback · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -7263,7 +7708,7 @@
             if (getSetting('autoSnipeMode') === 'adaptive') {
                 const freshRef = await ensureFreshHunterReference(
                     fresh,
-                    HUNTER_WM_PRE_BID_MAX_AGE_MS
+                    Math.min(HUNTER_WM_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                 );
                 // Fail-safe : impossible de vérifier une moyenne >= 1500 => aucune mise.
                 if (!freshRef) return null;
@@ -9926,7 +10371,7 @@
                 if (hunterHotCandidate?.source === 'hunter_dynamic') {
                     hunterHotFresh = !!(await ensureFreshHunterReference(
                         a,
-                        HUNTER_WM_PRE_BID_MAX_AGE_MS
+                        Math.min(HUNTER_WM_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                     ));
                     if (!hunterHotFresh) {
                         dynamicHunterContinuationAllowed(a);
@@ -9987,7 +10432,7 @@
                                             if (retryHunterCandidate?.source === 'hunter_dynamic') {
                                                 retryHunterFresh = !!(await ensureFreshHunterReference(
                                                     retryFresh,
-                                                    HUNTER_WM_PRE_BID_MAX_AGE_MS
+                                                    Math.min(HUNTER_WM_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                                                 ));
                                             }
 
@@ -13183,20 +13628,34 @@
         const rows = Array.isArray(probe?.rows) ? probe.rows : [];
         const prices = rows
             .map(r => Number(r?.final_price))
-            .filter(v => Number.isFinite(v) && v > 0);
+            .filter(v => Number.isFinite(v) && v > 0)
+            .slice(0, RECENT_MARKET_LIMIT);
+
+        const robust = computeRobustRecentAverage(prices);
 
         const recentAverage = prices.length
             ? Math.round(prices.reduce((a, b) => a + b, 0) / prices.length)
             : null;
 
+        const robustRounded = robust.eligible
+            ? Math.round(robust.robustAverage * 10) / 10
+            : null;
+
         const wm = Number(wmAverage);
         const ratioToWm =
-            Number.isFinite(recentAverage) &&
-                recentAverage > 0 &&
+            Number.isFinite(robustRounded) &&
+                robustRounded > 0 &&
                 Number.isFinite(wm) &&
                 wm > 0
-                ? Math.round((recentAverage / wm) * 1000) / 10
+                ? Math.round((robustRounded / wm) * 1000) / 10
                 : null;
+
+        const hunterRecentCap = robust.eligible
+            ? dynamicHunterCapFromReference(
+                robust.robustAverage,
+                'recent_market'
+            )
+            : null;
 
         return {
             version: WM_VERSION,
@@ -13208,6 +13667,12 @@
             prix: prices,
             derniereVente: prices[0] ?? null,
             moyenneVentesVisibles: recentAverage,
+            moyenneRobusteRecente: robustRounded,
+            ventesUtilisees: robust.trimmedPrices,
+            venteBasseRetiree: robust.removedLow,
+            venteHauteRetiree: robust.removedHigh,
+            recentMarketEligible: robust.eligible,
+            hunterRecentCap,
             moyenneWM:
                 Number.isFinite(wm) && wm > 0
                     ? wm
@@ -13267,7 +13732,10 @@
             wmLog(
                 `🧪 Historique auctions : <b>${probe.rows.length}</b> vente(s) visible(s) ` +
                 `[${rr || 'toutes'}] · ` +
-                `moy. récente <b>${summary.moyenneVentesVisibles ?? '—'} 💰</b>` +
+                `robuste <b>${summary.moyenneRobusteRecente ?? '—'} 💰</b>` +
+                (summary.hunterRecentCap != null
+                    ? ` · cap Hunter <b>${summary.hunterRecentCap} 💰</b>`
+                    : '') +
                 (summary.marcheRecentSurWM_Pct != null
                     ? ` · <b>${summary.marcheRecentSurWM_Pct}%</b> de la moy. WM`
                     : '')
@@ -13388,7 +13856,9 @@
                     http: x.httpStatus,
                     lignes: x.lignesVisibles,
                     derniere: x.derniereVente,
-                    moyRecente: x.moyenneVentesVisibles,
+                    moySimple: x.moyenneVentesVisibles,
+                    robuste: x.moyenneRobusteRecente,
+                    capHunter: x.hunterRecentCap,
                     moyWM: x.moyenneWM,
                     ratioPct: x.marcheRecentSurWM_Pct,
                     erreur: x.erreur
@@ -15261,13 +15731,22 @@
                         <label style="font-size:9px;color:#888;">Marge mini %
                             <input id="wm-flip-markup" type="number" min="0" max="500" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
-                        <label style="font-size:9px;color:#888;">1er listing % WM
+                        <label style="font-size:9px;color:#4ade80;">Recent 1er %
+                            <input id="wm-flip-initial-recent-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(74,222,128,.25);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#4ade80;">Recent relist #1 %
+                            <input id="wm-flip-relist1-recent-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(74,222,128,.25);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#4ade80;">Recent relist #2+ %
+                            <input id="wm-flip-relist2-recent-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(74,222,128,.25);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#888;">Fallback WM 1er %
                             <input id="wm-flip-initial-wm-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
-                        <label style="font-size:9px;color:#888;">Relist #1 % WM
+                        <label style="font-size:9px;color:#888;">Fallback WM relist #1 %
                             <input id="wm-flip-relist1-wm-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
-                        <label style="font-size:9px;color:#888;">Relist #2+ % WM
+                        <label style="font-size:9px;color:#888;">Fallback WM relist #2+ %
                             <input id="wm-flip-relist2-wm-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
                         <label style="font-size:9px;color:#888;grid-column:1 / -1;">Durée
@@ -15280,7 +15759,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Stratégie 2.9 : <b>60% WM</b> au 1er listing → <b>55%</b> au 1er invendu → <b>52%</b> ensuite · moyenne WM fraîche à chaque listing · jamais sous la marge mini.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.0 : si ≥6 ventes visibles → moyenne robuste des 10 dernières (hors 1 min + 1 max), puis <b>100% → 95% → 90%</b>. Sinon fallback WM <b>60% → 55% → 52%</b>. Toujours sous protection de la marge mini.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -15431,10 +15910,12 @@
                     <div class="wm-set-title">Comportement</div>
                     <div class="wm-set-sub">Hunter : mode de décision</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="fixed"><span>Seuil fixe (mise si prix ≤ valeur définie)</span></label>
-                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique (moyenne officielle WikiMasters uniquement)</span></label>
+                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Recent Market (10 dernières ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la moyenne officielle WikiMasters servant de plafond d’achat. Stratégie 2.9 : <b>40%</b>. Ex. moyenne WM 1 100 × 40% → plafond 440.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Recent Market : avec ≥${RECENT_MARKET_MIN_SALES} ventes, plafond Hunter = <b>70%</b> de la moyenne robuste (on retire 1 plus haute + 1 plus basse).</div>
+                    <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
+                    <div class="wm-set-sub" style="margin-top:8px;">Fallback si &lt;${RECENT_MARKET_MIN_SALES} ventes : <b>40%</b> de la moyenne WM fraîche (fourchette WM ${HUNTER_DYNAMIC_MIN_REFERENCE}–${HUNTER_DYNAMIC_MAX_REFERENCE}).</div>
                     <input id="wm-set-autosnipe-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -15981,6 +16462,9 @@
         const flipBtn = document.getElementById('wm-flip-btn');
         const flipStatus = document.getElementById('wm-flip-status');
         const flipMarkup = document.getElementById('wm-flip-markup');
+        const flipInitialRecentPct = document.getElementById('wm-flip-initial-recent-pct');
+        const flipRelist1RecentPct = document.getElementById('wm-flip-relist1-recent-pct');
+        const flipRelist2RecentPct = document.getElementById('wm-flip-relist2-recent-pct');
         const flipInitialWmPct = document.getElementById('wm-flip-initial-wm-pct');
         const flipRelist1WmPct = document.getElementById('wm-flip-relist1-wm-pct');
         const flipRelist2WmPct = document.getElementById('wm-flip-relist2-wm-pct');
@@ -15995,6 +16479,31 @@
                 wmLog(`💸 Flip Seller : marge brute minimale → <b>${v}%</b>.`);
             };
         }
+        if (flipInitialRecentPct) {
+            flipInitialRecentPct.value = getFlipInitialRecentPct();
+            flipInitialRecentPct.onchange = () => {
+                const v = setFlipInitialRecentPct(flipInitialRecentPct.value);
+                flipInitialRecentPct.value = v;
+                wmLog(`💸 Flip Recent : 1er listing → <b>${v}%</b> du marché récent robuste.`);
+            };
+        }
+        if (flipRelist1RecentPct) {
+            flipRelist1RecentPct.value = getFlipRelist1RecentPct();
+            flipRelist1RecentPct.onchange = () => {
+                const v = setFlipRelist1RecentPct(flipRelist1RecentPct.value);
+                flipRelist1RecentPct.value = v;
+                wmLog(`💸 Flip Recent : relist #1 → <b>${v}%</b> du marché récent robuste.`);
+            };
+        }
+        if (flipRelist2RecentPct) {
+            flipRelist2RecentPct.value = getFlipRelist2RecentPct();
+            flipRelist2RecentPct.onchange = () => {
+                const v = setFlipRelist2RecentPct(flipRelist2RecentPct.value);
+                flipRelist2RecentPct.value = v;
+                wmLog(`💸 Flip Recent : relist #2+ → <b>${v}%</b> du marché récent robuste.`);
+            };
+        }
+
         if (flipInitialWmPct) {
             flipInitialWmPct.value = getFlipInitialWmPct();
             flipInitialWmPct.onchange = () => {
@@ -16081,11 +16590,13 @@
             // Garde les moyennes officielles des Flips vivants à jour. La fonction ne fait
             // réellement un fetch que si le dernier snapshot a ≥ 2 min.
             refreshTrackedFlipOfficialAverages(false).catch(() => { });
+            refreshTrackedFlipRecentMarkets(false).catch(() => { });
 
             renderFlipHistory(); // moyenne WM / âge rafraîchis en continu
         }, 15000);
         // Au chargement, les anciens Flips sans snapshot frais sont actualisés rapidement.
         setTimeout(() => refreshTrackedFlipOfficialAverages(false).catch(() => { }), 2500);
+        setTimeout(() => refreshTrackedFlipRecentMarkets(false).catch(() => { }), 3000);
 
         // L'affichage seul est très léger : entre deux cycles réseau, l'âge et la dernière
         // moyenne WM reçue se rafraîchissent sans requête.
@@ -16141,6 +16652,7 @@
         const autoSnipePriceInput = document.getElementById('wm-set-autosnipe-price');
         const autoSnipeMinBalanceInput = document.getElementById('wm-set-autosnipe-min-balance');
         const autoSnipeRatioInput = document.getElementById('wm-set-autosnipe-ratio');
+        const autoSnipeRecentRatioInput = document.getElementById('wm-set-autosnipe-recent-ratio');
         const bidDelayInput = document.getElementById('wm-set-bid-delay');
         const dailyAlertChk = document.getElementById('wm-set-daily-alert');
         const dailyLimitInput = document.getElementById('wm-set-daily-limit');
@@ -16164,6 +16676,9 @@
         autoSnipePriceInput.value = getSetting('autoSnipePrice');
         autoSnipeMinBalanceInput.value = getSetting('minBalanceForAutoSnipe');
         autoSnipeRatioInput.value = Math.round(getSetting('autoSnipeAdaptiveRatio') * 100);
+        if (autoSnipeRecentRatioInput) {
+            autoSnipeRecentRatioInput.value = Math.round(getSetting('autoSnipeRecentRatio') * 100);
+        }
         if (bidDelayInput) bidDelayInput.value = getSetting('humanizedBidDelayMs');
         dailyAlertChk.checked = getSetting('dailyPackAlert');
         dailyLimitInput.value = getSetting('dailyPackLimit');
@@ -16186,12 +16701,15 @@
             // Grise le champ non pertinent selon le mode
             const fixedRow = autoSnipePriceInput;
             const ratioRow = autoSnipeRatioInput;
+            const recentRatioRow = autoSnipeRecentRatioInput;
             if (mode === 'adaptive') {
                 fixedRow.style.opacity = '0.4';
                 ratioRow.style.opacity = '1';
+                if (recentRatioRow) recentRatioRow.style.opacity = '1';
             } else {
                 fixedRow.style.opacity = '1';
                 ratioRow.style.opacity = '0.4';
+                if (recentRatioRow) recentRatioRow.style.opacity = '0.4';
             }
         }
         applySnipeModeUI();
@@ -16203,20 +16721,31 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? '🎯 Hunter en mode <b>dynamique</b> (% de la moyenne WM fraîche)'
+                        ? '🎯 Hunter en mode <b>Recent Market</b> (70% récent · fallback 40% WM)'
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
                 }
             };
         });
 
-        // Ratio adaptatif
+        // Ratios Hunter Recent Market + fallback WM
+        if (autoSnipeRecentRatioInput) {
+            autoSnipeRecentRatioInput.onchange = () => {
+                let pct = parseInt(autoSnipeRecentRatioInput.value, 10);
+                if (!Number.isFinite(pct) || pct < 1) pct = 70;
+                if (pct > 200) pct = 200;
+                autoSnipeRecentRatioInput.value = pct;
+                setSetting('autoSnipeRecentRatio', pct / 100);
+                wmLog(`🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la moyenne robuste récente`);
+            };
+        }
+
         autoSnipeRatioInput.onchange = () => {
             let pct = parseInt(autoSnipeRatioInput.value, 10);
             if (!Number.isFinite(pct) || pct < 1) pct = 40;
             if (pct > 200) pct = 200;
             autoSnipeRatioInput.value = pct;
             setSetting('autoSnipeAdaptiveRatio', pct / 100);
-            wmLog(`🎯 Hunter dynamique : plafond à ${pct}% de la moyenne officielle WM uniquement`);
+            wmLog(`🎯 Hunter fallback : plafond à <b>${pct}%</b> de la moyenne WM fraîche`);
         };
 
         // Délai humanisé avant une mise
@@ -19413,7 +19942,9 @@
                     ${pricesHtml || '—'}
                 </div>
                 <div style="color:#777;">
-                    moy. visible <b>${r.moyenneVentesVisibles ?? '—'}</b> ·
+                    moy. simple <b>${r.moyenneVentesVisibles ?? '—'}</b> ·
+                    robuste <b style="color:#4ade80;">${r.moyenneRobusteRecente ?? '—'}</b> ·
+                    cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? '—'}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
                 </div>
             </div>`;
@@ -19451,8 +19982,8 @@
         ============================================================ */
 
     wmLog(
-        `🧪 v2.9.1 : sonde des 10 dernières ventes via auctions ajoutée · ` +
-        `stratégie 2.9.0 Hunter/Flip inchangée.`
+        `🚀 v3.0.0 Recent Market : Hunter 70% moyenne robuste des 10 dernières ventes ` +
+        `(>=6), Flip 100/95/90% · fallback WM 40% et 60/55/52%.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
