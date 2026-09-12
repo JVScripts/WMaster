@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.8.3';
+    const WM_VERSION = '2.9.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -437,8 +437,8 @@
        3) crée/pose l'étiquette vente,
        4) le Flip Seller peut le revendre ensuite par user_card_id exact.
 
-       Le prix de revente est prudent : plancher = prix d'achat + marge brute configurée ;
-       si une moyenne officielle WM est disponible, elle est utilisée comme référence.
+       Le prix de revente est agressif mais protégé : plancher = prix d'achat + marge brute configurée ;
+       si une moyenne officielle WM est disponible, la cible suit 60% → 55% → 52% selon les invendus.
        L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
        plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
     const FLIP_TAG_NAME = 'vente';
@@ -447,7 +447,12 @@
     const FLIP_MARKUP_KEY = 'wm_flip_markup_pct';
     const FLIP_DURATION_KEY = 'wm_flip_duration_min';
     const FLIP_UNDERCUT_KEY = 'wm_flip_undercut';
-    const FLIP_REFERENCE_DISCOUNT_KEY = 'wm_flip_reference_discount_pct';
+
+    // v2.9.0 — stratégie de sortie agressive adaptée au marché observé :
+    // 1er listing 60% WM, 1er relisting 55%, puis 52%.
+    const FLIP_INITIAL_WM_PCT_KEY = 'wm_flip_initial_wm_pct';
+    const FLIP_RELIST1_WM_PCT_KEY = 'wm_flip_relist1_wm_pct';
+    const FLIP_RELIST2_WM_PCT_KEY = 'wm_flip_relist2_wm_pct';
 
     // v2.6.8 : le cache général de moyenne WM reste long pour Hunter/Market Watcher,
     // mais le Flip Seller maintient sa PROPRE fraîcheur.
@@ -511,19 +516,71 @@
         localStorage.setItem(FLIP_MARKUP_KEY, String(n));
         return n;
     }
-    function getFlipReferenceDiscountPct() {
-        const raw = localStorage.getItem(FLIP_REFERENCE_DISCOUNT_KEY);
-        if (raw === null || raw === '') return 5;
-        const n = Number(raw);
-        return Number.isFinite(n) ? Math.max(0, Math.min(50, n)) : 5;
+    function clampFlipWmPct(v, fallback) {
+        const n = Number(v);
+        return Number.isFinite(n)
+            ? Math.max(1, Math.min(100, n))
+            : fallback;
     }
 
-    function setFlipReferenceDiscountPct(v) {
-        const n = Number(v);
-        const safe = Number.isFinite(n) ? Math.max(0, Math.min(50, n)) : 5;
-        localStorage.setItem(FLIP_REFERENCE_DISCOUNT_KEY, String(safe));
+    function getFlipInitialWmPct() {
+        const raw = localStorage.getItem(FLIP_INITIAL_WM_PCT_KEY);
+        return raw === null || raw === '' ? 60 : clampFlipWmPct(raw, 60);
+    }
+
+    function setFlipInitialWmPct(v) {
+        const safe = clampFlipWmPct(v, 60);
+        localStorage.setItem(FLIP_INITIAL_WM_PCT_KEY, String(safe));
         return safe;
     }
+
+    function getFlipRelist1WmPct() {
+        const raw = localStorage.getItem(FLIP_RELIST1_WM_PCT_KEY);
+        return raw === null || raw === '' ? 55 : clampFlipWmPct(raw, 55);
+    }
+
+    function setFlipRelist1WmPct(v) {
+        const safe = clampFlipWmPct(v, 55);
+        localStorage.setItem(FLIP_RELIST1_WM_PCT_KEY, String(safe));
+        return safe;
+    }
+
+    function getFlipRelist2WmPct() {
+        const raw = localStorage.getItem(FLIP_RELIST2_WM_PCT_KEY);
+        return raw === null || raw === '' ? 52 : clampFlipWmPct(raw, 52);
+    }
+
+    function setFlipRelist2WmPct(v) {
+        const safe = clampFlipWmPct(v, 52);
+        localStorage.setItem(FLIP_RELIST2_WM_PCT_KEY, String(safe));
+        return safe;
+    }
+
+    function getFlipWmSellPct(rec) {
+        const relists = Math.max(0, Number(rec?.relists) || 0);
+        if (relists <= 0) return getFlipInitialWmPct();
+        if (relists === 1) return getFlipRelist1WmPct();
+        return getFlipRelist2WmPct();
+    }
+
+    function getFlipWmSellStage(rec) {
+        const relists = Math.max(0, Number(rec?.relists) || 0);
+        if (relists <= 0) return '1er listing';
+        if (relists === 1) return 'relist #1';
+        return 'relist #2+';
+    }
+
+    function getFlipTargetFromAverage(rec, average) {
+        const avg = Number(average);
+        if (!Number.isFinite(avg) || avg <= 0) return 0;
+        return roundFlipReferencePriceDown(avg * (getFlipWmSellPct(rec) / 100));
+    }
+
+    // Nettoyage de l'ancien réglage unique "Sous réf. %", qui n'est plus utilisé en 2.9.
+    try {
+        localStorage.removeItem('wm_flip_reference_discount_pct');
+    } catch (e) { }
+
 
     function roundFlipReferencePriceDown(value) {
         const n = Number(value);
@@ -681,8 +738,7 @@
                         before !== snap.average
                     ) {
                         const listPrice = Number(rec.listPrice);
-                        const targetRaw = snap.average * (1 - getFlipReferenceDiscountPct() / 100);
-                        const target = roundFlipReferencePriceDown(targetRaw);
+                        const target = getFlipTargetFromAverage(rec, snap.average);
                         rec.wmCurrentTarget = target;
                     }
                 }
@@ -2391,14 +2447,16 @@
         }
         let marketDrift = '';
         if (rec.status === 'listed' && Number.isFinite(Number(rec.listPrice))) {
-            const target = roundFlipReferencePriceDown(wmAverage * (1 - getFlipReferenceDiscountPct() / 100));
+            const target = getFlipTargetFromAverage(rec, wmAverage);
             const lp = Number(rec.listPrice);
             if (target > 0 && lp > 0) {
                 const pct = Math.round((lp / target - 1) * 100);
                 marketDrift = ` · <span style="color:${Math.abs(pct) <= 5 ? '#4ade80' : '#fbbf24'};">cible actuelle ${target.toLocaleString('fr-FR')} (${pct >= 0 ? '+' : ''}${pct}%)</span>`;
             }
         }
-        return `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b>${freshText}${marketDrift}</span>`;
+        const stagePct = getFlipWmSellPct(rec);
+        const stage = getFlipWmSellStage(rec);
+        return `<span style="color:#06b6d4;">moy. WM <b>${wmAverage.toLocaleString('fr-FR')}</b>${freshText} · ${stage} <b>${stagePct}%</b>${marketDrift}</span>`;
     }
 
     function flipAgeLabel(rec) {
@@ -2415,8 +2473,7 @@
         const markupPct = getFlipMarkupPct();
         const floor = Math.max(1, Math.ceil(buy * (1 + markupPct / 100)));
 
-        // v2.8.0 : CHAQUE listing/relisting force une nouvelle lecture de la moyenne WM.
-        // On ne fixe jamais un prix Flip à partir du cache général de 6 h.
+        // v2.9.0 : chaque listing/relisting force toujours une moyenne WM fraîche.
         const fresh = await refreshFlipOfficialAverage(rec, {
             force: true,
             reason: rec?.relists > 0 ? 'avant relisting' : 'avant listing',
@@ -2424,8 +2481,7 @@
             logChange: true
         }).catch(() => null);
 
-        // En cas de panne réseau ponctuelle, on tolère uniquement le dernier snapshot Flip
-        // s'il a moins de 5 minutes. Au-delà : pas de vieille moyenne, fallback au plancher.
+        // Panne réseau ponctuelle : dernier snapshot Flip accepté seulement < 5 min.
         const recentStored = getStoredFlipOfficialAverage(
             rec,
             FLIP_WM_AVERAGE_MAX_STALE_MS
@@ -2436,33 +2492,37 @@
                 ? Number(fresh.average)
                 : recentStored?.average ?? null;
 
-        const discountPct = getFlipReferenceDiscountPct();
-
         const reference =
             Number.isFinite(Number(wmAverage)) && Number(wmAverage) > 0
                 ? Number(wmAverage)
                 : null;
 
         const referenceKind = reference ? 'wm_average' : null;
-        const referenceLabel = reference ? `moyenne WM fraîche ${reference}` : null;
+        const stagePct = getFlipWmSellPct(rec);
+        const stage = getFlipWmSellStage(rec);
 
         let price = floor;
         let basis = `achat +${markupPct}% · moyenne WM fraîche indisponible`;
 
         if (reference) {
-            const discountedRaw = reference * (1 - discountPct / 100);
-            const discounted = roundFlipReferencePriceDown(discountedRaw);
+            const target = getFlipTargetFromAverage(rec, reference);
 
-            price = Math.max(floor, discounted);
+            // La stratégie marché peut baisser jusqu'à 52% WM, mais jamais sous le
+            // plancher achat + marge mini.
+            price = Math.max(floor, target);
             basis =
-                `${referenceLabel} -${discountPct}%` +
-                ` → ${discounted}` +
-                (price > discounted ? ` · plancher ${floor}` : '');
+                `moyenne WM fraîche ${reference} · ${stage} ${stagePct}%` +
+                ` → ${target}` +
+                (price > target ? ` · plancher ${floor}` : '');
 
-            rec.wmCurrentTarget = discounted;
+            rec.wmCurrentTarget = target;
+            rec.wmCurrentTargetPct = stagePct;
+            rec.wmCurrentTargetStage = stage;
             saveFlipLedger();
         }
 
+        // Undercut optionnel conservé : peut passer sous la cible de l'étape,
+        // mais jamais sous le plancher de marge.
         let undercut = null;
         if (getFlipUndercut()) {
             const lowest = await fetchLowestActiveListing(rec.cardId).catch(() => null);
@@ -2487,7 +2547,8 @@
             wmAverageFetchedAt: Number(rec?.wmAverageFetchedAt || 0),
             reference,
             referenceKind,
-            referenceDiscountPct: discountPct,
+            wmSellPct: stagePct,
+            wmSellStage: stage,
             undercut
         };
     }
@@ -3641,9 +3702,7 @@
         const rows = records.map(r => {
             const snap = getStoredFlipOfficialAverage(r);
             const target = snap
-                ? roundFlipReferencePriceDown(
-                    snap.average * (1 - getFlipReferenceDiscountPct() / 100)
-                )
+                ? getFlipTargetFromAverage(r, snap.average)
                 : null;
 
             return {
@@ -3654,7 +3713,9 @@
                 moyenneWM: snap?.average ?? null,
                 ageMoyenneSec: snap ? Math.round(snap.ageMs / 1000) : null,
                 raisonRefresh: snap?.reason ?? null,
-                cibleMoinsDecote: target,
+                etape: getFlipWmSellStage(r),
+                pctWM: getFlipWmSellPct(r),
+                cibleWM: target,
                 prixListe: r.listPrice ?? null,
                 derniereMaj: snap?.fetchedAt
                     ? new Date(snap.fetchedAt).toLocaleTimeString('fr-FR')
@@ -3675,7 +3736,9 @@
             refreshSuiviMin: FLIP_WM_AVERAGE_REFRESH_MS / 60000,
             refreshForceAvantChaqueListing: true,
             fallbackMaxAgeMin: FLIP_WM_AVERAGE_MAX_STALE_MS / 60000,
-            decotePct: getFlipReferenceDiscountPct(),
+            premierListingPctWM: getFlipInitialWmPct(),
+            premierRelistPctWM: getFlipRelist1WmPct(),
+            relistDeuxEtPlusPctWM: getFlipRelist2WmPct(),
             margeMiniPct: getFlipMarkupPct(),
             dureeMin: getFlipDurationMin(),
             fallbackSiMoyenneAbsente: 'plancher achat + marge mini',
@@ -3698,7 +3761,8 @@
             moyenneWM: info.wmAverage ?? null,
             reference: info.reference ?? null,
             sourceReference: info.referenceKind ?? 'aucune_moyenne_WM',
-            decotePct: info.referenceDiscountPct,
+            etape: info.wmSellStage,
+            pctWM: info.wmSellPct,
             plancherMarge: info.floor,
             prixCible: info.price,
             undercut: info.undercut || null,
@@ -3900,7 +3964,9 @@
             vendus: flipLedger.filter(r => r.status === 'sold').length,
             profitBrutRealise: flipLedger.filter(r => r.status === 'sold').reduce((s, r) => s + Number(r.profit || 0), 0),
             margeCiblePct: getFlipMarkupPct(),
-            decoteReferencePct: getFlipReferenceDiscountPct(),
+            premierListingPctWM: getFlipInitialWmPct(),
+            premierRelistPctWM: getFlipRelist1WmPct(),
+            relistDeuxEtPlusPctWM: getFlipRelist2WmPct(),
             dureeMin: getFlipDurationMin(),
             undercut: getFlipUndercut()
         };
@@ -4571,7 +4637,7 @@
 
     // Plafond dynamique = ratio configuré × moyenne officielle WM,
     // arrondi vers le BAS à la dizaine à partir de 100 Wbid.
-    // Exemple : moyenne WM 942 × 75% = 706,5 → plafond réel 700.
+    // Exemple : moyenne WM 1 100 × 40% = 440 → plafond réel 440.
     function dynamicHunterCapFromReference(reference) {
         const ref = Number(reference);
         if (!Number.isFinite(ref) || ref <= 0) return 0;
@@ -4927,7 +4993,7 @@
         logAutobid: true,
         autoSnipePrice: 100,
         autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = % moyenne officielle WM
-        autoSnipeAdaptiveRatio: 0.75,     // v2.3.9 : plafond Hunter dynamique plus conservateur
+        autoSnipeAdaptiveRatio: 0.40,     // v2.9.0 : marché observé ~50-55% WM, achat visé ~40%
         minBalanceForAutoSnipe: 2000,
         autoRetagEnabled: true,
         sellTagName: 'Trash',
@@ -4993,13 +5059,24 @@
         }
     }
 
-    // v2.3.9 : l'ancien défaut était 85%, trop agressif. On migre uniquement
-    // les comptes encore sur cet ancien défaut ; un réglage personnalisé différent est conservé.
+    // v2.9.0 : nouveau positionnement marché = 40% de la moyenne WM.
+    // Migration uniquement des valeurs connues comme anciens défauts / réglage précédent
+    // utilisé pour cette stratégie (85%, 75% ou 50%). Les autres valeurs personnalisées restent.
     try {
+        const migrationKey = 'wm_migration_v290_hunter_ratio_40';
         const k = SETTINGS_KEYS.autoSnipeAdaptiveRatio;
-        const raw = localStorage.getItem(k);
-        if (raw === null || Math.abs(Number(raw) - 0.85) < 1e-9) {
-            localStorage.setItem(k, '0.75');
+        if (!localStorage.getItem(migrationKey)) {
+            const raw = localStorage.getItem(k);
+            const n = raw === null ? null : Number(raw);
+            if (
+                raw === null ||
+                Math.abs(n - 0.85) < 1e-9 ||
+                Math.abs(n - 0.75) < 1e-9 ||
+                Math.abs(n - 0.50) < 1e-9
+            ) {
+                localStorage.setItem(k, '0.40');
+            }
+            localStorage.setItem(migrationKey, '1');
         }
     } catch (e) { }
 
@@ -14830,14 +14907,20 @@
                         <button class="wm-btn wm-g wm-sm" id="wm-flip-btn" style="padding:2px 8px;">▶ START</button>
                     </div>
                     <div id="wm-flip-status" style="font-size:9px;color:#888;min-height:13px;margin-bottom:5px;"></div>
-                    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-bottom:5px;">
+                    <div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:5px;">
                         <label style="font-size:9px;color:#888;">Marge mini %
                             <input id="wm-flip-markup" type="number" min="0" max="500" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
-                        <label style="font-size:9px;color:#888;">Sous réf. %
-                            <input id="wm-flip-ref-discount" type="number" min="0" max="50" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
+                        <label style="font-size:9px;color:#888;">1er listing % WM
+                            <input id="wm-flip-initial-wm-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                         </label>
-                        <label style="font-size:9px;color:#888;">Durée
+                        <label style="font-size:9px;color:#888;">Relist #1 % WM
+                            <input id="wm-flip-relist1-wm-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#888;">Relist #2+ % WM
+                            <input id="wm-flip-relist2-wm-pct" type="number" min="1" max="100" step="1" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
+                        </label>
+                        <label style="font-size:9px;color:#888;grid-column:1 / -1;">Durée
                             <select id="wm-flip-duration" style="width:100%;box-sizing:border-box;margin-top:2px;padding:3px 5px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;">
                                 <option value="10">10 min</option><option value="30">30 min</option><option value="60">1 h</option><option value="180">3 h</option><option value="360">6 h</option><option value="720">12 h</option><option value="1440">24 h</option>
                             </select>
@@ -14847,7 +14930,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Prix cible = <b>moyenne officielle WikiMasters</b> moins <b>5%</b> par défaut · jamais sous la marge mini. Victoire auto → tag <b>vente</b>.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">Stratégie 2.9 : <b>60% WM</b> au 1er listing → <b>55%</b> au 1er invendu → <b>52%</b> ensuite · moyenne WM fraîche à chaque listing · jamais sous la marge mini.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -15001,7 +15084,7 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique (moyenne officielle WikiMasters uniquement)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la moyenne officielle WikiMasters servant de plafond d’achat. Ex. moyenne WM 942 × 75% → plafond 700, arrondi vers le bas à la dizaine.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Mode dynamique : % de la moyenne officielle WikiMasters servant de plafond d’achat. Stratégie 2.9 : <b>40%</b>. Ex. moyenne WM 1 100 × 40% → plafond 440.</div>
                     <input id="wm-set-autosnipe-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -15491,7 +15574,9 @@
         const flipBtn = document.getElementById('wm-flip-btn');
         const flipStatus = document.getElementById('wm-flip-status');
         const flipMarkup = document.getElementById('wm-flip-markup');
-        const flipRefDiscount = document.getElementById('wm-flip-ref-discount');
+        const flipInitialWmPct = document.getElementById('wm-flip-initial-wm-pct');
+        const flipRelist1WmPct = document.getElementById('wm-flip-relist1-wm-pct');
+        const flipRelist2WmPct = document.getElementById('wm-flip-relist2-wm-pct');
         const flipDuration = document.getElementById('wm-flip-duration');
         const flipUndercut = document.getElementById('wm-flip-undercut');
 
@@ -15503,12 +15588,28 @@
                 wmLog(`💸 Flip Seller : marge brute minimale → <b>${v}%</b>.`);
             };
         }
-        if (flipRefDiscount) {
-            flipRefDiscount.value = getFlipReferenceDiscountPct();
-            flipRefDiscount.onchange = () => {
-                const v = setFlipReferenceDiscountPct(flipRefDiscount.value);
-                flipRefDiscount.value = v;
-                wmLog(`💸 Flip Seller : décote sous référence → <b>${v}%</b>.`);
+        if (flipInitialWmPct) {
+            flipInitialWmPct.value = getFlipInitialWmPct();
+            flipInitialWmPct.onchange = () => {
+                const v = setFlipInitialWmPct(flipInitialWmPct.value);
+                flipInitialWmPct.value = v;
+                wmLog(`💸 Flip Seller : 1er listing → <b>${v}% de la moyenne WM</b>.`);
+            };
+        }
+        if (flipRelist1WmPct) {
+            flipRelist1WmPct.value = getFlipRelist1WmPct();
+            flipRelist1WmPct.onchange = () => {
+                const v = setFlipRelist1WmPct(flipRelist1WmPct.value);
+                flipRelist1WmPct.value = v;
+                wmLog(`💸 Flip Seller : relist #1 → <b>${v}% de la moyenne WM</b>.`);
+            };
+        }
+        if (flipRelist2WmPct) {
+            flipRelist2WmPct.value = getFlipRelist2WmPct();
+            flipRelist2WmPct.onchange = () => {
+                const v = setFlipRelist2WmPct(flipRelist2WmPct.value);
+                flipRelist2WmPct.value = v;
+                wmLog(`💸 Flip Seller : relist #2+ → <b>${v}% de la moyenne WM</b>.`);
             };
         }
 
@@ -15695,7 +15796,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? '🎯 Hunter en mode <b>dynamique</b> (sous la référence prix)'
+                        ? '🎯 Hunter en mode <b>dynamique</b> (% de la moyenne WM fraîche)'
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
                 }
             };
@@ -15704,7 +15805,7 @@
         // Ratio adaptatif
         autoSnipeRatioInput.onchange = () => {
             let pct = parseInt(autoSnipeRatioInput.value, 10);
-            if (!Number.isFinite(pct) || pct < 1) pct = 75;
+            if (!Number.isFinite(pct) || pct < 1) pct = 40;
             if (pct > 200) pct = 200;
             autoSnipeRatioInput.value = pct;
             setSetting('autoSnipeAdaptiveRatio', pct / 100);
