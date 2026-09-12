@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '2.9.0';
+    const WM_VERSION = '2.9.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3805,6 +3805,7 @@
             auctionCols: typeof AUCTION_COLS === 'string' && AUCTION_COLS.includes('id'),
             queryAuctions: typeof queryAuctions === 'function',
             fetchAuctionsByIds: typeof fetchAuctionsByIds === 'function',
+            lastSalesProbe: typeof window.wmLastSales === 'function',
             supabaseSelect: typeof supabaseSelect === 'function',
             currentUserId: typeof currentUserId === 'function'
         };
@@ -13051,6 +13052,353 @@
     }
 
 
+
+    /* ── v2.9.1 : sonde des dernières ventes via `auctions` ──
+       But : vérifier si la RLS normale du compte expose l'historique final_price par
+       card_id + rareté. Aucun endpoint PRO n'est contourné : cette fonction utilise
+       strictement le JWT utilisateur déjà employé par WMaster pour `auctions`. */
+    async function fetchLastVisibleSalesFromAuctions(cardId, rarity = '', limit = 10) {
+        const id = String(cardId || '').trim();
+        const rr = String(rarity || '').trim().toUpperCase();
+        const lim = Math.max(1, Math.min(50, Number(limit) || 10));
+
+        if (!id) {
+            return {
+                ok: false,
+                httpStatus: null,
+                error: 'card_id manquant',
+                rows: []
+            };
+        }
+
+        const auth = getSupabaseAccessToken();
+        const token = auth?.token || null;
+        if (!token) {
+            return {
+                ok: false,
+                httpStatus: null,
+                error: 'JWT utilisateur absent — connecte-toi au site',
+                rows: []
+            };
+        }
+
+        const filters = [
+            `card_id=eq.${encodeURIComponent(id)}`,
+            'winner_id=not.is.null',
+            'final_price=not.is.null'
+        ];
+
+        if (rr) {
+            filters.push(`snapshot_rarity=eq.${encodeURIComponent(rr)}`);
+        }
+
+        const select = [
+            'id',
+            'card_id',
+            'snapshot_rarity',
+            'final_price',
+            'settled_at',
+            'end_at',
+            'status',
+            'winner_id',
+            'seller_id',
+            'created_at'
+        ].join(',');
+
+        const path =
+            `auctions?${filters.join('&')}` +
+            `&select=${select}` +
+            `&order=settled_at.desc.nullslast,end_at.desc` +
+            `&limit=${lim}`;
+
+        let res;
+        let body = '';
+
+        try {
+            res = await fetchWithTimeout(`${SUPABASE_URL}/${path}`, {
+                credentials: 'omit',
+                headers: {
+                    'apikey': SUPABASE_KEY,
+                    'Authorization': `Bearer ${token}`,
+                    'Accept': 'application/json'
+                }
+            });
+            body = await res.text();
+        } catch (e) {
+            return {
+                ok: false,
+                httpStatus: null,
+                error: e?.message || String(e),
+                rows: [],
+                path
+            };
+        }
+
+        if (!res.ok) {
+            let parsed = null;
+            try { parsed = JSON.parse(body); } catch (e) { }
+
+            return {
+                ok: false,
+                httpStatus: res.status,
+                error:
+                    parsed?.message ||
+                    parsed?.error ||
+                    parsed?.hint ||
+                    body ||
+                    `HTTP ${res.status}`,
+                code: parsed?.code || null,
+                details: parsed?.details || null,
+                rows: [],
+                contentRange: res.headers?.get?.('content-range') || null,
+                path
+            };
+        }
+
+        let rows = [];
+        try {
+            const parsed = JSON.parse(body);
+            rows = Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            return {
+                ok: false,
+                httpStatus: res.status,
+                error: 'Réponse JSON illisible',
+                rows: [],
+                raw: body.slice(0, 1000),
+                path
+            };
+        }
+
+        return {
+            ok: true,
+            httpStatus: res.status,
+            rows,
+            contentRange: res.headers?.get?.('content-range') || null,
+            path
+        };
+    }
+
+    function summarizeLastVisibleSales(probe, cardId, rarity, wmAverage = null) {
+        const rows = Array.isArray(probe?.rows) ? probe.rows : [];
+        const prices = rows
+            .map(r => Number(r?.final_price))
+            .filter(v => Number.isFinite(v) && v > 0);
+
+        const recentAverage = prices.length
+            ? Math.round(prices.reduce((a, b) => a + b, 0) / prices.length)
+            : null;
+
+        const wm = Number(wmAverage);
+        const ratioToWm =
+            Number.isFinite(recentAverage) &&
+                recentAverage > 0 &&
+                Number.isFinite(wm) &&
+                wm > 0
+                ? Math.round((recentAverage / wm) * 1000) / 10
+                : null;
+
+        return {
+            version: WM_VERSION,
+            cardId,
+            rarete: String(rarity || '').trim().toUpperCase() || 'toutes',
+            accessible: !!probe?.ok,
+            httpStatus: probe?.httpStatus ?? null,
+            lignesVisibles: rows.length,
+            prix: prices,
+            derniereVente: prices[0] ?? null,
+            moyenneVentesVisibles: recentAverage,
+            moyenneWM:
+                Number.isFinite(wm) && wm > 0
+                    ? wm
+                    : null,
+            marcheRecentSurWM_Pct: ratioToWm,
+            erreur: probe?.ok ? null : (probe?.error || 'échec inconnu'),
+            code: probe?.code || null,
+            contentRange: probe?.contentRange || null
+        };
+    }
+
+    window.wmLastSales = async function (cardId, rarity = '', limit = 10) {
+        const id = String(cardId || '').trim();
+        const rr = String(rarity || '').trim().toUpperCase();
+        const lim = Math.max(1, Math.min(50, Number(limit) || 10));
+
+        if (!id) {
+            console.warn(
+                'Usage : await wmLastSales("CARD_ID", "UR", 10)'
+            );
+            return null;
+        }
+
+        // La moyenne WM n'est là que pour COMPARER, jamais pour fabriquer les ventes.
+        await fetchWmOfficialSummary(id, true).catch(() => null);
+        const wmAverage = rr ? getWmOfficialAverage(id, rr) : null;
+
+        const probe = await fetchLastVisibleSalesFromAuctions(id, rr, lim);
+        const summary = summarizeLastVisibleSales(
+            probe,
+            id,
+            rr,
+            wmAverage
+        );
+
+        console.log('[WikiMasters][LastSalesProbe]', {
+            summary,
+            rows: probe?.rows || [],
+            path: probe?.path || null
+        });
+
+        console.table(summary);
+
+        if (probe?.ok && Array.isArray(probe.rows) && probe.rows.length) {
+            console.table(
+                probe.rows.map((r, i) => ({
+                    n: i + 1,
+                    auctionId: r.id,
+                    rarete: r.snapshot_rarity || '?',
+                    finalPrice: r.final_price,
+                    settledAt: r.settled_at,
+                    endAt: r.end_at,
+                    status: r.status
+                }))
+            );
+
+            wmLog(
+                `🧪 Historique auctions : <b>${probe.rows.length}</b> vente(s) visible(s) ` +
+                `[${rr || 'toutes'}] · ` +
+                `moy. récente <b>${summary.moyenneVentesVisibles ?? '—'} 💰</b>` +
+                (summary.marcheRecentSurWM_Pct != null
+                    ? ` · <b>${summary.marcheRecentSurWM_Pct}%</b> de la moy. WM`
+                    : '')
+            );
+        } else if (probe?.ok) {
+            console.warn(
+                '[WikiMasters] Requête auctions autorisée mais 0 vente visible. ' +
+                'Cela peut signifier : aucune vente correspondante OU lignes historiques filtrées par la RLS.'
+            );
+            wmLog(
+                `🧪 Historique auctions : requête autorisée mais <b>0 ligne visible</b> ` +
+                `[${rr || 'toutes'}]. Impossible de distinguer « aucune vente » d'un filtrage RLS silencieux.`
+            );
+        } else {
+            console.warn(
+                '[WikiMasters] Historique auctions non accessible :',
+                probe?.httpStatus,
+                probe?.error
+            );
+            wmLog(
+                `🧪 Historique auctions : <b style="color:#ef4444;">échec</b>` +
+                `${probe?.httpStatus ? ` HTTP ${probe.httpStatus}` : ''} · ` +
+                `${htmlEsc(probe?.error || 'inconnu')}`
+            );
+        }
+
+        return {
+            ...summary,
+            rows: probe?.rows || [],
+            queryPath: probe?.path || null
+        };
+    };
+
+    window.wmLastSalesByTitle = async function (
+        title,
+        rarity = '',
+        limit = 10,
+        silent = false
+    ) {
+        const q = String(title || '').trim();
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (!q) return [];
+
+        const cards = await findCardsByTitleForOfficialPrice(q);
+        if (!Array.isArray(cards) || cards.length === 0) {
+            if (!silent) {
+                console.warn(`[WikiMasters] Carte introuvable : "${q}"`);
+            }
+            return [];
+        }
+
+        const ql = q.toLocaleLowerCase('fr-FR');
+        const exact = cards.filter(
+            c => String(c?.title || '').toLocaleLowerCase('fr-FR') === ql
+        );
+        const selected = exact.length ? exact : cards.slice(0, 5);
+
+        const targets = [];
+        const dedup = new Set();
+
+        for (const c of selected) {
+            const official =
+                await fetchWmOfficialSummary(c.cardId, true).catch(() => null);
+
+            const rarities = rr
+                ? [rr]
+                : [...new Set(
+                    [
+                        c.rarity,
+                        ...Object.keys(official?.summary || {})
+                    ]
+                        .filter(Boolean)
+                        .map(x => String(x).toUpperCase())
+                )];
+
+            for (const r of rarities) {
+                const key = `${c.cardId}|${r}`;
+                if (dedup.has(key)) continue;
+                dedup.add(key);
+                targets.push({
+                    cardId: c.cardId,
+                    title: official?.title || c.title,
+                    rarity: r
+                });
+            }
+        }
+
+        const out = [];
+        for (const t of targets.slice(0, 12)) {
+            const probe = await fetchLastVisibleSalesFromAuctions(
+                t.cardId,
+                t.rarity,
+                limit
+            );
+            const wmAverage = getWmOfficialAverage(t.cardId, t.rarity);
+            const summary = summarizeLastVisibleSales(
+                probe,
+                t.cardId,
+                t.rarity,
+                wmAverage
+            );
+
+            out.push({
+                carte: t.title,
+                ...summary,
+                rows: probe?.rows || []
+            });
+
+            // Évite une rafale si plusieurs raretés sont testées.
+            await new Promise(r => setTimeout(r, 100));
+        }
+
+        if (!silent) {
+            console.table(
+                out.map(x => ({
+                    carte: x.carte,
+                    rarete: x.rarete,
+                    http: x.httpStatus,
+                    lignes: x.lignesVisibles,
+                    derniere: x.derniereVente,
+                    moyRecente: x.moyenneVentesVisibles,
+                    moyWM: x.moyenneWM,
+                    ratioPct: x.marcheRecentSurWM_Pct,
+                    erreur: x.erreur
+                }))
+            );
+        }
+
+        return out;
+    };
+
     /* ── Pseudos des enchérisseurs dans "Ventes actives" ──
        La table `auctions` expose current_bidder_id mais pas forcément le profil associé.
        L'API marketplace normale, elle, renvoie déjà `current_bidder.username` dans ses
@@ -14837,8 +15185,10 @@
                                 <option value="">Toutes</option><option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option><option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
                             </select>
                             <button id="wm-price-btn" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(6,182,212,.45);background:rgba(6,182,212,.10);color:#67e8f9;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">Prix WM</button>
+                            <button id="wm-last-sales-btn" title="Teste les 10 dernières ventes visibles dans la table auctions avec ta RLS normale" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);color:#fbbf24;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">🧪 10 ventes</button>
                         </div>
                         <div id="wm-price-result" style="margin-top:5px;min-height:13px;font-size:10px;color:#777;line-height:1.45;">Tape une carte puis Entrée.</div>
+                        <div id="wm-last-sales-result" style="margin-top:5px;min-height:13px;font-size:9px;color:#777;line-height:1.45;"></div>
                     </div>
 
                     <div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
@@ -15461,6 +15811,8 @@
         const priceRaritySelect = document.getElementById('wm-price-rarity');
         const priceLookupBtn = document.getElementById('wm-price-btn');
         const priceLookupResult = document.getElementById('wm-price-result');
+        const lastSalesLookupBtn = document.getElementById('wm-last-sales-btn');
+        const lastSalesLookupResult = document.getElementById('wm-last-sales-result');
 
         async function runOfficialPriceLookupUi() {
             if (!priceLookupInput || !priceLookupResult) return;
@@ -15479,8 +15831,63 @@
             }
         }
         if (priceLookupBtn) priceLookupBtn.onclick = runOfficialPriceLookupUi;
-        if (priceLookupInput) priceLookupInput.onkeydown = (e) => { if (e.key === 'Enter') { e.preventDefault(); runOfficialPriceLookupUi(); } };
-        if (priceRaritySelect) priceRaritySelect.onchange = () => { if (String(priceLookupInput?.value || '').trim()) runOfficialPriceLookupUi(); };
+
+        async function runLastSalesLookupUi() {
+            if (!priceLookupInput || !lastSalesLookupResult) return;
+
+            const q = String(priceLookupInput.value || '').trim();
+            const rarity = String(priceRaritySelect?.value || '').trim().toUpperCase();
+
+            if (!q) {
+                lastSalesLookupResult.innerHTML =
+                    '<span style="color:#777;">Tape d’abord le nom d’une carte.</span>';
+                priceLookupInput.focus();
+                return;
+            }
+
+            if (lastSalesLookupBtn) {
+                lastSalesLookupBtn.disabled = true;
+                lastSalesLookupBtn.textContent = '🧪 …';
+            }
+
+            lastSalesLookupResult.innerHTML =
+                '<span style="color:#777;">Test RLS auctions en cours…</span>';
+
+            try {
+                const rows = await window.wmLastSalesByTitle(
+                    q,
+                    rarity,
+                    10,
+                    true
+                );
+                lastSalesLookupResult.innerHTML =
+                    quickLastSalesRowsHtml(rows, q);
+            } catch (e) {
+                lastSalesLookupResult.innerHTML =
+                    `<span style="color:#ef4444;">Erreur : ${htmlEsc(e?.message || String(e))}</span>`;
+            } finally {
+                if (lastSalesLookupBtn) {
+                    lastSalesLookupBtn.disabled = false;
+                    lastSalesLookupBtn.textContent = '🧪 10 ventes';
+                }
+            }
+        }
+
+        if (lastSalesLookupBtn) {
+            lastSalesLookupBtn.onclick = runLastSalesLookupUi;
+        }
+
+        if (priceLookupInput) priceLookupInput.onkeydown = (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                runOfficialPriceLookupUi();
+            }
+        };
+        if (priceRaritySelect) priceRaritySelect.onchange = () => {
+            if (String(priceLookupInput?.value || '').trim()) {
+                runOfficialPriceLookupUi();
+            }
+        };
 
         // Barre de recherche du watcher : filtre live des annonces affichées
         const marketSearchInput = document.getElementById('wm-market-search');
@@ -18950,6 +19357,69 @@
         }).join('');
     }
 
+
+    function quickLastSalesRowsHtml(rows, query = '') {
+        if (!Array.isArray(rows) || rows.length === 0) {
+            return `<span style="color:#f59e0b;">Aucune carte trouvée pour « ${htmlEsc(query)} ».</span>`;
+        }
+
+        return rows.map(r => {
+            if (!r?.accessible) {
+                return `<div style="padding:4px 0;border-top:1px solid rgba(255,255,255,.035);">
+                    <b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b>
+                    <span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span>
+                    <div style="color:#ef4444;">
+                        API auctions : échec${r?.httpStatus ? ` HTTP ${r.httpStatus}` : ''} ·
+                        ${htmlEsc(r?.erreur || 'inconnu')}
+                    </div>
+                </div>`;
+            }
+
+            if (!Array.isArray(r.rows) || r.rows.length === 0) {
+                return `<div style="padding:4px 0;border-top:1px solid rgba(255,255,255,.035);">
+                    <b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b>
+                    <span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span>
+                    <div style="color:#f59e0b;">
+                        HTTP ${r.httpStatus} · 0 vente visible via RLS
+                    </div>
+                    <div style="color:#555;">
+                        Ne permet pas encore de distinguer « aucune vente » d'un filtrage historique.
+                    </div>
+                </div>`;
+            }
+
+            const prices = r.rows
+                .map(x => Number(x?.final_price))
+                .filter(v => Number.isFinite(v) && v > 0);
+
+            const pricesHtml = prices
+                .map((p, i) =>
+                    `<span style="color:${i === 0 ? '#fff' : '#aaa'};">${p.toLocaleString('fr-FR')}</span>`
+                )
+                .join(' · ');
+
+            const comparison =
+                r.marcheRecentSurWM_Pct != null
+                    ? ` · récent/WM <b style="color:#fbbf24;">${r.marcheRecentSurWM_Pct}%</b>`
+                    : '';
+
+            return `<div style="padding:4px 0;border-top:1px solid rgba(255,255,255,.035);">
+                <div>
+                    <b style="color:#eee;">${htmlEsc(r?.carte || '?')}</b>
+                    <span style="color:#67e8f9;"> [${htmlEsc(r?.rarete || '?')}]</span>
+                    <span style="color:#4ade80;"> · ${prices.length} vente(s) visible(s)</span>
+                </div>
+                <div style="color:#888;">
+                    ${pricesHtml || '—'}
+                </div>
+                <div style="color:#777;">
+                    moy. visible <b>${r.moyenneVentesVisibles ?? '—'}</b> ·
+                    moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
+                </div>
+            </div>`;
+        }).join('');
+    }
+
     window.wmPrice = async function (title, rarity = '', silent = false) {
         const q = String(title || '').trim(), wantedRarity = String(rarity || '').trim().toUpperCase();
         if (!q) { console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")'); return []; }
@@ -18981,8 +19451,8 @@
         ============================================================ */
 
     wmLog(
-        `💰 v2.8.0 : prix automatiques basés uniquement sur la moyenne officielle WikiMasters · ` +
-        `ancien collecteur local désactivé.`
+        `🧪 v2.9.1 : sonde des 10 dernières ventes via auctions ajoutée · ` +
+        `stratégie 2.9.0 Hunter/Flip inchangée.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
