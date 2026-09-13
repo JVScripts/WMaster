@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.3.2';
+    const WM_VERSION = '3.4.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3192,6 +3192,7 @@
                 price_not_applied: 'prix calculé non appliqué au formulaire — vente annulée',
                 duration_not_applied: 'durée non appliquée au formulaire — vente annulée',
                 form_changed_before_launch: 'prix/durée modifiés par le site avant lancement — vente annulée',
+                server_listing_mismatch_cancelled: 'listing serveur incohérent — annulé automatiquement',
                 launch_button_disabled: 'bouton de lancement désactivé',
                 modal_still_open: 'mise en vente refusée par le site'
             };
@@ -5130,7 +5131,7 @@
          - >=30%              -> référence = moyenne pondérée récence
 
        Hunter :
-         >=10 ventes ET moyenne robuste > 500 -> 70% de la référence Trend-Aware v2
+         >=10 ventes ET moyenne robuste > 790 -> 70% de la référence Trend-Aware v2
          sinon -> AUCUNE mise automatique dynamique
 
        Flip :
@@ -5479,13 +5480,13 @@
     // v3.1.0 — Hunter RECENT MARKET + TREND-AWARE.
     // Conditions obligatoires :
     // - au moins HUNTER_RECENT_MIN_SALES (=10) ventes valides
-    // - moyenne robuste STRICTEMENT supérieure à 500
+    // - moyenne robuste STRICTEMENT supérieure à 790
     // - la valeur d'achat est ensuite la référence Trend-Aware
     // - référence récente <= 60 s pour décider
     // - référence récente <= 5 s juste avant une mise
     //
     // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
-    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 500;
+    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 790;
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
@@ -5510,9 +5511,9 @@
     function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
         const ref = Number(reference);
 
-        // Le seuil >500 porte volontairement sur la MOYENNE ROBUSTE dans
+        // Le seuil >790 porte volontairement sur la MOYENNE ROBUSTE dans
         // getHunterPricingReference()/ensureFreshHunterReference().
-        // Ici, la référence Trend-Aware peut légitimement tomber sous 500
+        // Ici, la référence Trend-Aware peut légitimement tomber sous 790
         // en cas de forte baisse ; on applique alors simplement 70% de cette valeur.
         if (
             kind !== 'recent_market' ||
@@ -5595,7 +5596,7 @@
             maxAgeMs
         );
 
-        // Fail-safe : API inaccessible, <10 ventes Hunter, robuste <=500,
+        // Fail-safe : API inaccessible, <10 ventes Hunter, robuste <=790,
         // ou référence Trend-Aware v2 invalide => aucune mise.
         if (
             !recent?.ok ||
@@ -5737,7 +5738,7 @@
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.3.1 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec >=10 ventes et moyenne robuste STRICTEMENT > 500.
+    //   avec >=10 ventes et moyenne robuste STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
@@ -11675,9 +11676,19 @@
         const soleTagOnly = getSetting('sellOnlyIfSoleTag');
         let skippedMultiTag = 0;
         let skippedPendingTrade = 0;
+        let skippedFlipProtected = 0;
         const filterTrash = (items) => items.filter(item => {
             const tags = item.tags || [];
             if (!tags.some(t => t.name === sellTag)) return false;
+
+            // v3.3.3 — le tag Flip `vente` est réservé. Même si l'option « seul tag » est
+            // désactivée, Trash Seller n'a jamais le droit de consommer cet exemplaire.
+            const hasFlipTag = tags.some(t =>
+                String(t?.name || '').trim().toLocaleLowerCase('fr-FR') === FLIP_TAG_NAME.toLocaleLowerCase('fr-FR') ||
+                (FLIP_TAG_ID && (t?.id === FLIP_TAG_ID || t?.tag_id === FLIP_TAG_ID))
+            );
+            if (hasFlipTag) { skippedFlipProtected++; return false; }
+
             if (soleTagOnly && tags.some(t => t.name !== sellTag)) { skippedMultiTag++; return false; }
             // Exclut les cartes engagées dans un échange en attente (409), le temps du cooldown.
             const cid = item.card_id || item.card?.id;
@@ -11763,6 +11774,9 @@
         wmLog(`🔍 Scan Trash : <b>${trashCards.length}</b> cartes tagguées (${newlyTagged.length > 0 ? `+${newlyTagged.length} depuis dernier scan` : 'inchangé'})${rarityStr ? ` — <span style="color:#888;">${rarityStr}</span>` : ''}`);
         if (skippedMultiTag > 0) {
             wmLog(`🛡️ Filet de sécurité : <b>${skippedMultiTag}</b> carte(s) « ${sellTag} » ignorée(s) (elles portent aussi un autre tag)`);
+        }
+        if (skippedFlipProtected > 0) {
+            wmLog(`🛡️ Protection Flip : <b>${skippedFlipProtected}</b> carte(s) portant le tag <b>vente</b> exclue(s) du Trash Seller.`);
         }
         if (skippedPendingTrade > 0) {
             wmLog(`⏸️ <b>${skippedPendingTrade}</b> carte(s) exclue(s) temporairement (engagée(s) dans un échange en attente) — réessai après ${PENDING_TRADE_COOLDOWN_MS / 60000} min`);
@@ -12249,6 +12263,46 @@
        qui n'est pas affichée à l'écran). */
     const DURATION_BUTTON_LABELS = { 10: '10 min', 30: '30 min', 60: '1 h', 180: '3 h', 360: '6 h', 720: '12 h', 1440: '24 h' };
     let _lastUiListingAuctionId = null; // rempli par installPackInterceptor à la volée
+    let _activeUiListingCapture = null; // { cardId, auctionId, startedAt } pendant UN listing UI
+
+    // v3.3.3 — verrou global de création d'enchère.
+    // Trash Seller et Flip Seller utilisent tous deux /api/marketplace / le même modal React.
+    // Sans sérialisation, deux ventes pouvaient se chevaucher : un module réécrivait le prix
+    // pendant que l'autre lançait l'enchère, ou l'auction_id global capturait la vente voisine.
+    let marketplaceCreateLockTail = Promise.resolve();
+    let marketplaceCreateLockSeq = 0;
+    let marketplaceCreateLockOwner = null;
+
+    async function withMarketplaceCreateLock(owner, fn) {
+        const id = ++marketplaceCreateLockSeq;
+        let releaseGate;
+        const gate = new Promise(resolve => { releaseGate = resolve; });
+        const previous = marketplaceCreateLockTail;
+        marketplaceCreateLockTail = previous.then(() => gate);
+        await previous;
+
+        marketplaceCreateLockOwner = {
+            id,
+            owner: String(owner || 'listing'),
+            startedAt: Date.now()
+        };
+
+        try {
+            return await fn();
+        } finally {
+            if (marketplaceCreateLockOwner?.id === id) marketplaceCreateLockOwner = null;
+            releaseGate();
+        }
+    }
+
+    window.wmMarketplaceCreateLockDiag = () => ({
+        locked: !!marketplaceCreateLockOwner,
+        owner: marketplaceCreateLockOwner?.owner || null,
+        ageMs: marketplaceCreateLockOwner
+            ? Math.max(0, Date.now() - marketplaceCreateLockOwner.startedAt)
+            : 0,
+        sequence: marketplaceCreateLockSeq
+    });
 
     // Écrire .value directement sur un input contrôlé React ne déclenche pas son onChange
     // (React a surchargé le setter sur l'instance, pas sur le prototype) : il faut passer par
@@ -12315,7 +12369,7 @@
 
     // Tentative "légère" : sert uniquement à sonder si l'API remarche, pas à gérer tous les cas
     // d'erreur comme l'ancienne version de sellBatch() — sur échec on bascule sur sellCardViaUI.
-    async function trySellViaApi(cardId, price, duration) {
+    async function trySellViaApiUnlocked(cardId, price, duration) {
         try {
             const res = await fetch("https://www.wiki-masters.com/api/marketplace", {
                 method: "POST", credentials: "include",
@@ -12328,6 +12382,13 @@
         } catch (e) {
             return { ok: false };
         }
+    }
+
+    async function trySellViaApi(cardId, price, duration) {
+        return withMarketplaceCreateLock(
+            `trash-api:${String(cardId || '').slice(0, 8)}`,
+            () => trySellViaApiUnlocked(cardId, price, duration)
+        );
     }
 
     // S'assure qu'on est sur /collection avant de continuer. Après une vente, le site navigue
@@ -12655,6 +12716,13 @@
     }
 
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
+        return withMarketplaceCreateLock(
+            `ui:${title || String(cardId || '').slice(0, 8)}`,
+            () => sellCardViaUIUnlocked(cardId, title, rarity, price, duration)
+        );
+    }
+
+    async function sellCardViaUIUnlocked(cardId, title, rarity, price, duration) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
         const requestedPrice = Math.max(1, Math.round(Number(price) || 0));
@@ -12794,16 +12862,26 @@
         );
 
         _lastUiListingAuctionId = null;
+        _activeUiListingCapture = {
+            cardId: String(cardId || ''),
+            auctionId: null,
+            startedAt: Date.now()
+        };
         launchBtn.click();
 
         await new Promise(r => setTimeout(r, 900));
+
+        // Snapshot puis libération du contexte de capture : une vente manuelle ultérieure ne
+        // peut plus écraser l'auction_id associé à CET appel.
+        const capturedAuctionId = _activeUiListingCapture?.auctionId || null;
+        _activeUiListingCapture = null;
 
         // Si le modal existe encore, le site a refusé ou n'a pas encore accepté le listing.
         if (document.body.contains(launchBtn)) {
             return { ok: false, reason: 'modal_still_open' };
         }
 
-        let createdAuctionId = _lastUiListingAuctionId;
+        let createdAuctionId = capturedAuctionId || _lastUiListingAuctionId;
         if (!createdAuctionId) {
             const m = location.pathname.match(/\/marketplace\/([0-9a-f-]{20,})/i);
             if (m) createdAuctionId = m[1];
@@ -12825,6 +12903,9 @@
                 if (Number.isFinite(serverPrice)) actualPrice = serverPrice;
                 if (Number.isFinite(serverDuration)) actualDurationMin = serverDuration;
 
+                const serverCardId = String(row.card_id || '');
+                const cardMismatch = !!serverCardId && serverCardId !== String(cardId || '');
+
                 const priceMismatch =
                     Number.isFinite(serverPrice) &&
                     serverPrice !== requestedPrice;
@@ -12833,16 +12914,52 @@
                     Number.isFinite(serverDuration) &&
                     Math.abs(serverDuration - requestedDuration) > 1;
 
-                if (priceMismatch || durationMismatch) {
+                if (cardMismatch || priceMismatch || durationMismatch) {
                     anomaly =
                         `ANOMALIE listing serveur : demandé ${requestedPrice} 💰 / ` +
                         `${DURATION_BUTTON_LABELS[requestedDuration] || requestedDuration + ' min'}, ` +
                         `créé ${Number.isFinite(serverPrice) ? serverPrice : '?'} 💰 / ` +
-                        `${Number.isFinite(serverDuration) ? serverDuration + ' min' : '?'}`;
+                        `${Number.isFinite(serverDuration) ? serverDuration + ' min' : '?'}` +
+                        `${cardMismatch ? ' · card_id différent' : ''}`;
 
                     wmLog(
-                        `🚨 Flip Seller : <b>${title}</b> — ${anomaly}. ` +
-                        `Aucun deuxième listing ne sera créé.`
+                        `🚨 Flip Seller : <b>${title}</b> — ${anomaly}.`
+                    );
+
+                    // Si c'est bien la carte attendue et qu'aucune mise n'existe encore,
+                    // annule immédiatement le listing dangereux au lieu de laisser partir une
+                    // carte très sous-évaluée. Si l'annulation échoue / une mise existe déjà,
+                    // on garde le suivi sur l'enchère réelle et on NE crée jamais un doublon.
+                    if (!cardMismatch && !row.current_bidder_id) {
+                        try {
+                            const cancelRes = await fetch(
+                                `https://www.wiki-masters.com/api/marketplace/${createdAuctionId}`,
+                                { method: 'DELETE', credentials: 'include' }
+                            );
+                            if (cancelRes.ok) {
+                                wmLog(
+                                    `🛑 Flip Seller : listing incohérent annulé automatiquement → ` +
+                                    `<b>${title}</b> · demandé ${requestedPrice} 💰, créé ${Number.isFinite(serverPrice) ? serverPrice : '?'} 💰.`
+                                );
+                                invalidateSalesDetail();
+                                await ensureOnCollectionPage();
+                                return {
+                                    ok: false,
+                                    reason: 'server_listing_mismatch_cancelled',
+                                    auctionId: createdAuctionId,
+                                    actualPrice: serverPrice,
+                                    actualDurationMin: serverDuration,
+                                    anomaly,
+                                    requestedPrice,
+                                    requestedDuration
+                                };
+                            }
+                        } catch (e) { }
+                    }
+
+                    wmLog(
+                        `⚠️ Flip Seller : listing incohérent conservé sous surveillance ` +
+                        `(annulation auto impossible ou enchère déjà mise). Aucun deuxième listing ne sera créé.`
                     );
                 }
             }
@@ -12977,6 +13094,18 @@
             removeFromTrashPoolCache(cardId);
         }
     }
+    function flipProtectsCollectionCard(cardId, rarity) {
+        const cid = String(cardId || '');
+        const rr = String(rarity || '').toUpperCase();
+        if (!cid) return false;
+        return flipLedger.some(rec =>
+            rec &&
+            rec.cardId === cid &&
+            (!rr || !rec.rarity || String(rec.rarity).toUpperCase() === rr) &&
+            (rec.status === 'tagged' || rec.status === 'pending_tag')
+        );
+    }
+
     async function sellBatch(cards, statusEl) {
         let sold = 0, skipped = 0, deferred = 0;
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
@@ -12987,6 +13116,15 @@
             const duration = getSellDuration(rarity);
             const title = item.card?.wikipedia_title || item.wikipedia_title || '?';
             if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${title}`); continue; }
+
+            // Une copie Flip de même carte/rareté présente dans la collection rend le ciblage
+            // DOM ambigu (le site ne donne pas le user_card_id sur la tuile). Dans ce cas Trash
+            // attend : mieux vaut bloquer temporairement un doublon que vendre le Flip au prix Trash.
+            if (flipProtectsCollectionCard(cardId, rarity)) {
+                skipped++;
+                wmLog(`🛡️ Trash Seller : <b>${title}</b> [${rarity}] ignoré — exemplaire Flip protégé présent dans la collection.`);
+                continue;
+            }
 
             // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
             const priceInfo = await resolveSellBasePrice(rarity, cardId);
@@ -16735,7 +16873,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.3.2 Trend-Aware v2 : jusqu’à 15 ventes, minimum strict <b>10 ventes</b> pour acheter comme pour vendre. Extrêmes filtrés avant tendance/pondération (2 basses + 2 hautes), puis 5 dernières filtrées vs 5 précédentes ; bascule robuste → récence entre 15% et 30%, puis <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Toujours sous protection de la marge mini.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.0 Trend-Aware v2 + Listing Safety : jusqu’à 15 ventes, minimum strict <b>10 ventes</b> pour acheter comme pour vendre, et Hunter bloqué si la robuste ≤ <b>790</b>. Extrêmes filtrés avant tendance/pondération (2 basses + 2 hautes), puis 5 dernières filtrées vs 5 précédentes ; bascule robuste → récence entre 15% et 30%, puis <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Toujours sous protection de la marge mini.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -20110,6 +20248,7 @@
             // l'associer à sellHistory. Déclarée ici (comme les variables au-dessus) pour rester
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
+            let marketplaceCreateCardId = null;
             let shouldHarvestUsernames = false;
             let isMarketplaceListScan = false;
             try {
@@ -20124,6 +20263,12 @@
                 // stricte sur l'URL absolue ne matchait jamais, donc auctionId restait toujours
                 // null (bug du 2026-08-20 : plus de re-tag Trash sur les invendus).
                 isMarketplaceCreate = method === 'POST' && /\/api\/marketplace(\?|$)/.test(url);
+                if (isMarketplaceCreate && args[1] && typeof args[1].body === 'string') {
+                    try {
+                        const payload = JSON.parse(args[1].body);
+                        marketplaceCreateCardId = payload?.card_id || payload?.cardId || null;
+                    } catch (e) { }
+                }
 
                 // Les pages de scan marketplace sont volumineuses et déjà parsées par le moteur.
                 // Les cloner + JSON.parse une DEUXIÈME fois juste pour récolter des pseudos
@@ -20200,7 +20345,24 @@
                 p.then(res => {
                     if (res && res.ok) {
                         res.clone().json().then(d => {
-                            if (d && d.auction_id) _lastUiListingAuctionId = d.auction_id;
+                            if (!d?.auction_id) return;
+
+                            const cap = _activeUiListingCapture;
+                            if (cap) {
+                                const requestCard = String(marketplaceCreateCardId || '');
+                                const expectedCard = String(cap.cardId || '');
+
+                                // Quand le payload expose card_id, exige le match exact.
+                                // Si le navigateur masque le body du Request, le verrou global
+                                // garantit au moins qu'aucune autre création WMaster ne chevauche.
+                                if (!requestCard || requestCard === expectedCard) {
+                                    cap.auctionId = d.auction_id;
+                                    _lastUiListingAuctionId = d.auction_id;
+                                }
+                                return;
+                            }
+
+                            _lastUiListingAuctionId = d.auction_id;
                         }).catch(() => { });
                     }
                 }).catch(() => { });
