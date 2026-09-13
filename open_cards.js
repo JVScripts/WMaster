@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.1.0';
+    const WM_VERSION = '3.2.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -30,7 +30,11 @@
     const MARKET_TIMER_SYNC_WINDOW_MS = 20_000;   // synchro serveur à partir de T-20s
     const MARKET_TIMER_SYNC_GRACE_MS = 5_000;     // continue 5s après l'ancien zéro
     const MARKET_TIMER_SYNC_INTERVAL_MS = 250;    // synchro serveur 4 fois/s
-    const MARKET_COUNTDOWN_TICK_MS = 100;          // affichage du compteur 10 fois/s
+    const MARKET_COUNTDOWN_TICK_MS = 100;          // affichage uniquement ; aucun impact sur le moteur
+    // v3.2.0 — Hunter autonome : quand le Market Watcher visuel est OFF, le Hunter
+    // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
+    const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // lit jusqu'à T-5m30 pour absorber le jitter de scan
+    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // assez rapide sans scanner inutilement tout le marché
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -191,7 +195,19 @@
 
     function getHunterDynamicCandidatePool(list) {
         if (!Array.isArray(list) || list.length === 0) return [];
-        return list.filter(a => hunterDynamicMatchesSource(a));
+
+        // v3.2.0 : évite de calculer les mots-clés Standards quand la source choisie
+        // est uniquement "Global", et inversement.
+        if (hunterDynamicSource === 'global') {
+            return list.filter(a => globalSearchMatchesAuction(a));
+        }
+        if (hunterDynamicSource === 'both') {
+            return list.filter(a =>
+                standardSearchMatchesAuction(a) ||
+                globalSearchMatchesAuction(a)
+            );
+        }
+        return list.filter(a => standardSearchMatchesAuction(a));
     }
 
     function hunterDynamicSourceLabel(short = false) {
@@ -5140,6 +5156,9 @@
     const RECENT_MARKET_CACHE_TTL_MS = 60 * 1000;
     const RECENT_MARKET_PRE_ACTION_MAX_AGE_MS = 5 * 1000;
     const RECENT_MARKET_FLIP_MAX_STALE_MS = 5 * 60 * 1000;
+    // Le Hunter peut rencontrer énormément de cartes au fil d'une longue session.
+    // Le cache ne doit jamais devenir une archive infinie.
+    const RECENT_MARKET_CACHE_MAX_ENTRIES = 750;
 
     // v3.1.0 — Trend-Aware.
     // Les prix sont ordonnés du plus récent au plus ancien.
@@ -5347,7 +5366,8 @@
             cardId,
             rarity: String(rarity || '').trim().toUpperCase(),
             fetchedAt: Date.now(),
-            rows,
+            // v3.2.0 : ne conserve PAS les 10 objets DB complets dans le cache.
+            // `prices` + les agrégats Trend-Aware suffisent à toutes les décisions.
             newestSaleAt: Number.isFinite(newestTs) ? newestTs : null,
             oldestSaleAt: Number.isFinite(oldestTs) ? oldestTs : null,
             ...calc
@@ -5389,7 +5409,21 @@
 
             // On garde en cache les réponses HTTP 200, y compris <6 ventes :
             // le Hunter peut ainsi bloquer immédiatement sans refaire la requête.
-            if (snap.ok) recentMarketCache.set(key, snap);
+            if (snap.ok) {
+                // Refresh = réinsère en fin de Map pour faire un LRU très léger.
+                recentMarketCache.delete(key);
+                recentMarketCache.set(key, snap);
+
+                while (
+                    recentMarketCache.size >
+                    RECENT_MARKET_CACHE_MAX_ENTRIES
+                ) {
+                    const oldestKey =
+                        recentMarketCache.keys().next().value;
+                    if (!oldestKey) break;
+                    recentMarketCache.delete(oldestKey);
+                }
+            }
 
             return snap;
         })();
@@ -7449,6 +7483,133 @@
         return { auctions: deduped, total, totalPages };
     }
 
+
+    // Fetch léger du Hunter autonome.
+    //
+    // La marketplace est triée "ending_soon". Comme AUCUNE mise automatique n'est
+    // autorisée avant T-5 min, il est inutile de télécharger les dizaines/centaines
+    // de pages situées bien après cette fenêtre lorsque le Market Watcher est OFF.
+    //
+    // On garde 30 s de marge : un scan qui arrive légèrement avant T-5 min aura déjà
+    // la carte au cycle suivant sans trou de découverte.
+    async function fetchHunterActionWindowAuctions(onProgress) {
+        const first = await fetchMarketPage(1);
+        const total = Number(first?.total || 0);
+        const totalPages = Math.max(
+            1,
+            Math.ceil(total / MARKET_PAGE_LIMIT)
+        );
+
+        const cutoff =
+            AUTOMATIC_BID_MAX_REMAINING_MS +
+            HUNTER_HEADLESS_MARGIN_MS;
+
+        const collected = [];
+        let pagesScanned = 0;
+        let boundaryReached = false;
+
+        const consumePage = (data, pageNo) => {
+            const rows = Array.isArray(data?.auctions)
+                ? data.auctions
+                : [];
+
+            pagesScanned++;
+
+            let furthestRemaining = -Infinity;
+            for (const a of rows) {
+                if (!a?.id || !a?.end_at) continue;
+
+                const remaining =
+                    new Date(a.end_at).getTime() -
+                    serverNow();
+
+                if (!Number.isFinite(remaining)) continue;
+
+                furthestRemaining =
+                    Math.max(
+                        furthestRemaining,
+                        remaining
+                    );
+
+                if (
+                    remaining >
+                    -MARKET_TIMER_SYNC_GRACE_MS &&
+                    remaining <= cutoff
+                ) {
+                    collected.push(a);
+                }
+            }
+
+            if (onProgress) {
+                onProgress(
+                    pageNo,
+                    totalPages,
+                    collected.length
+                );
+            }
+
+            // Pages triées par fin proche : dès que la fin d'une page traverse
+            // T-5m30, les pages suivantes sont hors zone utile.
+            if (
+                Number.isFinite(furthestRemaining) &&
+                furthestRemaining > cutoff
+            ) {
+                boundaryReached = true;
+            }
+        };
+
+        consumePage(first, 1);
+
+        for (
+            let start = 2;
+            start <= totalPages && !boundaryReached;
+            start += HUNTER_HEADLESS_PAGE_CONCURRENCY
+        ) {
+            const pages = [];
+            for (
+                let p = start;
+                p < start + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
+                p <= totalPages;
+                p++
+            ) {
+                pages.push(p);
+            }
+
+            const results = await Promise.all(
+                pages.map(
+                    p => fetchMarketPage(p)
+                        .catch(() => ({ auctions: [] }))
+                )
+            );
+
+            for (let i = 0; i < results.length; i++) {
+                consumePage(results[i], pages[i]);
+                if (boundaryReached) break;
+            }
+
+            if (!boundaryReached) {
+                await new Promise(r => setTimeout(r, 50));
+            }
+        }
+
+        // Déduplication : le tri évolue pendant la pagination.
+        const seen = new Set();
+        const auctions = [];
+        for (const a of collected) {
+            if (!a?.id || seen.has(a.id)) continue;
+            seen.add(a.id);
+            auctions.push(a);
+        }
+
+        return {
+            auctions,
+            total,
+            totalPages,
+            pagesScanned,
+            cutoffMs: cutoff
+        };
+    }
+
     /* ===================== MARKET WATCHER ===================== */
 
     // activeHits = Map<auctionId, {auction, endAt}> pour les countdowns en cours
@@ -8096,7 +8257,11 @@
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
             const recentPct = Math.round(Number(getSetting('autoSnipeRecentRatio')) * 100);
-            return `⚡ Hunter Recent ${recentPct}% · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ${hunterDynamicSourceLabel(true)} ${state}${suffix}`;
+            const engine =
+                (!marketWatcherActive && enabled)
+                    ? ' · autonome'
+                    : '';
+            return `⚡ Hunter Trend ${recentPct}% · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -8377,6 +8542,13 @@
             btn.style.color = '#4ade80';
             btn.style.borderColor = 'rgba(74,222,128,0.4)';
             btn.style.background = 'rgba(74,222,128,0.08)';
+
+            // v3.2.0 : en mode Trend-Aware, le Hunter sait désormais découvrir les enchères
+            // tout seul quand le Market Watcher visuel est arrêté.
+            if (getSetting('autoSnipeMode') === 'adaptive') {
+                startHunterHeadlessEngine();
+            }
+
             // Rattrapage : traite aussi les enchères DÉJÀ présentes qui matchent le critère,
             // pas seulement les prochaines. (bidLockSet évite les doublons avec le scan.)
             const activationPool = getSetting('autoSnipeMode') === 'adaptive'
@@ -8394,6 +8566,14 @@
             btn.style.color = '#555';
             btn.style.borderColor = 'rgba(255,255,255,0.1)';
             btn.style.background = 'none';
+
+            // Plus de découverte de nouvelles cartes, mais la Hot Lane reste active si
+            // une enchère déjà engagée / armée doit encore être protégée.
+            stopHunterHeadlessEngine({
+                keepHotLane: hasTrackedHotLaneWork(),
+                silent: true
+            });
+
             // Les enchères déjà armées en fourbe RESTENT armées et tireront : couper le Hunter
             // arrête les nouvelles prises, il n'annule pas ce qui est engagé (même logique que
             // l'auto-bid). Pour tout désarmer, décocher « mode fourbe ».
@@ -10994,11 +11174,295 @@
         );
     }
 
+
+    /* ===================== HUNTER HEADLESS ENGINE v3.2 ===================== */
+
+    let hunterHeadlessActive = false;
+    let hunterHeadlessTimeout = null;
+    let hunterHeadlessScanInProgress = false;
+    const hunterHeadlessStats = {
+        scans: 0,
+        lastScanTs: 0,
+        lastDurationMs: 0,
+        lastPagesScanned: 0,
+        lastAuctionsInWindow: 0,
+        lastCandidates: 0,
+        lastError: ''
+    };
+
+    function hunterHeadlessWanted() {
+        return !!(
+            autoSnipeEnabled &&
+            getSetting('autoSnipeMode') === 'adaptive' &&
+            !marketWatcherActive
+        );
+    }
+
+    function hasTrackedHotLaneWork() {
+        return !!(
+            myBidsSet.size > 0 ||
+            autoBidSet.size > 0 ||
+            snipeSet.size > 0
+        );
+    }
+
+    function seedTrackedAuctionsForHotLane(auctions) {
+        if (!Array.isArray(auctions) || auctions.length === 0) return 0;
+
+        const tracked = new Set([
+            ...myBidsSet,
+            ...autoBidSet,
+            ...snipeSet
+        ]);
+
+        if (tracked.size === 0) return 0;
+
+        let seeded = 0;
+        for (const a of auctions) {
+            if (!a?.id || !tracked.has(a.id) || !a.end_at) continue;
+
+            activeHitsMap.set(
+                a.id,
+                {
+                    auction: a,
+                    endAt: a.end_at
+                }
+            );
+            seeded++;
+        }
+
+        return seeded;
+    }
+
+    async function checkHunterHeadlessMarketplace() {
+        if (!hunterHeadlessWanted()) return;
+
+        if (!navigator.onLine) {
+            hunterHeadlessStats.lastError = 'hors ligne';
+            return;
+        }
+
+        // Même réconciliation des achats gagnés que le Market Watcher.
+        if (Date.now() - lastWonSync > 60000) {
+            lastWonSync = Date.now();
+            syncWonAuctions();
+        }
+
+        // Le solde conditionne les décisions de mise.
+        await fetchBalance();
+
+        const result =
+            await fetchHunterActionWindowAuctions();
+
+        const auctions =
+            Array.isArray(result?.auctions)
+                ? result.auctions
+                : [];
+
+        // Quand le Watcher visuel est OFF, ce cache contient volontairement
+        // uniquement la fenêtre utile à l'action automatique.
+        lastAllMarketAuctions = auctions;
+
+        apiHealth.lastMarketScanTs = Date.now();
+
+        // Sécurité anti auto-surenchère identique au scan complet.
+        auctions.forEach(a => {
+            if (iAmLeading(a)) {
+                trackMyBid(a.id);
+                rememberMyLeadingBid(
+                    a,
+                    a.current_bid ?? a.base_amount
+                );
+            }
+        });
+
+        const hunterCandidates =
+            getHunterDynamicCandidatePool(auctions);
+
+        hunterHeadlessStats.lastPagesScanned =
+            Number(result?.pagesScanned || 0);
+        hunterHeadlessStats.lastAuctionsInWindow =
+            auctions.length;
+        hunterHeadlessStats.lastCandidates =
+            hunterCandidates.length;
+
+        if (hunterCandidates.length > 0) {
+            await runHunterAutoBidPass(
+                hunterCandidates
+            );
+        }
+
+        // Important pour le mode Fourbe et les enchères déjà engagées :
+        // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
+        // passe immédiatement à 150/250 ms dans la zone chaude.
+        seedTrackedAuctionsForHotLane(auctions);
+
+        if (!hotLaneActive) {
+            startHotLane();
+        } else {
+            // Une carte peut apparaître directement à T-8s.
+            // On recalcule immédiatement le prochain tick au lieu d'attendre
+            // l'ancien sommeil de 10 s.
+            scheduleHotLane();
+        }
+    }
+
+    async function runHunterHeadlessLoop() {
+        if (
+            !hunterHeadlessWanted() ||
+            hunterHeadlessScanInProgress
+        ) {
+            return;
+        }
+
+        hunterHeadlessActive = true;
+        hunterHeadlessScanInProgress = true;
+        const startedAt = Date.now();
+
+        try {
+            await checkHunterHeadlessMarketplace();
+            hunterHeadlessStats.scans++;
+            hunterHeadlessStats.lastScanTs = Date.now();
+            hunterHeadlessStats.lastError = '';
+        } catch (e) {
+            hunterHeadlessStats.lastError =
+                String(e?.message || e || 'erreur');
+            console.warn(
+                '[WikiMasters][hunter-headless] scan error:',
+                e
+            );
+        } finally {
+            hunterHeadlessStats.lastDurationMs =
+                Date.now() - startedAt;
+            hunterHeadlessScanInProgress = false;
+        }
+
+        if (!hunterHeadlessWanted()) {
+            hunterHeadlessActive = false;
+            return;
+        }
+
+        const wait = Math.max(
+            MARKET_MIN_GAP_MS,
+            MARKET_REFRESH_MS -
+            hunterHeadlessStats.lastDurationMs
+        );
+
+        hunterHeadlessTimeout = setTimeout(
+            runHunterHeadlessLoop,
+            wait
+        );
+    }
+
+    function startHunterHeadlessEngine({ silent = false } = {}) {
+        if (!hunterHeadlessWanted()) return false;
+
+        if (hunterHeadlessTimeout) {
+            clearTimeout(hunterHeadlessTimeout);
+            hunterHeadlessTimeout = null;
+        }
+
+        if (!hunterHeadlessActive) {
+            hunterHeadlessActive = true;
+            fetchCurrentUser();
+
+            if (!silent) {
+                wmLog(
+                    `⚡ Hunter autonome démarré · ` +
+                    `scan léger T-5m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                );
+            }
+        }
+
+        // La Hot Lane ne dépend plus du Market Watcher.
+        startHotLane();
+
+        if (!hunterHeadlessScanInProgress) {
+            runHunterHeadlessLoop();
+        }
+
+        paintHunterAggro();
+        return true;
+    }
+
+    function stopHunterHeadlessEngine({
+        keepHotLane = false,
+        silent = false
+    } = {}) {
+        const wasActive =
+            hunterHeadlessActive ||
+            !!hunterHeadlessTimeout;
+
+        hunterHeadlessActive = false;
+
+        if (hunterHeadlessTimeout) {
+            clearTimeout(hunterHeadlessTimeout);
+            hunterHeadlessTimeout = null;
+        }
+
+        if (
+            !keepHotLane &&
+            !marketWatcherActive &&
+            !hasTrackedHotLaneWork()
+        ) {
+            stopHotLane();
+        }
+
+        if (wasActive && !silent) {
+            wmLog('⏸️ Hunter autonome stoppé.');
+        }
+
+        paintHunterAggro();
+    }
+
+    window.wmHunterEngineDiag = function () {
+        const result = {
+            version: WM_VERSION,
+            hunterOn: autoSnipeEnabled,
+            mode: getSetting('autoSnipeMode'),
+            source: hunterDynamicSource,
+            marketWatcherOn: marketWatcherActive,
+            headlessOn: hunterHeadlessActive,
+            scanEnCours: hunterHeadlessScanInProgress,
+            hotLaneOn: hotLaneActive,
+            serveurSynchronise: serverClockSynced,
+            decalageServeurMs: Math.round(serverClockOffset),
+            scanIntervalMs: MARKET_REFRESH_MS,
+            fenetreDecouverteMs:
+                AUTOMATIC_BID_MAX_REMAINING_MS +
+                HUNTER_HEADLESS_MARGIN_MS,
+            hotLaneTimerSyncMs: MARKET_TIMER_SYNC_INTERVAL_MS,
+            scansHeadless: hunterHeadlessStats.scans,
+            dernierScan:
+                hunterHeadlessStats.lastScanTs
+                    ? new Date(hunterHeadlessStats.lastScanTs)
+                        .toLocaleTimeString('fr-FR')
+                    : null,
+            dureeDernierScanMs:
+                hunterHeadlessStats.lastDurationMs,
+            pagesDernierScan:
+                hunterHeadlessStats.lastPagesScanned,
+            annoncesFenetre:
+                hunterHeadlessStats.lastAuctionsInWindow,
+            candidatesHunter:
+                hunterHeadlessStats.lastCandidates,
+            mesMises: myBidsSet.size,
+            autoBidArmes: autoBidSet.size,
+            fourbesArmes: snipeSet.size,
+            erreur: hunterHeadlessStats.lastError || null
+        };
+
+        console.table(result);
+        return result;
+    };
+
     /* ===================== MARKET WATCHER LIFECYCLE ===================== */
 
     function startMarketWatcher(marketAlertEl, marketStatusEl) {
+        // Le scan visuel complet prend le relais : jamais deux scanners marketplace en parallèle.
+        stopHunterHeadlessEngine({ keepHotLane: true, silent: true });
+        stopMarketWatcher(false, true);
         sessionStorage.setItem('wm_watcher_active', '1');
-        stopMarketWatcher();
         marketWatcherActive = true;
         lastMarketHits.clear();
         activeHitsMap.clear();
@@ -11059,7 +11523,7 @@
         marketWatcherTimeout = setTimeout(() => runMarketScanLoop(marketAlertEl, marketStatusEl), wait);
     }
 
-    function stopMarketWatcher(persist = true) {
+    function stopMarketWatcher(persist = true, keepHotLane = false) {
         if (persist) {
             sessionStorage.removeItem('wm_watcher_active');
             sessionStorage.removeItem('wm_hits_cache');
@@ -11067,8 +11531,16 @@
         if (marketWatcherInterval) { clearInterval(marketWatcherInterval); marketWatcherInterval = null; }
         if (marketWatcherTimeout) { clearTimeout(marketWatcherTimeout); marketWatcherTimeout = null; }
         if (marketCountdownInterval) { clearInterval(marketCountdownInterval); marketCountdownInterval = null; }
-        stopHotLane();
+
         marketWatcherActive = false;
+
+        if (
+            !keepHotLane &&
+            !hunterHeadlessWanted() &&
+            !hasTrackedHotLaneWork()
+        ) {
+            stopHotLane();
+        }
     }
 
     /* ===================== TRASH SELLER ===================== */
@@ -16697,14 +17169,33 @@
                 marketBtn.className = "wm-btn wm-r wm-sm"; marketBtn.innerText = "⏹ STOP";
                 document.getElementById('dot-market').classList.add('on');
                 startMarketWatcher(marketAlertEl, marketStatusEl);
+                paintHunterAggro();
                 wmLog("🛒 Market Watcher démarré");
             } else {
-                stopMarketWatcher(true); marketWatcherActive = false;
+                const keepHotLane =
+                    (
+                        autoSnipeEnabled &&
+                        getSetting('autoSnipeMode') === 'adaptive'
+                    ) ||
+                    hasTrackedHotLaneWork();
+
+                stopMarketWatcher(true, keepHotLane);
+                marketWatcherActive = false;
+
                 marketBtn.className = "wm-btn wm-g wm-sm"; marketBtn.innerText = "▶ START";
                 document.getElementById('dot-market').classList.remove('on');
                 marketAlertEl.innerHTML = ""; marketStatusEl.innerHTML = "";
                 wmLog("⏹ Market Watcher arrêté");
+
+                // Hunter ON ? Le scan léger prend immédiatement le relais.
+                if (
+                    autoSnipeEnabled &&
+                    getSetting('autoSnipeMode') === 'adaptive'
+                ) {
+                    startHunterHeadlessEngine();
+                }
             }
+            paintHunterAggro();
             updateDots();
         };
 
@@ -17194,6 +17685,17 @@
                     wmLog(radio.value === 'adaptive'
                         ? `🎯 Hunter en mode <b>Trend-Aware</b> (robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
+
+                    if (autoSnipeEnabled) {
+                        if (radio.value === 'adaptive') {
+                            startHunterHeadlessEngine();
+                        } else {
+                            stopHunterHeadlessEngine({
+                                keepHotLane: hasTrackedHotLaneWork(),
+                                silent: true
+                            });
+                        }
+                    }
                 }
             };
         });
@@ -19614,6 +20116,7 @@
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
             let shouldHarvestUsernames = false;
+            let isMarketplaceListScan = false;
             try {
                 const req = args[0];
                 const url = (typeof req === 'string') ? req : (req && req.url) || '';
@@ -19627,12 +20130,26 @@
                 // null (bug du 2026-08-20 : plus de re-tag Trash sur les invendus).
                 isMarketplaceCreate = method === 'POST' && /\/api\/marketplace(\?|$)/.test(url);
 
+                // Les pages de scan marketplace sont volumineuses et déjà parsées par le moteur.
+                // Les cloner + JSON.parse une DEUXIÈME fois juste pour récolter des pseudos
+                // doublait inutilement les allocations CPU/RAM.
+                isMarketplaceListScan =
+                    method === 'GET' &&
+                    /\/api\/marketplace\?/i.test(url) &&
+                    (
+                        /[?&]page=/i.test(url) ||
+                        /[?&]sort=ending_soon/i.test(url)
+                    );
+
                 // Lecture passive uniquement sur des réponses susceptibles de contenir des
                 // objets utilisateur. Aucun appel supplémentaire n'est déclenché ici.
                 shouldHarvestUsernames =
                     method === 'GET' &&
                     (
-                        url.includes('/api/marketplace') ||
+                        (
+                            url.includes('/api/marketplace') &&
+                            !isMarketplaceListScan
+                        ) ||
                         /\/api\/(friends|messages|chat|guild|leaderboard|profile|users?)(\/|\?|$)/i.test(url) ||
                         /\/rest\/v1\/(profiles|users|user_profiles|accounts|players|members)(\?|$)/i.test(url)
                     );
@@ -20463,9 +20980,9 @@
         ============================================================ */
 
     wmLog(
-        `📉 v3.1.0 Trend-Aware : valeur marché = robuste si stable, puis bascule progressivement ` +
-        `vers la pondérée récence à partir de ${RECENT_TREND_START_PCT}% de tendance et entièrement à ${RECENT_TREND_FULL_PCT}% · ` +
-        `Hunter 70% · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} obligatoire.`
+        `⚡ v3.2.0 Headless Hunter : le Hunter Trend-Aware scanne seul la zone T-5m30 ` +
+        `quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
+        `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
 
     if (document.readyState === "complete" || document.readyState === "interactive") {
