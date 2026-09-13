@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.0';
+    const WM_VERSION = '3.4.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -460,7 +460,7 @@
        4) le Flip Seller peut le revendre ensuite par user_card_id exact.
 
        Le prix de revente est agressif mais protégé : plancher = prix d'achat + marge brute configurée.
-       Une carte n'est vendue que si le Recent Market contient au moins 10 ventes valides ;
+       Une carte n'est vendue que si le Recent Market contient exactement le seuil complet de 15 ventes valides ;
        aucun fallback sur la moyenne officielle WM ni sur le simple plancher d'achat.
        L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
        plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
@@ -478,7 +478,7 @@
     const FLIP_RELIST2_WM_PCT_KEY = 'wm_flip_relist2_wm_pct';
 
     // v3.3.2 — le Flip utilise exclusivement le Recent Market.
-    // Il faut au moins 10 ventes valides ; aucune autre référence de vente n'est autorisée.
+    // Il faut 15 ventes valides ; aucune autre référence de vente n'est autorisée.
     const FLIP_INITIAL_RECENT_PCT_KEY = 'wm_flip_initial_recent_pct';
     const FLIP_RELIST1_RECENT_PCT_KEY = 'wm_flip_relist1_recent_pct';
     const FLIP_RELIST2_RECENT_PCT_KEY = 'wm_flip_relist2_recent_pct';
@@ -755,7 +755,7 @@
                         saveFlipLedger();
                         renderFlipHistory();
                     }
-                }).catch(() => { });
+                }).catch(() => {});
             }, delay);
         }
     }
@@ -2375,11 +2375,11 @@
         reconcileAutoFlipCandidatesById()
             .then(result => {
                 if (result?.wins > 0) {
-                    retryPendingFlipTags().catch(() => { });
+                    retryPendingFlipTags().catch(() => {});
                     wakeFlipSeller();
                 }
             })
-            .catch(() => { });
+            .catch(() => {});
     }, 15_000);
 
     async function retryPendingFlipTags() {
@@ -2651,7 +2651,7 @@
 
         return (
             `<span style="color:#fbbf24;">⏳ attente marché récent ` +
-            `<b>${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES}</b> ventes · aucune vente automatique</span>`
+            `<b>${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES}</b> ventes · carte ignorée</span>`
         );
     }
 
@@ -2673,7 +2673,7 @@
         const rarity = rec?.rarity || '';
 
         // v3.3.2 : Recent Market EXCLUSIF. Nouvelle requête à chaque listing/relisting.
-        // Sous 10 ventes valides, la carte reste taguée `vente` et attend ; aucun fallback WM.
+        // Sous 15 ventes valides, aucune vente automatique ; aucun fallback WM.
         const recentFresh = await fetchRecentMarket(
             cardId,
             rarity,
@@ -2700,7 +2700,7 @@
                 blockedByRecentMarket: true,
                 price: null,
                 floor,
-                basis: `marché récent insuffisant · ${recentCount}/${RECENT_MARKET_MIN_SALES} ventes · aucune vente automatique`,
+                basis: `historique insuffisant · ${recentCount}/${RECENT_MARKET_MIN_SALES} ventes · carte ignorée`,
                 reference: null,
                 referenceKind: null,
                 wmAverage: null,
@@ -3157,7 +3157,7 @@
         const priceInfo = await resolveFlipSellPrice(rec);
         if (!priceInfo?.eligibleForSale || !Number.isFinite(Number(priceInfo?.price)) || Number(priceInfo.price) <= 0) {
             const count = Number(priceInfo?.recentMarketCount || 0);
-            rec.lastError = `attente marché récent · ${count}/${RECENT_MARKET_MIN_SALES} ventes`;
+            rec.lastError = `ignorée · ${count}/${RECENT_MARKET_MIN_SALES} ventes`;
             saveFlipLedger();
             return {
                 ok: false,
@@ -3715,7 +3715,7 @@
                         saveFlipLedger();
                         wmLog(
                             r?.blockedMarket
-                                ? `⏳ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
+                                ? `⏭️ Flip Seller : <b>${rec.title}</b> ignoré · ${htmlEsc(rec.lastError)}`
                                 : `⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                         );
                     }
@@ -3723,12 +3723,12 @@
                 }
                 if (statusEl) {
                     statusEl.innerHTML = blockedMarket === batch.length && ok === 0
-                        ? `<span style="color:#fbbf24;">⏳ ${blockedMarket} flip(s) en attente d'au moins ${RECENT_MARKET_MIN_SALES} ventes</span>`
+                        ? `<span style="color:#888;">⏭️ ${blockedMarket} flip(s) ignoré(s) · moins de ${RECENT_MARKET_MIN_SALES} ventes</span>`
                         : `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} non listé(s)</span>` : ''}`;
                 }
                 renderFlipHistory();
 
-                // Une carte bloquée par manque d'historique reste taguée `vente`, mais on évite
+                // Une carte ignorée faute de 15 ventes reste taguée `vente`, mais on évite
                 // de recharger le Recent Market toutes les 1,5 s. Le cycle périodique de 15 s
                 // la réévaluera automatiquement.
                 const stillReady = flipLedger.some(r => r && r.status === 'tagged' && r.userCardId);
@@ -4477,8 +4477,8 @@
 
     window.wmFlipDeepResolve = async function () {
         const n = await deepResolvePendingFlipRecords(true);
-        await retryPendingFlipTags().catch(() => { });
-        await syncManualFlipTags().catch(() => { });
+        await retryPendingFlipTags().catch(() => {});
+        await syncManualFlipTags().catch(() => {});
         renderFlipHistory();
         console.log(`[WikiMasters][Flip] résolution profonde forcée : ${n} exemplaire(s) retrouvé(s).`);
         return n;
@@ -5048,7 +5048,7 @@
         if (!cardId || getCachedWmOfficialSummary(cardId) || wmOfficialSummaryQueued.has(cardId)) return;
         wmOfficialSummaryQueued.add(cardId);
         wmOfficialSummaryQueue.push(cardId);
-        processWmOfficialSummaryQueue().catch(() => { });
+        processWmOfficialSummaryQueue().catch(() => {});
     }
 
     async function processWmOfficialSummaryQueue() {
@@ -5108,17 +5108,17 @@
         const ratio = Number(currentPrice) / avg;
         const formatted = avg.toLocaleString('fr-FR');
         const tip = `Moyenne officielle WikiMasters : ${formatted} 💰`;
-        const common = { count: 1, wmAverage: avg, reference: avg, referenceKind: 'wm_average', tip };
-        if (ratio < 0.75) return { ...common, status: 'under', label: `sous-coté · moy. WM ${formatted}`, color: '#4ade80' };
-        if (ratio > 1.25) return { ...common, status: 'over', label: `surcoté · moy. WM ${formatted}`, color: '#ef4444' };
-        return { ...common, status: 'fair', label: `dans la zone · moy. WM ${formatted}`, color: '#888' };
+        const common = { count:1, wmAverage:avg, reference:avg, referenceKind:'wm_average', tip };
+        if (ratio < 0.75) return { ...common, status:'under', label:`sous-coté · moy. WM ${formatted}`, color:'#4ade80' };
+        if (ratio > 1.25) return { ...common, status:'over', label:`surcoté · moy. WM ${formatted}`, color:'#ef4444' };
+        return { ...common, status:'fair', label:`dans la zone · moy. WM ${formatted}`, color:'#888' };
     }
 
     /* ═══════ v3.3.0 — RECENT MARKET / TREND-AWARE v2 ═══════
        Source : jusqu'aux 15 dernières ventes `settled_sold` visibles dans `auctions`.
 
        Référence robuste :
-         - minimum 10 ventes valides
+         - minimum strict 15 ventes valides (historique complet utilisé)
          - retire les 2 plus basses + les 2 plus hautes
          - moyenne des ventes restantes, en conservant leur ordre chronologique
 
@@ -5131,19 +5131,19 @@
          - >=30%              -> référence = moyenne pondérée récence
 
        Hunter :
-         >=10 ventes ET moyenne robuste > 790 -> 70% de la référence Trend-Aware v2
+         >=15 ventes ET moyenne robuste > 790 -> 70% de la référence Trend-Aware v2
          sinon -> AUCUNE mise automatique dynamique
 
        Flip :
-         >=10 ventes -> 100% / 95% / 90% de la référence Trend-Aware v2
-         <10 ventes  -> AUCUNE mise en vente automatique
+         >=15 ventes -> 100% / 95% / 90% de la référence Trend-Aware v2
+         <15 ventes  -> carte ignorée : AUCUNE mise et AUCUNE vente automatique
 
        Aucun fallback WM pour l'achat ou la vente.
     */
     const RECENT_MARKET_LIMIT = 15;
-    const RECENT_MARKET_MIN_SALES = 10;
-    const HUNTER_RECENT_MIN_SALES = 10;
-    const RECENT_MARKET_FULL_TRIM_MIN_SALES = 10;
+    const RECENT_MARKET_MIN_SALES = 15;
+    const HUNTER_RECENT_MIN_SALES = 15;
+    const RECENT_MARKET_FULL_TRIM_MIN_SALES = 15;
     const RECENT_MARKET_TRIM_EACH_SIDE = 2;
     const RECENT_MARKET_CACHE_TTL_MS = 60 * 1000;
     const RECENT_MARKET_PRE_ACTION_MAX_AGE_MS = 5 * 1000;
@@ -5266,10 +5266,10 @@
 
         const trendPct =
             trendAvailable &&
-                Number.isFinite(recentBlockAverage) &&
-                recentBlockAverage > 0 &&
-                Number.isFinite(previousBlockAverage) &&
-                previousBlockAverage > 0
+            Number.isFinite(recentBlockAverage) &&
+            recentBlockAverage > 0 &&
+            Number.isFinite(previousBlockAverage) &&
+            previousBlockAverage > 0
                 ? ((recentBlockAverage / previousBlockAverage) - 1) * 100
                 : null;
 
@@ -5308,11 +5308,11 @@
 
         const marketReference =
             Number.isFinite(robustAverage) &&
-                robustAverage > 0 &&
-                Number.isFinite(recencyWeightedAverage) &&
-                recencyWeightedAverage > 0
+            robustAverage > 0 &&
+            Number.isFinite(recencyWeightedAverage) &&
+            recencyWeightedAverage > 0
                 ? robustAverage * (1 - trendBlend) +
-                recencyWeightedAverage * trendBlend
+                  recencyWeightedAverage * trendBlend
                 : robustAverage;
 
         return {
@@ -5423,7 +5423,7 @@
 
             const snap = buildRecentMarketSnapshot(probe, id, rr);
 
-            // On garde en cache les réponses HTTP 200, y compris <10 ventes :
+            // On garde en cache les réponses HTTP 200, y compris <15 ventes :
             // le Hunter peut ainsi bloquer immédiatement sans refaire la requête.
             if (snap.ok) {
                 // Refresh = réinsère en fin de Map pour faire un LRU très léger.
@@ -5479,7 +5479,7 @@
 
     // v3.1.0 — Hunter RECENT MARKET + TREND-AWARE.
     // Conditions obligatoires :
-    // - au moins HUNTER_RECENT_MIN_SALES (=10) ventes valides
+    // - au moins HUNTER_RECENT_MIN_SALES (=15) ventes valides
     // - moyenne robuste STRICTEMENT supérieure à 790
     // - la valeur d'achat est ensuite la référence Trend-Aware
     // - référence récente <= 60 s pour décider
@@ -5596,7 +5596,7 @@
             maxAgeMs
         );
 
-        // Fail-safe : API inaccessible, <10 ventes Hunter, robuste <=790,
+        // Fail-safe : API inaccessible, <15 ventes Hunter, robuste <=790,
         // ou référence Trend-Aware v2 invalide => aucune mise.
         if (
             !recent?.ok ||
@@ -5738,7 +5738,7 @@
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.3.1 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec >=10 ventes et moyenne robuste STRICTEMENT > 790.
+    //   avec >=15 ventes et moyenne robuste STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
@@ -8306,7 +8306,7 @@
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
-            await preloadRecentMarketForHunter(list).catch(() => { });
+            await preloadRecentMarketForHunter(list).catch(() => {});
         }
 
         if (hunterAggressive) return runHunterFourbePass(list);
@@ -14728,17 +14728,17 @@
         const wm = Number(wmAverage);
         const ratioToWm =
             Number.isFinite(trendAwareRounded) &&
-                trendAwareRounded > 0 &&
-                Number.isFinite(wm) &&
-                wm > 0
+            trendAwareRounded > 0 &&
+            Number.isFinite(wm) &&
+            wm > 0
                 ? Math.round((trendAwareRounded / wm) * 1000) / 10
                 : null;
 
         const hunterRecentCap =
             recent.eligible &&
-                hunterRecentReferenceAllowed(recent.robustAverage) &&
-                Number.isFinite(Number(recent.marketReference)) &&
-                Number(recent.marketReference) > 0
+            hunterRecentReferenceAllowed(recent.robustAverage) &&
+            Number.isFinite(Number(recent.marketReference)) &&
+            Number(recent.marketReference) > 0
                 ? dynamicHunterCapFromReference(
                     recent.marketReference,
                     'recent_market'
@@ -16873,7 +16873,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.0 Trend-Aware v2 + Listing Safety : jusqu’à 15 ventes, minimum strict <b>10 ventes</b> pour acheter comme pour vendre, et Hunter bloqué si la robuste ≤ <b>790</b>. Extrêmes filtrés avant tendance/pondération (2 basses + 2 hautes), puis 5 dernières filtrées vs 5 précédentes ; bascule robuste → récence entre 15% et 30%, puis <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Toujours sous protection de la marge mini.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.1 Trend-Aware v2 + Listing Safety : historique strict de <b>15 ventes</b> requis pour acheter comme pour vendre ; sous 15 ventes la carte est ignorée. Hunter bloqué si la robuste ≤ <b>790</b>. Extrêmes filtrés avant tendance/pondération (2 basses + 2 hautes), puis 5 dernières filtrées vs 5 précédentes ; bascule robuste → récence entre 15% et 30%, puis <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Toujours sous protection de la marge mini.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -17684,7 +17684,7 @@
                     .then(result => {
                         if (result?.wins > 0) wakeFlipSeller();
                     })
-                    .catch(() => { });
+                    .catch(() => {});
             }
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
@@ -17697,7 +17697,7 @@
             renderFlipHistory();
         }, 15000);
         // Au chargement, les Flips sans snapshot Recent frais sont actualisés rapidement.
-        setTimeout(() => refreshTrackedFlipRecentMarkets(false).catch(() => { }), 3000);
+        setTimeout(() => refreshTrackedFlipRecentMarkets(false).catch(() => {}), 3000);
 
         // L'affichage seul est très léger : entre deux cycles réseau, l'âge se rafraîchit sans requête.
         setInterval(() => renderFlipHistory(), 5000);
@@ -19457,7 +19457,7 @@
                 // Même si fetchSellingState() échoue, un achat auto doit entrer dans Flip Seller.
                 if (Date.now() - lastWonSync > 60000) {
                     lastWonSync = Date.now();
-                    syncWonAuctions().catch(() => { });
+                    syncWonAuctions().catch(() => {});
                 }
 
                 const st = await fetchSellingState();
@@ -20992,7 +20992,7 @@
                 if (!cardId || !t) continue;
                 if (t.toLocaleLowerCase('fr-FR').includes(q.toLocaleLowerCase('fr-FR'))) {
                     const rarity = String(a?.snapshot_rarity || c?.rarity || '').toUpperCase();
-                    found.set(`${cardId}|${rarity}`, { cardId, title: t, rarity });
+                    found.set(`${cardId}|${rarity}`, { cardId, title:t, rarity });
                 }
             }
         } catch (e) { }
@@ -21002,15 +21002,15 @@
             if (Array.isArray(rows)) for (const c of rows) {
                 if (!c?.id) continue;
                 const rarity = String(c?.rarity || '').toUpperCase();
-                found.set(`${c.id}|${rarity}`, { cardId: c.id, title: c.wikipedia_title || q, rarity });
+                found.set(`${c.id}|${rarity}`, { cardId:c.id, title:c.wikipedia_title || q, rarity });
             }
         } catch (e) { }
-        const arr = [...found.values()], ql = q.toLocaleLowerCase('fr-FR');
-        return arr.sort((a, b) => {
-            const ae = String(a.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
-            const be = String(b.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
-            if (ae !== be) return ae - be;
-            return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
+        const arr=[...found.values()], ql=q.toLocaleLowerCase('fr-FR');
+        return arr.sort((a,b)=>{
+            const ae=String(a.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
+            const be=String(b.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
+            if(ae!==be)return ae-be;
+            return String(a.title||'').localeCompare(String(b.title||''),'fr');
         });
     }
 
@@ -21106,27 +21106,27 @@
         }).join('');
     }
 
-    window.wmPrice = async function (title, rarity = '', silent = false) {
-        const q = String(title || '').trim(), wantedRarity = String(rarity || '').trim().toUpperCase();
-        if (!q) { console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")'); return []; }
-        const cards = await findCardsByTitleForOfficialPrice(q);
-        if (cards.length === 0) { if (!silent) console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`); return []; }
-        await Promise.all([...new Set(cards.map(c => c.cardId).filter(Boolean))].map(id => fetchWmOfficialSummary(id, true).catch(() => null)));
-        const results = [], dedup = new Set();
-        for (const c of cards) {
-            const official = getCachedWmOfficialSummary(c.cardId), officialRarities = Object.keys(official?.summary || {});
-            const rarities = wantedRarity ? [wantedRarity] : [...new Set([c.rarity, ...officialRarities].filter(Boolean).map(r => String(r).toUpperCase()))];
-            for (const rr of rarities) {
-                const key = `${c.cardId}|${rr}`; if (dedup.has(key)) continue; dedup.add(key);
-                const wmAvg = getWmOfficialAverage(c.cardId, rr), valid = Number.isFinite(wmAvg) && wmAvg > 0;
-                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null });
+    window.wmPrice = async function(title, rarity='', silent=false) {
+        const q=String(title||'').trim(), wantedRarity=String(rarity||'').trim().toUpperCase();
+        if(!q){console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")');return[];}
+        const cards=await findCardsByTitleForOfficialPrice(q);
+        if(cards.length===0){if(!silent)console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`);return[];}
+        await Promise.all([...new Set(cards.map(c=>c.cardId).filter(Boolean))].map(id=>fetchWmOfficialSummary(id,true).catch(()=>null)));
+        const results=[],dedup=new Set();
+        for(const c of cards){
+            const official=getCachedWmOfficialSummary(c.cardId), officialRarities=Object.keys(official?.summary||{});
+            const rarities=wantedRarity?[wantedRarity]:[...new Set([c.rarity,...officialRarities].filter(Boolean).map(r=>String(r).toUpperCase()))];
+            for(const rr of rarities){
+                const key=`${c.cardId}|${rr}`;if(dedup.has(key))continue;dedup.add(key);
+                const wmAvg=getWmOfficialAverage(c.cardId,rr), valid=Number.isFinite(wmAvg)&&wmAvg>0;
+                results.push({carte:official?.title||c.title,cardId:c.cardId,rarete:rr||'?',moyenneWM:valid?wmAvg:null});
             }
         }
-        const ql = q.toLocaleLowerCase('fr-FR'), exact = results.filter(r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql), shown = exact.length ? exact : results.slice(0, 20);
-        if (!silent) {
+        const ql=q.toLocaleLowerCase('fr-FR'), exact=results.filter(r=>String(r.carte||'').toLocaleLowerCase('fr-FR')===ql), shown=exact.length?exact:results.slice(0,20);
+        if(!silent){
             console.table(shown);
-            const lines = shown.filter(r => Number.isFinite(Number(r.moyenneWM)) && Number(r.moyenneWM) > 0).map(r => `[${r.rarete}] moy.WM ${r.moyenneWM} (info vente uniquement)`);
-            wmLog(lines.length ? `💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}` : `💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
+            const lines=shown.filter(r=>Number.isFinite(Number(r.moyenneWM))&&Number(r.moyenneWM)>0).map(r=>`[${r.rarete}] moy.WM ${r.moyenneWM} (info vente uniquement)`);
+            wmLog(lines.length?`💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}`:`💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
         }
         return shown;
     };
