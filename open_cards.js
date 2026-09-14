@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.7';
+    const WM_VERSION = '3.4.8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5337,6 +5337,64 @@
         return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
     }
 
+    // v3.4.8 — défense en profondeur contre un petit cluster de ventes artificiellement hautes.
+    // La v3.4.7 retirait seulement les 2 plus hauts prix : 3 faux trades pouvaient donc
+    // laisser le 3e gonfler la moyenne robuste. Ici, un groupe de >=3 prix nettement séparé
+    // du corps du marché est plafonné AVANT tous les calculs de référence.
+    function detectExtremeHighPriceCluster(prices) {
+        const sorted = (Array.isArray(prices) ? prices : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0)
+            .sort((a, b) => a - b);
+
+        const minLowCount = 5;
+        const minHighCount = 3;
+        const minGapRatio = 4;
+        const minMedianRatio = 8;
+
+        if (sorted.length < minLowCount + minHighCount) return null;
+
+        let best = null;
+        for (let i = minLowCount; i <= sorted.length - minHighCount; i++) {
+            const lowEdge = sorted[i - 1];
+            const highEdge = sorted[i];
+            if (!(lowEdge > 0) || !(highEdge > 0)) continue;
+
+            const gapRatio = highEdge / lowEdge;
+            if (!best || gapRatio > best.gapRatio) {
+                best = { splitAt: i, gapRatio };
+            }
+        }
+
+        if (!best || best.gapRatio < minGapRatio) return null;
+
+        const low = sorted.slice(0, best.splitAt);
+        const high = sorted.slice(best.splitAt);
+        const median = values => {
+            const a = values.slice().sort((x, y) => x - y);
+            const m = Math.floor(a.length / 2);
+            return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+        };
+        const lowMedian = median(low);
+        const highMedian = median(high);
+        const medianRatio = lowMedian > 0 ? highMedian / lowMedian : Infinity;
+
+        if (high.length < minHighCount || medianRatio < minMedianRatio) return null;
+
+        return {
+            splitAt: best.splitAt,
+            lowCount: low.length,
+            highCount: high.length,
+            gapRatio: best.gapRatio,
+            medianRatio,
+            lowMedian,
+            highMedian,
+            cap: low[low.length - 1],
+            highMin: high[0],
+            highMax: high[high.length - 1]
+        };
+    }
+
     function computeRobustRecentAverage(prices) {
         const clean = (Array.isArray(prices) ? prices : [])
             .map(Number)
@@ -5362,6 +5420,8 @@
                 removedHigh: null,
                 removedLows: [],
                 removedHighs: [],
+                extremeHighCluster: null,
+                safetyCappedHighCount: 0,
                 recencyWeightedAverage: null,
                 recentBlockAverage: null,
                 previousBlockAverage: null,
@@ -5385,19 +5445,34 @@
         }
 
         const trimEachSide = RECENT_MARKET_TRIM_EACH_SIDE;
-        const sorted = clean.slice().sort((a, b) => a - b);
+
+        // v3.4.8 : si >=3 ventes forment un îlot de prix très au-dessus du marché,
+        // on les plafonne au sommet du groupe bas AVANT le trim classique.
+        // Ainsi, même si le contrôle d'identités devait manquer un schéma de comptes liés,
+        // ces ventes ne peuvent plus fabriquer une référence Hunter artificiellement haute.
+        const extremeHighCluster = detectExtremeHighPriceCluster(clean);
+        const safetyCap = Number(extremeHighCluster?.cap);
+        const safetyClean = Number.isFinite(safetyCap) && safetyCap > 0
+            ? clean.map(price => Math.min(price, safetyCap))
+            : clean.slice();
+        const safetyCappedHighCount = extremeHighCluster
+            ? clean.filter(price => price > safetyCap).length
+            : 0;
+
+        const sorted = safetyClean.slice().sort((a, b) => a - b);
         const removedLows = sorted.slice(0, trimEachSide);
         const removedHighs = sorted.slice(-trimEachSide).sort((a, b) => b - a);
         const trimmedSorted = sorted.slice(trimEachSide, sorted.length - trimEachSide);
 
-        // Moyenne robuste : 11 valeurs centrales sur 15.
+        // Moyenne robuste : 11 valeurs centrales sur 15, après neutralisation éventuelle
+        // du cluster extrême.
         const robustAverage = meanOf(trimmedSorted);
 
         // Plafonnement des extrêmes plutôt que suppression pour les calculs temporels.
         // Les 15 positions restent donc présentes pour le 5v5 et la récence.
         const lowerBound = sorted[trimEachSide];
         const upperBound = sorted[sorted.length - trimEachSide - 1];
-        const boundedPrices = clean.map(price =>
+        const boundedPrices = safetyClean.map(price =>
             Math.min(upperBound, Math.max(lowerBound, price))
         );
         const boundedAverage = meanOf(boundedPrices);
@@ -5473,7 +5548,7 @@
         // Référence du régime courant : uniquement les 5 ventes les plus récentes.
         // On retire l'effet d'une valeur basse et d'une valeur haute en les plafonnant
         // à la 2e plus basse / 2e plus haute, puis on combine récence + moyenne centrale.
-        const recentRegimeRawPrices = clean.slice(0, RECENT_TREND_BLOCK_SIZE);
+        const recentRegimeRawPrices = safetyClean.slice(0, RECENT_TREND_BLOCK_SIZE);
         let recentRegimeTrimmedAverage = null;
         let recentRegimeWeightedAverage = null;
         let recentRegimeReference = null;
@@ -5566,6 +5641,8 @@
             removedHigh: removedHighs[0] ?? null,
             removedLows,
             removedHighs,
+            extremeHighCluster,
+            safetyCappedHighCount,
             recencyWeightedAverage,
             recentBlockAverage,
             previousBlockAverage,
@@ -5621,7 +5698,7 @@
         };
     }
 
-    // v3.4.7 — garde-fou sur les 15 ventes de la même carte / rareté.
+    // v3.4.8 — garde-fou renforcé sur les 15 ventes de la même carte / rareté.
     // Ce sont des heuristiques de prudence, pas une preuve de comptes liés.
     // Un signal fort met l'achat ET la référence de vente automatique en attente.
     const MARKET_INTEGRITY_POLICY = Object.freeze({
@@ -5635,7 +5712,8 @@
         clusterMinCount: 3,
         clusterGapRatio: 3,
         clusterMedianRatio: 6,
-        highClusterMinCount: 5,
+        highClusterMinCount: 3,
+        extremeGapRatio: 8,
         repeatedHighPriceMin: 3,
         lowReturnRatio: 0.35,
         recentRiseRatio: 3,
@@ -5849,10 +5927,21 @@
                 repeatedHighPrice,
                 latestReturnLow
             });
-            if (high.length >= policy.highClusterMinCount &&
-                highMedian / lowMedian >= policy.clusterMedianRatio &&
+            const highVsLowRatio = highMedian / lowMedian;
+            const isolatedExtremeHighCluster =
+                high.length >= policy.highClusterMinCount &&
+                largestGapRatio >= policy.extremeGapRatio &&
+                highVsLowRatio >= policy.clusterMedianRatio;
+
+            if (isolatedExtremeHighCluster) {
+                add(
+                    'isolated_high_cluster',
+                    `${high.length} ventes forment un cluster haut isolé : rupture ×${largestGapRatio.toFixed(1)}, niveau médian ×${highVsLowRatio.toFixed(1)} au-dessus du marché bas`
+                );
+            } else if (high.length >= policy.highClusterMinCount &&
+                highVsLowRatio >= policy.clusterMedianRatio &&
                 (repeatedHighPrice >= policy.repeatedHighPriceMin || latestReturnLow || highBuyers <= 2)) {
-                add('price_regimes', `deux niveaux de prix séparés par ×${(highMedian / lowMedian).toFixed(1)}, avec répétitions, demande concentrée ou retour récent vers le bas`);
+                add('price_regimes', `deux niveaux de prix séparés par ×${highVsLowRatio.toFixed(1)}, avec répétitions, demande concentrée ou retour récent vers le bas`);
             }
         }
 
@@ -15427,6 +15516,15 @@
             borneBassePlafonnement: recent.lowerBound ?? null,
             borneHautePlafonnement: recent.upperBound ?? null,
             prixPlafonnes: recent.boundedPrices ?? [],
+            clusterHautExtremeDetecte: !!recent.extremeHighCluster,
+            clusterHautExtremeNb: recent.extremeHighCluster?.highCount ?? 0,
+            clusterHautExtremeRuptureX: Number.isFinite(Number(recent.extremeHighCluster?.gapRatio))
+                ? Math.round(Number(recent.extremeHighCluster.gapRatio) * 10) / 10
+                : null,
+            clusterHautExtremeCap: Number.isFinite(Number(recent.extremeHighCluster?.cap))
+                ? Number(recent.extremeHighCluster.cap)
+                : null,
+            prixHautsNeutralises: Number(recent.safetyCappedHighCount || 0),
             moyenne5Dernieres: Number.isFinite(recent.recentBlockAverage)
                 ? Math.round(Number(recent.recentBlockAverage) * 10) / 10
                 : null,
@@ -21822,7 +21920,7 @@
         ============================================================ */
 
     wmLog(
-        `⚡ v${WM_VERSION} · protection contre les historiques suspects : couples répétés, échanges croisés, circuits de comptes et anomalies de prix · ` +
+        `⚡ v${WM_VERSION} · protection anti-manipulation renforcée : comptes liés + clusters de prix extrêmes dès 3 ventes · ` +
         `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes strictes · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
