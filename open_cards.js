@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.1';
+    const WM_VERSION = '3.4.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -460,7 +460,7 @@
        4) le Flip Seller peut le revendre ensuite par user_card_id exact.
 
        Le prix de revente est agressif mais protégé : plancher = prix d'achat + marge brute configurée.
-       Une carte n'est vendue que si le Recent Market contient exactement le seuil complet de 15 ventes valides ;
+       Une carte n'est vendue que si le Recent Market contient les 15 ventes valides requises ;
        aucun fallback sur la moyenne officielle WM ni sur le simple plancher d'achat.
        L'undercut optionnel peut se placer 1 sous la plus basse annonce, MAIS jamais sous le
        plancher de marge. Les montants sont des Wikibidous bruts (aucun frais serveur supposé). */
@@ -477,7 +477,7 @@
     const FLIP_RELIST1_WM_PCT_KEY = 'wm_flip_relist1_wm_pct';
     const FLIP_RELIST2_WM_PCT_KEY = 'wm_flip_relist2_wm_pct';
 
-    // v3.3.2 — le Flip utilise exclusivement le Recent Market.
+    // v3.4.0 — le Flip utilise exclusivement le Recent Market Trend v3.
     // Il faut 15 ventes valides ; aucune autre référence de vente n'est autorisée.
     const FLIP_INITIAL_RECENT_PCT_KEY = 'wm_flip_initial_recent_pct';
     const FLIP_RELIST1_RECENT_PCT_KEY = 'wm_flip_relist1_recent_pct';
@@ -618,11 +618,21 @@
         return safe;
     }
 
-    function getFlipRecentSellPct(rec) {
+    function getFlipRecentSellPct(rec, recent = null) {
         const relists = Math.max(0, Number(rec?.relists) || 0);
-        if (relists <= 0) return getFlipInitialRecentPct();
-        if (relists === 1) return getFlipRelist1RecentPct();
-        return getFlipRelist2RecentPct();
+        const base = relists <= 0
+            ? getFlipInitialRecentPct()
+            : relists === 1
+                ? getFlipRelist1RecentPct()
+                : getFlipRelist2RecentPct();
+
+        // Trend v3 : si une carte déjà achetée devient moins liquide / baissière,
+        // on accélère la sortie sans jamais descendre sous le plancher de marge.
+        const urgency = Math.max(
+            0,
+            Math.min(FLIP_MAX_URGENCY_DISCOUNT_PCT, Number(recent?.sellUrgencyDiscountPct) || 0)
+        );
+        return Math.max(1, base - urgency);
     }
 
     function getFlipWmSellPct(rec) {
@@ -645,10 +655,10 @@
         return roundFlipReferencePriceDown(avg * (getFlipWmSellPct(rec) / 100));
     }
 
-    function getFlipTargetFromRecentMarket(rec, recentAverage) {
+    function getFlipTargetFromRecentMarket(rec, recentAverage, recent = null) {
         const avg = Number(recentAverage);
         if (!Number.isFinite(avg) || avg <= 0) return 0;
-        return roundFlipReferencePriceDown(avg * (getFlipRecentSellPct(rec) / 100));
+        return roundFlipReferencePriceDown(avg * (getFlipRecentSellPct(rec, recent) / 100));
     }
 
     // Nettoyage de l'ancien réglage unique "Sous réf. %", qui n'est plus utilisé en 2.9.
@@ -2613,8 +2623,8 @@
                 : `${Math.floor(ageSec / 60)}m`;
 
             const reference = Number(recent.marketReference);
-            const target = getFlipTargetFromRecentMarket(rec, reference);
-            const stagePct = getFlipRecentSellPct(rec);
+            const target = getFlipTargetFromRecentMarket(rec, reference, recent);
+            const stagePct = getFlipRecentSellPct(rec, recent);
 
             const trend = Number.isFinite(recent?.trendPct) ? Number(recent.trendPct) : null;
             const trendText = Number.isFinite(trend)
@@ -2645,13 +2655,15 @@
                 `<b>${Math.round(reference).toLocaleString('fr-FR')}</b> ` +
                 `${arrow}${trendText}` +
                 ` · robuste ${Math.round(recent.robustAverage).toLocaleString('fr-FR')}` +
+                ` · ${Number.isFinite(Number(recent.saleRatePerDay)) ? Number(recent.saleRatePerDay).toFixed(2) : '—'} vente/j` +
+                ` · urgence -${Math.max(0, Number(recent.sellUrgencyDiscountPct) || 0)}pt` +
                 ` · n=${recent.count} · maj ${ageText} · ${stage} <b>${stagePct}%</b>${drift}</span>`
             );
         }
 
         return (
             `<span style="color:#fbbf24;">⏳ attente marché récent ` +
-            `<b>${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES}</b> ventes · carte ignorée</span>`
+            `<b>${recent?.count ?? 0}/${RECENT_MARKET_MIN_SALES}</b> ventes · aucune vente automatique</span>`
         );
     }
 
@@ -2672,8 +2684,8 @@
         const cardId = rec?.cardId;
         const rarity = rec?.rarity || '';
 
-        // v3.3.2 : Recent Market EXCLUSIF. Nouvelle requête à chaque listing/relisting.
-        // Sous 15 ventes valides, aucune vente automatique ; aucun fallback WM.
+        // v3.4.0 : Recent Market EXCLUSIF. Nouvelle requête à chaque listing/relisting.
+        // Sous 15 ventes valides, la carte reste taguée `vente` et attend ; aucun fallback WM.
         const recentFresh = await fetchRecentMarket(
             cardId,
             rarity,
@@ -2700,7 +2712,7 @@
                 blockedByRecentMarket: true,
                 price: null,
                 floor,
-                basis: `historique insuffisant · ${recentCount}/${RECENT_MARKET_MIN_SALES} ventes · carte ignorée`,
+                basis: `marché récent insuffisant · ${recentCount}/${RECENT_MARKET_MIN_SALES} ventes · aucune vente automatique`,
                 reference: null,
                 referenceKind: null,
                 wmAverage: null,
@@ -2719,9 +2731,9 @@
         }
 
         const reference = Number(recent.marketReference);
-        const referenceKind = 'recent_market_trend_aware';
-        const stagePct = getFlipRecentSellPct(rec);
-        const target = getFlipTargetFromRecentMarket(rec, reference);
+        const referenceKind = 'recent_market_trend_v3';
+        const stagePct = getFlipRecentSellPct(rec, recent);
+        const target = getFlipTargetFromRecentMarket(rec, reference, recent);
 
         const trend = Number.isFinite(recent?.trendPct) ? Number(recent.trendPct) : null;
         const trendText = Number.isFinite(trend)
@@ -2729,11 +2741,15 @@
             : '—';
         const blendPct = Math.round(Number(recent.trendBlend || 0) * 100);
 
+        const urgencyPct = Math.max(0, Number(recent?.sellUrgencyDiscountPct) || 0);
+        const rate = Number(recent?.saleRatePerDay);
         let basis =
-            `Trend-Aware v2 ${Math.round(reference)} · ` +
+            `Trend-Aware v3 ${Math.round(reference)} · ` +
             `robuste ${Math.round(recent.robustAverage)} · ` +
             `pondérée ${Math.round(recent.recencyWeightedAverage)} · ` +
             `tendance ${trendText} · poids tendance ${blendPct}% · ` +
+            `${Number.isFinite(rate) ? rate.toFixed(2) : '—'} vente/j · ` +
+            `urgence -${urgencyPct}pt · ` +
             `${getFlipWmSellStage(rec)} ${stagePct}% → ${target}`;
 
         rec.recentMarketAverage = reference;
@@ -3157,7 +3173,7 @@
         const priceInfo = await resolveFlipSellPrice(rec);
         if (!priceInfo?.eligibleForSale || !Number.isFinite(Number(priceInfo?.price)) || Number(priceInfo.price) <= 0) {
             const count = Number(priceInfo?.recentMarketCount || 0);
-            rec.lastError = `ignorée · ${count}/${RECENT_MARKET_MIN_SALES} ventes`;
+            rec.lastError = `attente marché récent · ${count}/${RECENT_MARKET_MIN_SALES} ventes`;
             saveFlipLedger();
             return {
                 ok: false,
@@ -3192,7 +3208,6 @@
                 price_not_applied: 'prix calculé non appliqué au formulaire — vente annulée',
                 duration_not_applied: 'durée non appliquée au formulaire — vente annulée',
                 form_changed_before_launch: 'prix/durée modifiés par le site avant lancement — vente annulée',
-                server_listing_mismatch_cancelled: 'listing serveur incohérent — annulé automatiquement',
                 launch_button_disabled: 'bouton de lancement désactivé',
                 modal_still_open: 'mise en vente refusée par le site'
             };
@@ -3715,7 +3730,7 @@
                         saveFlipLedger();
                         wmLog(
                             r?.blockedMarket
-                                ? `⏭️ Flip Seller : <b>${rec.title}</b> ignoré · ${htmlEsc(rec.lastError)}`
+                                ? `⏳ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                                 : `⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                         );
                     }
@@ -3723,12 +3738,12 @@
                 }
                 if (statusEl) {
                     statusEl.innerHTML = blockedMarket === batch.length && ok === 0
-                        ? `<span style="color:#888;">⏭️ ${blockedMarket} flip(s) ignoré(s) · moins de ${RECENT_MARKET_MIN_SALES} ventes</span>`
+                        ? `<span style="color:#fbbf24;">⏳ ${blockedMarket} flip(s) en attente d'au moins ${RECENT_MARKET_MIN_SALES} ventes</span>`
                         : `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} non listé(s)</span>` : ''}`;
                 }
                 renderFlipHistory();
 
-                // Une carte ignorée faute de 15 ventes reste taguée `vente`, mais on évite
+                // Une carte bloquée par manque d'historique reste taguée `vente`, mais on évite
                 // de recharger le Recent Market toutes les 1,5 s. Le cycle périodique de 15 s
                 // la réévaluera automatiquement.
                 const stillReady = flipLedger.some(r => r && r.status === 'tagged' && r.userCardId);
@@ -4004,7 +4019,8 @@
         );
 
         const robust = Number(recent?.robustAverage);
-        const trendRef = Number(recent?.marketReference);
+        const fair = Number(recent?.marketReference);
+        const buyRef = Number(recent?.hunterReference);
         const ageMs = Number(recent?.ageMs);
 
         const result = {
@@ -4012,39 +4028,40 @@
             cardId,
             rarete: rr,
             ventesRecentes: recent?.count ?? 0,
-            moyenneRobusteRecente:
-                Number.isFinite(robust)
-                    ? Math.round(robust * 10) / 10
-                    : null,
-            valeurTrendAware:
-                Number.isFinite(trendRef)
-                    ? Math.round(trendRef * 10) / 10
-                    : null,
-            tendancePct:
-                Number.isFinite(recent?.trendPct)
-                    ? Math.round(Number(recent.trendPct) * 10) / 10
-                    : null,
-            modeTendance: recent?.trendMode ?? null,
-            seuilStrictRobuste: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
-            ageCacheSec:
-                Number.isFinite(ageMs)
-                    ? Math.round(ageMs / 1000)
-                    : null,
-            assezDeVentesMarcheRecent: !!recent?.eligible,
-            assezDeVentesHunter: hunterRecentSalesAllowed(recent),
+            moyenneRobusteRecente: Number.isFinite(robust) ? Math.round(robust * 10) / 10 : null,
+            valeurJusteTrendV3: Number.isFinite(fair) ? Math.round(fair * 10) / 10 : null,
+            referenceAchatRisque: Number.isFinite(buyRef) ? Math.round(buyRef * 10) / 10 : null,
+            facteurRisquePct: Number.isFinite(Number(recent?.hunterRiskFactor))
+                ? Math.round(Number(recent.hunterRiskFactor) * 100)
+                : null,
+            tendancePct: Number.isFinite(recent?.trendPct)
+                ? Math.round(Number(recent.trendPct) * 10) / 10
+                : null,
+            dispersionPct: Number.isFinite(Number(recent?.dispersionPct))
+                ? Math.round(Number(recent.dispersionPct) * 10) / 10
+                : null,
+            ventesParJour: Number.isFinite(Number(recent?.saleRatePerDay))
+                ? Math.round(Number(recent.saleRatePerDay) * 100) / 100
+                : null,
+            ageDerniereVenteHeures: Number.isFinite(Number(recent?.newestSaleAgeMs))
+                ? Math.round(Number(recent.newestSaleAgeMs) / 360000) / 10
+                : null,
+            scoreLiquidite: recent?.liquidityScore ?? null,
+            scoreVolatilite: recent?.volatilityScore ?? null,
+            scoreConfiance: recent?.confidenceScore ?? null,
+            liquiditeHunterOK: !!recent?.liquidityEligible,
             seuilVentesHunter: HUNTER_RECENT_MIN_SALES,
-            robusteAssezHaute: hunterRecentReferenceAllowed(robust),
-            cacheAssezFrais:
-                Number.isFinite(ageMs)
-                    ? ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-                    : false,
+            seuilStrictRobuste: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
+            ageCacheSec: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
+            cacheAssezFrais: Number.isFinite(ageMs)
+                ? ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+                : false,
             hunterAutoriseAvecCeCache: !!(
                 recent?.ok &&
-                recent?.eligible &&
+                recent?.hunterEligible &&
                 hunterRecentSalesAllowed(recent) &&
                 hunterRecentReferenceAllowed(robust) &&
-                Number.isFinite(trendRef) &&
-                trendRef > 0 &&
+                Number.isFinite(buyRef) && buyRef > 0 &&
                 Number.isFinite(ageMs) &&
                 ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
             )
@@ -4056,16 +4073,11 @@
 
     window.wmHunterPriceDiag = async function (cardId, rarity = '') {
         const rr = String(rarity || '').trim().toUpperCase();
-
-        const recent = await fetchRecentMarket(
-            cardId,
-            rr,
-            true
-        ).catch(() => null);
-
+        const recent = await fetchRecentMarket(cardId, rr, true).catch(() => null);
         const ref = getHunterPricingReference(cardId, rr);
         const robust = Number(recent?.robustAverage);
-        const trendRef = Number(recent?.marketReference);
+        const fair = Number(recent?.marketReference);
+        const buyRef = Number(recent?.hunterReference);
 
         let blocage = null;
         if (!recent?.ok) {
@@ -4073,11 +4085,17 @@
         } else if (!recent?.eligible || !hunterRecentSalesAllowed(recent)) {
             blocage = `seulement ${recent?.count ?? 0}/${HUNTER_RECENT_MIN_SALES} ventes Hunter`;
         } else if (!hunterRecentReferenceAllowed(robust)) {
-            blocage =
-                `moyenne robuste ${Math.round(robust)} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
-        } else if (!Number.isFinite(trendRef) || trendRef <= 0) {
-            blocage = 'référence Trend-Aware v2 invalide';
+            blocage = `moyenne robuste ${Math.round(robust)} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
+        } else if (!recent?.liquidityEligible) {
+            const rate = Number(recent?.saleRatePerDay);
+            const ageH = Number(recent?.newestSaleAgeMs) / 3600000;
+            blocage = `liquidité insuffisante · ${Number.isFinite(rate) ? rate.toFixed(2) : '—'} vente/j · dernière ${Number.isFinite(ageH) ? ageH.toFixed(1) : '—'} h`;
+        } else if (!Number.isFinite(buyRef) || buyRef <= 0) {
+            blocage = 'référence achat Trend-Aware v3 invalide';
         }
+
+        const ratio = ref ? hunterRatioForReferenceKind(ref.kind) : null;
+        const cap = ref ? dynamicHunterCapFromReference(ref.value, ref.kind) : null;
 
         const result = {
             version: WM_VERSION,
@@ -4085,55 +4103,57 @@
             rarete: rr,
             ventesRecentes: recent?.count ?? null,
             prixRecents: recent?.prices ?? [],
-            moyenneRobusteRecente:
-                Number.isFinite(robust)
-                    ? Math.round(robust * 10) / 10
-                    : null,
-            moyennePondereeRecence:
-                Number.isFinite(Number(recent?.recencyWeightedAverage))
-                    ? Math.round(Number(recent.recencyWeightedAverage) * 10) / 10
-                    : null,
-            moyenne5DernieresFiltrees:
-                Number.isFinite(recent?.recentBlockAverage)
-                    ? Math.round(Number(recent.recentBlockAverage) * 10) / 10
-                    : null,
-            moyenne5PrecedentesFiltrees:
-                Number.isFinite(recent?.previousBlockAverage)
-                    ? Math.round(Number(recent.previousBlockAverage) * 10) / 10
-                    : null,
-            tendancePct:
-                Number.isFinite(recent?.trendPct)
-                    ? Math.round(Number(recent.trendPct) * 10) / 10
-                    : null,
-            poidsTendancePct:
-                Number.isFinite(Number(recent?.trendBlend))
-                    ? Math.round(Number(recent.trendBlend) * 100)
-                    : null,
-            modeTendance: recent?.trendMode ?? null,
-            valeurTrendAware:
-                Number.isFinite(trendRef)
-                    ? Math.round(trendRef * 10) / 10
-                    : null,
-            retireBasse: recent?.removedLow ?? null,
-            retireHaute: recent?.removedHigh ?? null,
-            ventesBassesRetirees: recent?.removedLows ?? [],
-            ventesHautesRetirees: recent?.removedHighs ?? [],
-            trimChaqueCote: recent?.trimEachSide ?? null,
-            tendanceDisponible: !!recent?.trendAvailable,
-            seuilAchatRobuste: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
-            sourceUtiliseePourAchat: ref ? 'trend_aware_recent_market' : 'aucune',
-            ratioPct: ref
-                ? Math.round(hunterRatioForReferenceKind(ref.kind) * 100)
+            prixPlafonnes: recent?.boundedPrices ?? [],
+            borneBasse: recent?.lowerBound ?? null,
+            borneHaute: recent?.upperBound ?? null,
+            moyenneRobusteRecente: Number.isFinite(robust) ? Math.round(robust * 10) / 10 : null,
+            moyennePondereeRecence: Number.isFinite(Number(recent?.recencyWeightedAverage))
+                ? Math.round(Number(recent.recencyWeightedAverage) * 10) / 10
                 : null,
-            plafondHunter: ref
-                ? dynamicHunterCapFromReference(ref.value, ref.kind)
+            moyenne5Dernieres: Number.isFinite(recent?.recentBlockAverage)
+                ? Math.round(Number(recent.recentBlockAverage) * 10) / 10
+                : null,
+            moyenne5Precedentes: Number.isFinite(recent?.previousBlockAverage)
+                ? Math.round(Number(recent.previousBlockAverage) * 10) / 10
+                : null,
+            tendancePct: Number.isFinite(recent?.trendPct)
+                ? Math.round(Number(recent.trendPct) * 10) / 10
+                : null,
+            poidsTendancePct: Number.isFinite(Number(recent?.trendBlend))
+                ? Math.round(Number(recent.trendBlend) * 100)
+                : null,
+            valeurJusteTrendV3: Number.isFinite(fair) ? Math.round(fair * 10) / 10 : null,
+            dispersionPct: Number.isFinite(Number(recent?.dispersionPct))
+                ? Math.round(Number(recent.dispersionPct) * 10) / 10
+                : null,
+            ventesParJour: Number.isFinite(Number(recent?.saleRatePerDay))
+                ? Math.round(Number(recent.saleRatePerDay) * 100) / 100
+                : null,
+            ageDerniereVenteHeures: Number.isFinite(Number(recent?.newestSaleAgeMs))
+                ? Math.round(Number(recent.newestSaleAgeMs) / 360000) / 10
+                : null,
+            scoreLiquidite: recent?.liquidityScore ?? null,
+            scoreVolatilite: recent?.volatilityScore ?? null,
+            scoreDiversite: recent?.diversityScore ?? null,
+            scoreConfiance: recent?.confidenceScore ?? null,
+            facteurRisquePct: Number.isFinite(Number(recent?.hunterRiskFactor))
+                ? Math.round(Number(recent.hunterRiskFactor) * 100)
+                : null,
+            referenceAchatRisque: Number.isFinite(buyRef) ? Math.round(buyRef * 10) / 10 : null,
+            ratioHunterPct: Number.isFinite(ratio) ? Math.round(ratio * 100) : null,
+            plafondHunter: cap,
+            remiseUrgenceFlipPct: recent?.sellUrgencyDiscountPct ?? null,
+            acheteursUniques: recent?.uniqueWinners ?? null,
+            vendeursUniques: recent?.uniqueSellers ?? null,
+            concentrationMaxPct: Number.isFinite(Number(recent?.participantConcentration))
+                ? Math.round(Number(recent.participantConcentration) * 100)
                 : null,
             blocage
         };
 
         console.table(result);
         return result;
-    };;;;
+    };;;
 
     window.wmFlipLayoutDiag = function () {
         const hist = document.getElementById('wm-flip-history');
@@ -4215,17 +4235,19 @@
     window.wmFlipPricingMode = function () {
         const result = {
             version: WM_VERSION,
-            sourceMiseEnVente: `Trend-Aware v2 uniquement · minimum strict ${RECENT_MARKET_MIN_SALES} ventes`,
+            sourceMiseEnVente: `Trend-Aware v3 uniquement · minimum strict ${RECENT_MARKET_MIN_SALES} ventes`,
             recentMinVentesFlip: RECENT_MARKET_MIN_SALES,
             recentMinVentesHunter: HUNTER_RECENT_MIN_SALES,
-            trendDetection: `${RECENT_TREND_BLOCK_SIZE} dernières filtrées vs ${RECENT_TREND_BLOCK_SIZE} précédentes · ${RECENT_TREND_START_PCT}%→${RECENT_TREND_FULL_PCT}%`,
-            filtreExtremes: `jusqu’à ${RECENT_MARKET_LIMIT} ventes · ${RECENT_MARKET_TRIM_EACH_SIDE}+${RECENT_MARKET_TRIM_EACH_SIDE} extrêmes`,
+            trendDetection: `${RECENT_TREND_BLOCK_SIZE} dernières plafonnées vs ${RECENT_TREND_BLOCK_SIZE} précédentes · ${RECENT_TREND_START_PCT}%→${RECENT_TREND_FULL_PCT}%`,
+            filtreExtremes: `${RECENT_MARKET_LIMIT} ventes strictes · robuste sur 11 centrales · extrêmes plafonnés dans la série temporelle`,
             recencyDecay: RECENT_RECENCY_DECAY,
             recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
-            recentHunterMinimum: `>= ${HUNTER_RECENT_MIN_SALES} ventes ET robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
+            hunterRiskReferenceFloorPct: Math.round(HUNTER_RISK_REFERENCE_FLOOR * 100),
+            hunterLiquidity: `dernière vente <= 48h · rythme >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour`,
+            recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} ET dernière vente <=48h ET rythme >=${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/j`,
             hunterFallbackAchat: 'aucun',
-            recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}%`,
-            flipMinimum: `>= ${RECENT_MARKET_MIN_SALES} ventes`,
+            recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}% · remise urgence 0-${FLIP_MAX_URGENCY_DISCOUNT_PCT}pt`,
+            flipMinimum: `${RECENT_MARKET_MIN_SALES} ventes strictes`,
             flipFallback: 'aucun',
             refreshForceAvantChaqueListing: true,
             margeMiniPct: getFlipMarkupPct(),
@@ -5114,51 +5136,56 @@
         return { ...common, status:'fair', label:`dans la zone · moy. WM ${formatted}`, color:'#888' };
     }
 
-    /* ═══════ v3.3.0 — RECENT MARKET / TREND-AWARE v2 ═══════
-       Source : jusqu'aux 15 dernières ventes `settled_sold` visibles dans `auctions`.
+    /* ═══════ v3.4.0 — RECENT MARKET / TREND-AWARE v3 ═══════
+       Source : les 15 dernières ventes `settled_sold` visibles dans `auctions`.
 
-       Référence robuste :
-         - minimum strict 15 ventes valides (historique complet utilisé)
-         - retire les 2 plus basses + les 2 plus hautes
-         - moyenne des ventes restantes, en conservant leur ordre chronologique
+       Règle stricte :
+         - 15 ventes valides obligatoires pour acheter ET pour vendre
+         - aucun fallback WM
 
-       Trend-Aware v2 :
-         - la moyenne pondérée récence est calculée APRES filtrage des extrêmes
-         - la tendance compare les 5 dernières ventes filtrées aux 5 précédentes
-         - s'il reste moins de 10 ventes filtrées, pas de bascule Trend : robuste seule
-         - |tendance| < 15%  -> référence = moyenne robuste
+       Prix juste v3 :
+         - moyenne robuste = moyenne des 11 valeurs centrales (2 basses + 2 hautes écartées)
+         - pour préserver la chronologie, les 15 prix restent présents dans la série Trend,
+           mais les 2 extrêmes de chaque côté sont plafonnés aux bornes centrales
+         - récence adoucie (0.80 au lieu de 0.50) : l'historique compte réellement
+         - tendance = 5 dernières ventes plafonnées vs 5 précédentes
+         - |tendance| < 15%  -> référence = robuste
          - 15% à 30%         -> interpolation robuste -> pondérée récence
-         - >=30%              -> référence = moyenne pondérée récence
+         - >=30%              -> référence = pondérée récence
 
-       Hunter :
-         >=15 ventes ET moyenne robuste > 790 -> 70% de la référence Trend-Aware v2
-         sinon -> AUCUNE mise automatique dynamique
+       Anti-cartes mortes / achat :
+         - dernière vente <= 48 h
+         - rythme >= 0.75 vente / jour sur les 15 dernières
+         - la référence d'achat est encore réduite selon volatilité, liquidité,
+           baisse récente et concentration des participants (facteur 75%..100%)
+         - le réglage Hunter (70% par défaut) s'applique ENSUITE à cette référence d'achat
 
-       Flip :
-         >=15 ventes -> 100% / 95% / 90% de la référence Trend-Aware v2
-         <15 ventes  -> carte ignorée : AUCUNE mise et AUCUNE vente automatique
-
-       Aucun fallback WM pour l'achat ou la vente.
+       Revente :
+         - 15 ventes obligatoires
+         - base 100% / 95% / 90% de la valeur juste
+         - jusqu'à 8 points de remise d'urgence si le marché ralentit / baisse / devient volatil
+         - plancher de marge existant toujours prioritaire
     */
     const RECENT_MARKET_LIMIT = 15;
     const RECENT_MARKET_MIN_SALES = 15;
     const HUNTER_RECENT_MIN_SALES = 15;
-    const RECENT_MARKET_FULL_TRIM_MIN_SALES = 15;
     const RECENT_MARKET_TRIM_EACH_SIDE = 2;
     const RECENT_MARKET_CACHE_TTL_MS = 60 * 1000;
     const RECENT_MARKET_PRE_ACTION_MAX_AGE_MS = 5 * 1000;
     const RECENT_MARKET_FLIP_MAX_STALE_MS = 5 * 60 * 1000;
-    // Le Hunter peut rencontrer énormément de cartes au fil d'une longue session.
-    // Le cache ne doit jamais devenir une archive infinie.
     const RECENT_MARKET_CACHE_MAX_ENTRIES = 750;
 
-    // v3.3.0 — Trend-Aware v2.
-    // Les prix sont ordonnés du plus récent au plus ancien.
-    // Les extrêmes sont retirés AVANT le calcul pondéré et la détection de tendance.
     const RECENT_TREND_BLOCK_SIZE = 5;
     const RECENT_TREND_START_PCT = 15;
     const RECENT_TREND_FULL_PCT = 30;
-    const RECENT_RECENCY_DECAY = 0.5;
+    const RECENT_RECENCY_DECAY = 0.80;
+
+    // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
+    // une carte déjà acquise dès lors que ses 15 ventes existent, avec prix d'urgence.
+    const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
+    const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.75;
+    const HUNTER_RISK_REFERENCE_FLOOR = 0.75;
+    const FLIP_MAX_URGENCY_DISCOUNT_PCT = 8;
 
     const recentMarketCache = new Map();
     const recentMarketInflight = new Map();
@@ -5167,15 +5194,26 @@
         return `${String(cardId || '')}|${String(rarity || '').trim().toUpperCase()}`;
     }
 
+    function clamp01(v) {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return 0;
+        return Math.max(0, Math.min(1, n));
+    }
+
+    function meanOf(values) {
+        const arr = (Array.isArray(values) ? values : [])
+            .map(Number)
+            .filter(Number.isFinite);
+        return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    }
+
     function computeRobustRecentAverage(prices) {
         const clean = (Array.isArray(prices) ? prices : [])
             .map(Number)
             .filter(v => Number.isFinite(v) && v > 0)
             .slice(0, RECENT_MARKET_LIMIT);
 
-        const simpleAverage = clean.length
-            ? clean.reduce((a, b) => a + b, 0) / clean.length
-            : null;
+        const simpleAverage = meanOf(clean);
 
         if (clean.length < RECENT_MARKET_MIN_SALES) {
             return {
@@ -5183,9 +5221,13 @@
                 count: clean.length,
                 prices: clean,
                 trimmedPrices: [],
+                boundedPrices: [],
                 trimEachSide: 0,
                 robustAverage: null,
+                boundedAverage: null,
                 simpleAverage,
+                lowerBound: null,
+                upperBound: null,
                 removedLow: null,
                 removedHigh: null,
                 removedLows: [],
@@ -5199,83 +5241,61 @@
                 trendDirection: 'unknown',
                 trendBlend: 0,
                 trendMode: 'insufficient',
+                dispersionPct: null,
                 marketReference: null
             };
         }
 
         const trimEachSide = RECENT_MARKET_TRIM_EACH_SIDE;
+        const sorted = clean.slice().sort((a, b) => a - b);
+        const removedLows = sorted.slice(0, trimEachSide);
+        const removedHighs = sorted.slice(-trimEachSide).sort((a, b) => b - a);
+        const trimmedSorted = sorted.slice(trimEachSide, sorted.length - trimEachSide);
 
-        // On repère les extrêmes par INDEX afin de retirer exactement N occurrences,
-        // y compris lorsqu'il existe plusieurs ventes au même prix. Ensuite on restaure
-        // l'ordre récent -> ancien pour les calculs de récence et de tendance.
-        const indexed = clean.map((price, index) => ({ price, index }));
-        const ascending = indexed.slice().sort(
-            (a, b) => (a.price - b.price) || (a.index - b.index)
+        // Moyenne robuste : 11 valeurs centrales sur 15.
+        const robustAverage = meanOf(trimmedSorted);
+
+        // Plafonnement des extrêmes plutôt que suppression pour les calculs temporels.
+        // Les 15 positions restent donc présentes pour le 5v5 et la récence.
+        const lowerBound = sorted[trimEachSide];
+        const upperBound = sorted[sorted.length - trimEachSide - 1];
+        const boundedPrices = clean.map(price =>
+            Math.min(upperBound, Math.max(lowerBound, price))
         );
+        const boundedAverage = meanOf(boundedPrices);
 
-        const lowEntries = ascending.slice(0, trimEachSide);
-        const highEntries = ascending.slice(-trimEachSide);
-        const removedIndexes = new Set(
-            [...lowEntries, ...highEntries].map(entry => entry.index)
-        );
-
-        const trimmedPrices = indexed
-            .filter(entry => !removedIndexes.has(entry.index))
-            .map(entry => entry.price);
-
-        const removedLows = lowEntries.map(entry => entry.price);
-        const removedHighs = highEntries
-            .map(entry => entry.price)
-            .sort((a, b) => b - a);
-
-        const robustAverage = trimmedPrices.length
-            ? trimmedPrices.reduce((a, b) => a + b, 0) / trimmedPrices.length
-            : null;
-
-        // Référence sensible à la récence, mais uniquement sur les ventes filtrées.
         let weightedSum = 0;
         let weightTotal = 0;
-        for (let i = 0; i < trimmedPrices.length; i++) {
+        for (let i = 0; i < boundedPrices.length; i++) {
             const w = Math.pow(RECENT_RECENCY_DECAY, i);
-            weightedSum += trimmedPrices[i] * w;
+            weightedSum += boundedPrices[i] * w;
             weightTotal += w;
         }
         const recencyWeightedAverage =
             weightTotal > 0 ? weightedSum / weightTotal : null;
 
         const trendAvailable =
-            trimmedPrices.length >= RECENT_TREND_BLOCK_SIZE * 2;
-
+            boundedPrices.length >= RECENT_TREND_BLOCK_SIZE * 2;
         const recentBlock = trendAvailable
-            ? trimmedPrices.slice(0, RECENT_TREND_BLOCK_SIZE)
+            ? boundedPrices.slice(0, RECENT_TREND_BLOCK_SIZE)
             : [];
         const previousBlock = trendAvailable
-            ? trimmedPrices.slice(
+            ? boundedPrices.slice(
                 RECENT_TREND_BLOCK_SIZE,
                 RECENT_TREND_BLOCK_SIZE * 2
             )
             : [];
 
-        const recentBlockAverage = trendAvailable
-            ? recentBlock.reduce((a, b) => a + b, 0) / recentBlock.length
-            : null;
-
-        const previousBlockAverage = trendAvailable
-            ? previousBlock.reduce((a, b) => a + b, 0) / previousBlock.length
-            : null;
-
+        const recentBlockAverage = meanOf(recentBlock);
+        const previousBlockAverage = meanOf(previousBlock);
         const trendPct =
             trendAvailable &&
-            Number.isFinite(recentBlockAverage) &&
-            recentBlockAverage > 0 &&
-            Number.isFinite(previousBlockAverage) &&
-            previousBlockAverage > 0
+            Number.isFinite(recentBlockAverage) && recentBlockAverage > 0 &&
+            Number.isFinite(previousBlockAverage) && previousBlockAverage > 0
                 ? ((recentBlockAverage / previousBlockAverage) - 1) * 100
                 : null;
 
-        const trendAbsPct = Number.isFinite(trendPct)
-            ? Math.abs(trendPct)
-            : null;
+        const trendAbsPct = Number.isFinite(trendPct) ? Math.abs(trendPct) : null;
         const trendDirection = !Number.isFinite(trendPct)
             ? 'unknown'
             : trendPct < -0.1
@@ -5298,7 +5318,6 @@
             trendBlend =
                 (trendAbsPct - RECENT_TREND_START_PCT) /
                 (RECENT_TREND_FULL_PCT - RECENT_TREND_START_PCT);
-
             trendMode = trendDirection === 'down'
                 ? 'transition_down'
                 : trendDirection === 'up'
@@ -5307,27 +5326,34 @@
         }
 
         const marketReference =
-            Number.isFinite(robustAverage) &&
-            robustAverage > 0 &&
-            Number.isFinite(recencyWeightedAverage) &&
-            recencyWeightedAverage > 0
+            Number.isFinite(robustAverage) && robustAverage > 0 &&
+            Number.isFinite(recencyWeightedAverage) && recencyWeightedAverage > 0
                 ? robustAverage * (1 - trendBlend) +
                   recencyWeightedAverage * trendBlend
                 : robustAverage;
 
+        // Dispersion moyenne autour de la robuste, après plafonnement des extrêmes.
+        const dispersionPct =
+            Number.isFinite(robustAverage) && robustAverage > 0
+                ? meanOf(boundedPrices.map(v => Math.abs(v - robustAverage))) /
+                  robustAverage * 100
+                : null;
+
         return {
             eligible:
-                Number.isFinite(robustAverage) &&
-                robustAverage > 0 &&
-                Number.isFinite(marketReference) &&
-                marketReference > 0,
+                clean.length >= RECENT_MARKET_MIN_SALES &&
+                Number.isFinite(robustAverage) && robustAverage > 0 &&
+                Number.isFinite(marketReference) && marketReference > 0,
             count: clean.length,
             prices: clean,
-            trimmedPrices,
+            trimmedPrices: trimmedSorted,
+            boundedPrices,
             trimEachSide,
             robustAverage,
+            boundedAverage,
             simpleAverage,
-            // Compatibilité avec les diagnostics existants : premier extrême retiré.
+            lowerBound,
+            upperBound,
             removedLow: removedLows[0] ?? null,
             removedHigh: removedHighs[0] ?? null,
             removedLows,
@@ -5341,7 +5367,41 @@
             trendDirection,
             trendBlend,
             trendMode,
+            dispersionPct,
             marketReference
+        };
+    }
+
+    function scoreLinear(value, bad, good) {
+        const v = Number(value);
+        if (!Number.isFinite(v)) return 0;
+        if (good === bad) return v >= good ? 100 : 0;
+        return Math.round(clamp01((v - bad) / (good - bad)) * 100);
+    }
+
+    function computeParticipantSummary(rows) {
+        const valid = (Array.isArray(rows) ? rows : []).slice(0, RECENT_MARKET_LIMIT);
+        const countMap = (field) => {
+            const map = new Map();
+            for (const row of valid) {
+                const id = String(row?.[field] || '').trim();
+                if (!id) continue;
+                map.set(id, (map.get(id) || 0) + 1);
+            }
+            return map;
+        };
+        const winners = countMap('winner_id');
+        const sellers = countMap('seller_id');
+        const maxShare = (map) => {
+            if (!valid.length || !map.size) return 0;
+            return Math.max(...map.values()) / valid.length;
+        };
+        return {
+            uniqueWinners: winners.size,
+            uniqueSellers: sellers.size,
+            maxWinnerShare: maxShare(winners),
+            maxSellerShare: maxShare(sellers),
+            participantConcentration: Math.max(maxShare(winners), maxShare(sellers))
         };
     }
 
@@ -5355,38 +5415,160 @@
                 httpStatus: probe?.httpStatus ?? null,
                 fetchedAt: Date.now(),
                 eligible: false,
+                hunterEligible: false,
                 count: 0,
                 prices: [],
                 trimmedPrices: [],
-                robustAverage: null
+                boundedPrices: [],
+                robustAverage: null,
+                marketReference: null,
+                hunterReference: null
             };
         }
 
-        const rows = Array.isArray(probe.rows) ? probe.rows : [];
-        const prices = rows
-            .map(r => Number(r?.final_price))
-            .filter(v => Number.isFinite(v) && v > 0)
+        const rows = (Array.isArray(probe.rows) ? probe.rows : [])
+            .filter(r => Number.isFinite(Number(r?.final_price)) && Number(r.final_price) > 0)
             .slice(0, RECENT_MARKET_LIMIT);
-
+        const prices = rows.map(r => Number(r.final_price));
         const calc = computeRobustRecentAverage(prices);
-        const newestTs = rows.length
-            ? new Date(rows[0]?.settled_at || rows[0]?.end_at || 0).getTime()
+
+        const saleTimes = rows
+            .map(r => new Date(r?.settled_at || r?.end_at || 0).getTime())
+            .filter(Number.isFinite);
+        const newestTs = saleTimes.length ? saleTimes[0] : null;
+        const oldestTs = saleTimes.length ? saleTimes[saleTimes.length - 1] : null;
+        const nowTs = typeof serverNow === 'function' ? serverNow() : Date.now();
+        const newestSaleAgeMs = Number.isFinite(newestTs)
+            ? Math.max(0, nowTs - newestTs)
             : null;
-        const oldestRow = rows[Math.min(rows.length, RECENT_MARKET_LIMIT) - 1];
-        const oldestTs = oldestRow
-            ? new Date(oldestRow?.settled_at || oldestRow?.end_at || 0).getTime()
-            : null;
+        const salesSpanMs =
+            Number.isFinite(newestTs) && Number.isFinite(oldestTs)
+                ? Math.max(0, newestTs - oldestTs)
+                : null;
+        const saleRatePerDay =
+            rows.length >= 2 && Number.isFinite(salesSpanMs)
+                ? salesSpanMs > 0
+                    ? (rows.length - 1) / (salesSpanMs / 86400000)
+                    : 99
+                : 0;
+        const averageGapHours =
+            rows.length >= 2 && Number.isFinite(salesSpanMs)
+                ? salesSpanMs / (rows.length - 1) / 3600000
+                : null;
+
+        const participants = computeParticipantSummary(rows);
+
+        // Score liquidité : une vente très récente et un rythme élevé donnent 100.
+        const newestAgeHours = Number.isFinite(newestSaleAgeMs)
+            ? newestSaleAgeMs / 3600000
+            : Infinity;
+        const freshnessScore = Number.isFinite(newestAgeHours)
+            ? 100 - scoreLinear(newestAgeHours, 6, 48)
+            : 0;
+        const paceScore = scoreLinear(saleRatePerDay, 0.75, 3);
+        const liquidityScore = Math.round(
+            Math.max(0, Math.min(100, freshnessScore * 0.45 + paceScore * 0.55))
+        );
+
+        const dispersionPct = Number(calc?.dispersionPct);
+        const volatilityScore = Number.isFinite(dispersionPct)
+            ? 100 - scoreLinear(dispersionPct, 10, 45)
+            : 0;
+
+        const winnerDiversity = Math.min(1, participants.uniqueWinners / 8);
+        const sellerDiversity = Math.min(1, participants.uniqueSellers / 8);
+        const concentrationPenalty = clamp01(
+            (participants.participantConcentration - 0.35) / 0.35
+        );
+        const diversityScore = Math.round(
+            Math.max(
+                0,
+                Math.min(
+                    100,
+                    ((winnerDiversity + sellerDiversity) / 2) * 100 -
+                    concentrationPenalty * 30
+                )
+            )
+        );
+
+        const confidenceScore = Math.round(
+            liquidityScore * 0.45 + volatilityScore * 0.35 + diversityScore * 0.20
+        );
+
+        const liquidityEligible =
+            rows.length >= HUNTER_RECENT_MIN_SALES &&
+            Number.isFinite(newestSaleAgeMs) &&
+            newestSaleAgeMs <= HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS &&
+            Number.isFinite(saleRatePerDay) &&
+            saleRatePerDay >= HUNTER_LIQUIDITY_MIN_SALES_PER_DAY;
+
+        // Réduction de la référence d'achat : jamais de bonus qui ferait poursuivre le prix.
+        const volatilityPenalty = Number.isFinite(dispersionPct)
+            ? 0.10 * clamp01((dispersionPct - 10) / 35)
+            : 0.10;
+        const liquidityPenalty = 0.08 * (1 - liquidityScore / 100);
+        const trendPct = Number(calc?.trendPct);
+        const downtrendPenalty = Number.isFinite(trendPct) && trendPct < 0
+            ? 0.08 * clamp01(Math.abs(trendPct) / 40)
+            : 0;
+        const participantsPenalty = 0.04 * concentrationPenalty;
+
+        const hunterRiskFactor = Math.max(
+            HUNTER_RISK_REFERENCE_FLOOR,
+            Math.min(
+                1,
+                1 - volatilityPenalty - liquidityPenalty -
+                downtrendPenalty - participantsPenalty
+            )
+        );
+        const hunterReference =
+            calc.eligible && liquidityEligible && Number.isFinite(calc.marketReference)
+                ? calc.marketReference * hunterRiskFactor
+                : null;
+
+        // Pour une carte déjà acquise, on préfère accélérer la sortie si le marché ralentit.
+        let sellUrgencyDiscountPct = 0;
+        if (newestAgeHours > 48) sellUrgencyDiscountPct += 4;
+        else if (newestAgeHours > 24) sellUrgencyDiscountPct += 2;
+        else if (newestAgeHours > 12) sellUrgencyDiscountPct += 1;
+
+        if (saleRatePerDay < 0.75) sellUrgencyDiscountPct += 4;
+        else if (saleRatePerDay < 1.5) sellUrgencyDiscountPct += 2;
+        else if (saleRatePerDay < 3) sellUrgencyDiscountPct += 1;
+
+        if (Number.isFinite(trendPct) && trendPct <= -30) sellUrgencyDiscountPct += 3;
+        else if (Number.isFinite(trendPct) && trendPct <= -15) sellUrgencyDiscountPct += 1;
+        if (Number.isFinite(dispersionPct) && dispersionPct >= 30) sellUrgencyDiscountPct += 1;
+        sellUrgencyDiscountPct = Math.max(
+            0,
+            Math.min(FLIP_MAX_URGENCY_DISCOUNT_PCT, sellUrgencyDiscountPct)
+        );
 
         return {
             ok: true,
             cardId,
             rarity: String(rarity || '').trim().toUpperCase(),
             fetchedAt: Date.now(),
-            // v3.3.0 : ne conserve PAS les 15 objets DB complets dans le cache.
-            // `prices` + les agrégats Trend-Aware suffisent à toutes les décisions.
             newestSaleAt: Number.isFinite(newestTs) ? newestTs : null,
             oldestSaleAt: Number.isFinite(oldestTs) ? oldestTs : null,
-            ...calc
+            newestSaleAgeMs,
+            salesSpanMs,
+            saleRatePerDay,
+            averageGapHours,
+            liquidityScore,
+            volatilityScore,
+            diversityScore,
+            confidenceScore,
+            liquidityEligible,
+            hunterRiskFactor,
+            hunterReference,
+            sellUrgencyDiscountPct,
+            ...participants,
+            ...calc,
+            hunterEligible:
+                calc.eligible &&
+                liquidityEligible &&
+                Number.isFinite(hunterReference) && hunterReference > 0
         };
     }
 
@@ -5477,16 +5659,17 @@
         return `Trend ${Math.round(ref)} · ${trendText}`;
     }
 
-    // v3.1.0 — Hunter RECENT MARKET + TREND-AWARE.
+    // v3.4.0 — Hunter RECENT MARKET + TREND-AWARE v3.
     // Conditions obligatoires :
-    // - au moins HUNTER_RECENT_MIN_SALES (=15) ventes valides
-    // - moyenne robuste STRICTEMENT supérieure à 790
-    // - la valeur d'achat est ensuite la référence Trend-Aware
+    // - 15 ventes valides obligatoires
+    // - moyenne robuste STRICTEMENT supérieure à 500
+    // - liquidité minimale obligatoire (vente récente + rythme suffisant)
+    // - la valeur d'achat est la référence Trend v3 ajustée au risque
     // - référence récente <= 60 s pour décider
     // - référence récente <= 5 s juste avant une mise
     //
     // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
-    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 790;
+    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 500;
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
@@ -5511,10 +5694,10 @@
     function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
         const ref = Number(reference);
 
-        // Le seuil >790 porte volontairement sur la MOYENNE ROBUSTE dans
+        // Le seuil >500 porte volontairement sur la MOYENNE ROBUSTE dans
         // getHunterPricingReference()/ensureFreshHunterReference().
-        // Ici, la référence Trend-Aware peut légitimement tomber sous 790
-        // en cas de forte baisse ; on applique alors simplement 70% de cette valeur.
+        // Ici, la référence d'achat Trend v3 peut légitimement tomber sous 500
+        // après ajustement du risque ; on applique alors simplement le ratio Hunter.
         if (
             kind !== 'recent_market' ||
             !Number.isFinite(ref) ||
@@ -5530,39 +5713,37 @@
             : Math.max(1, Math.floor(raw));
     }
 
-    function getHunterPricingReference(cardId, rarity = '') {
-        const rr = String(rarity || '').trim().toUpperCase();
-        if (!cardId || !rr) return null;
+    function hunterRecentLiquidityAllowed(recent) {
+        return !!recent?.hunterEligible && !!recent?.liquidityEligible;
+    }
 
-        const recent = getCachedRecentMarket(
-            cardId,
-            rr,
-            HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-        );
-
+    function hunterPricingReferenceFromRecent(recent, cardId, rarity) {
         if (
             !recent?.ok ||
             !recent.eligible ||
             !hunterRecentSalesAllowed(recent) ||
             !hunterRecentReferenceAllowed(recent.robustAverage) ||
-            !Number.isFinite(Number(recent.marketReference)) ||
-            Number(recent.marketReference) <= 0
-        ) {
-            return null;
-        }
+            !hunterRecentLiquidityAllowed(recent) ||
+            !Number.isFinite(Number(recent.hunterReference)) ||
+            Number(recent.hunterReference) <= 0
+        ) return null;
 
         return {
-            value: Number(recent.marketReference),
+            value: Number(recent.hunterReference),
+            fairValue: Number(recent.marketReference),
             kind: 'recent_market',
-            label: 'Trend-Aware v2',
-            reasonLabel: 'valeur marché Trend-Aware v2',
+            label: 'Trend-Aware v3',
+            reasonLabel: 'référence achat Trend-Aware v3 ajustée au risque',
             cardId,
-            rarity: rr,
+            rarity,
             fetchedAt: Number(recent.fetchedAt || 0),
             ageMs: Number(recent.ageMs || 0),
             salesCount: recent.count,
             prices: recent.prices,
             trimmedPrices: recent.trimmedPrices,
+            boundedPrices: recent.boundedPrices,
+            lowerBound: recent.lowerBound,
+            upperBound: recent.upperBound,
             removedLow: recent.removedLow,
             removedHigh: recent.removedHigh,
             removedLows: recent.removedLows,
@@ -5576,8 +5757,32 @@
             trendPct: Number.isFinite(recent?.trendPct) ? Number(recent.trendPct) : null,
             trendBlend: Number(recent.trendBlend),
             trendMode: recent.trendMode,
-            trendDirection: recent.trendDirection
+            trendDirection: recent.trendDirection,
+            dispersionPct: Number.isFinite(Number(recent.dispersionPct)) ? Number(recent.dispersionPct) : null,
+            saleRatePerDay: Number.isFinite(Number(recent.saleRatePerDay)) ? Number(recent.saleRatePerDay) : null,
+            averageGapHours: Number.isFinite(Number(recent.averageGapHours)) ? Number(recent.averageGapHours) : null,
+            newestSaleAgeMs: Number.isFinite(Number(recent.newestSaleAgeMs)) ? Number(recent.newestSaleAgeMs) : null,
+            liquidityScore: Number(recent.liquidityScore || 0),
+            volatilityScore: Number(recent.volatilityScore || 0),
+            diversityScore: Number(recent.diversityScore || 0),
+            confidenceScore: Number(recent.confidenceScore || 0),
+            hunterRiskFactor: Number(recent.hunterRiskFactor || 0),
+            uniqueWinners: Number(recent.uniqueWinners || 0),
+            uniqueSellers: Number(recent.uniqueSellers || 0),
+            participantConcentration: Number(recent.participantConcentration || 0)
         };
+    }
+
+    function getHunterPricingReference(cardId, rarity = '') {
+        const rr = String(rarity || '').trim().toUpperCase();
+        if (!cardId || !rr) return null;
+
+        const recent = getCachedRecentMarket(
+            cardId,
+            rr,
+            HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+        );
+        return hunterPricingReferenceFromRecent(recent, cardId, rr);
     }
 
     async function ensureFreshHunterReference(
@@ -5596,46 +5801,9 @@
             maxAgeMs
         );
 
-        // Fail-safe : API inaccessible, <15 ventes Hunter, robuste <=790,
-        // ou référence Trend-Aware v2 invalide => aucune mise.
-        if (
-            !recent?.ok ||
-            !recent.eligible ||
-            !hunterRecentSalesAllowed(recent) ||
-            !hunterRecentReferenceAllowed(recent.robustAverage) ||
-            !Number.isFinite(Number(recent.marketReference)) ||
-            Number(recent.marketReference) <= 0
-        ) {
-            return null;
-        }
-
-        return {
-            value: Number(recent.marketReference),
-            kind: 'recent_market',
-            label: 'Trend-Aware v2',
-            reasonLabel: 'valeur marché Trend-Aware v2',
-            cardId,
-            rarity,
-            fetchedAt: Number(recent.fetchedAt || Date.now()),
-            ageMs: Number(recent.ageMs || 0),
-            salesCount: recent.count,
-            prices: recent.prices,
-            trimmedPrices: recent.trimmedPrices,
-            removedLow: recent.removedLow,
-            removedHigh: recent.removedHigh,
-            removedLows: recent.removedLows,
-            removedHighs: recent.removedHighs,
-            trimEachSide: recent.trimEachSide,
-            trendAvailable: recent.trendAvailable,
-            robustAverage: Number(recent.robustAverage),
-            recencyWeightedAverage: Number(recent.recencyWeightedAverage),
-            recentBlockAverage: Number(recent.recentBlockAverage),
-            previousBlockAverage: Number(recent.previousBlockAverage),
-            trendPct: Number.isFinite(recent?.trendPct) ? Number(recent.trendPct) : null,
-            trendBlend: Number(recent.trendBlend),
-            trendMode: recent.trendMode,
-            trendDirection: recent.trendDirection
-        };
+        // Fail-safe : API inaccessible, <15 ventes, robuste <=500,
+        // liquidité insuffisante ou référence d'achat v3 invalide => aucune mise.
+        return hunterPricingReferenceFromRecent(recent, cardId, rarity);
     }
 
     async function preloadRecentMarketForHunter(list) {
@@ -5736,9 +5904,9 @@
 
 
     // Décide si une enchère doit déclencher un auto-snipe.
-    // Mode dynamique v3.3.1 :
+    // Mode dynamique v3.4.0 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec >=15 ventes et moyenne robuste STRICTEMENT > 790.
+    //   avec 15 ventes, liquidité suffisante et moyenne robuste STRICTEMENT > 500.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
@@ -5765,6 +5933,11 @@
                         const robust = Number(recent.robustAverage);
                         reason =
                             `moyenne robuste ${Number.isFinite(robust) ? Math.round(robust) : '—'} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
+                    } else if (!recent.liquidityEligible) {
+                        const rate = Number(recent.saleRatePerDay);
+                        const ageH = Number(recent.newestSaleAgeMs) / 3600000;
+                        reason =
+                            `liquidité insuffisante (${Number.isFinite(rate) ? rate.toFixed(2) : '—'} vente/j · dernière ${Number.isFinite(ageH) ? ageH.toFixed(1) : '—'} h)`;
                     }
                 }
 
@@ -5784,7 +5957,9 @@
                     : '—';
 
             const src =
-                `${ref.salesCount} ventes · Trend ${Math.round(ref.value)} · ` +
+                `${ref.salesCount} ventes · juste ${Math.round(ref.fairValue)} · ` +
+                `achat risque ${Math.round(ref.value)} (${Math.round(ref.hunterRiskFactor * 100)}%) · ` +
+                `${Number.isFinite(ref.saleRatePerDay) ? ref.saleRatePerDay.toFixed(2) : '—'} vente/j · ` +
                 `robuste ${Math.round(ref.robustAverage)} · tendance ${trend}`;
 
             if (currentBid <= threshold) {
@@ -5921,7 +6096,7 @@
         logAutobid: true,
         autoSnipePrice: 100,
         autoSnipeMode: 'fixed',   // 'fixed' = seuil fixe · 'adaptive' = Recent Market uniquement
-        autoSnipeRecentRatio: 0.70,       // v3.0 : 70% de la moyenne robuste récente
+        autoSnipeRecentRatio: 0.70,       // v3.4 : ratio appliqué à la référence d'achat Trend v3 ajustée au risque
         minBalanceForAutoSnipe: 2000,
         autoRetagEnabled: true,
         sellTagName: 'Trash',
@@ -8341,7 +8516,7 @@
                     fresh,
                     Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                 );
-                // Fail-safe : impossible de vérifier une moyenne >= 1500 => aucune mise.
+                // Fail-safe : impossible de vérifier la référence achat v3 fraîche => aucune mise.
                 if (!freshRef) return null;
             }
 
@@ -9376,7 +9551,7 @@
                     );
                     if (!freshRef) {
                         // dynamicHunterContinuationAllowed() coupera l'armement si la
-                        // moyenne fraîche est réellement sous 1500 ; sinon simple pause.
+                        // référence fraîche devient inéligible ; sinon simple pause.
                         dynamicHunterContinuationAllowed(freshBidAuction);
                         bidLockSet.delete(a.id);
                         continue;
@@ -11676,19 +11851,9 @@
         const soleTagOnly = getSetting('sellOnlyIfSoleTag');
         let skippedMultiTag = 0;
         let skippedPendingTrade = 0;
-        let skippedFlipProtected = 0;
         const filterTrash = (items) => items.filter(item => {
             const tags = item.tags || [];
             if (!tags.some(t => t.name === sellTag)) return false;
-
-            // v3.3.3 — le tag Flip `vente` est réservé. Même si l'option « seul tag » est
-            // désactivée, Trash Seller n'a jamais le droit de consommer cet exemplaire.
-            const hasFlipTag = tags.some(t =>
-                String(t?.name || '').trim().toLocaleLowerCase('fr-FR') === FLIP_TAG_NAME.toLocaleLowerCase('fr-FR') ||
-                (FLIP_TAG_ID && (t?.id === FLIP_TAG_ID || t?.tag_id === FLIP_TAG_ID))
-            );
-            if (hasFlipTag) { skippedFlipProtected++; return false; }
-
             if (soleTagOnly && tags.some(t => t.name !== sellTag)) { skippedMultiTag++; return false; }
             // Exclut les cartes engagées dans un échange en attente (409), le temps du cooldown.
             const cid = item.card_id || item.card?.id;
@@ -11774,9 +11939,6 @@
         wmLog(`🔍 Scan Trash : <b>${trashCards.length}</b> cartes tagguées (${newlyTagged.length > 0 ? `+${newlyTagged.length} depuis dernier scan` : 'inchangé'})${rarityStr ? ` — <span style="color:#888;">${rarityStr}</span>` : ''}`);
         if (skippedMultiTag > 0) {
             wmLog(`🛡️ Filet de sécurité : <b>${skippedMultiTag}</b> carte(s) « ${sellTag} » ignorée(s) (elles portent aussi un autre tag)`);
-        }
-        if (skippedFlipProtected > 0) {
-            wmLog(`🛡️ Protection Flip : <b>${skippedFlipProtected}</b> carte(s) portant le tag <b>vente</b> exclue(s) du Trash Seller.`);
         }
         if (skippedPendingTrade > 0) {
             wmLog(`⏸️ <b>${skippedPendingTrade}</b> carte(s) exclue(s) temporairement (engagée(s) dans un échange en attente) — réessai après ${PENDING_TRADE_COOLDOWN_MS / 60000} min`);
@@ -12263,46 +12425,6 @@
        qui n'est pas affichée à l'écran). */
     const DURATION_BUTTON_LABELS = { 10: '10 min', 30: '30 min', 60: '1 h', 180: '3 h', 360: '6 h', 720: '12 h', 1440: '24 h' };
     let _lastUiListingAuctionId = null; // rempli par installPackInterceptor à la volée
-    let _activeUiListingCapture = null; // { cardId, auctionId, startedAt } pendant UN listing UI
-
-    // v3.3.3 — verrou global de création d'enchère.
-    // Trash Seller et Flip Seller utilisent tous deux /api/marketplace / le même modal React.
-    // Sans sérialisation, deux ventes pouvaient se chevaucher : un module réécrivait le prix
-    // pendant que l'autre lançait l'enchère, ou l'auction_id global capturait la vente voisine.
-    let marketplaceCreateLockTail = Promise.resolve();
-    let marketplaceCreateLockSeq = 0;
-    let marketplaceCreateLockOwner = null;
-
-    async function withMarketplaceCreateLock(owner, fn) {
-        const id = ++marketplaceCreateLockSeq;
-        let releaseGate;
-        const gate = new Promise(resolve => { releaseGate = resolve; });
-        const previous = marketplaceCreateLockTail;
-        marketplaceCreateLockTail = previous.then(() => gate);
-        await previous;
-
-        marketplaceCreateLockOwner = {
-            id,
-            owner: String(owner || 'listing'),
-            startedAt: Date.now()
-        };
-
-        try {
-            return await fn();
-        } finally {
-            if (marketplaceCreateLockOwner?.id === id) marketplaceCreateLockOwner = null;
-            releaseGate();
-        }
-    }
-
-    window.wmMarketplaceCreateLockDiag = () => ({
-        locked: !!marketplaceCreateLockOwner,
-        owner: marketplaceCreateLockOwner?.owner || null,
-        ageMs: marketplaceCreateLockOwner
-            ? Math.max(0, Date.now() - marketplaceCreateLockOwner.startedAt)
-            : 0,
-        sequence: marketplaceCreateLockSeq
-    });
 
     // Écrire .value directement sur un input contrôlé React ne déclenche pas son onChange
     // (React a surchargé le setter sur l'instance, pas sur le prototype) : il faut passer par
@@ -12369,7 +12491,7 @@
 
     // Tentative "légère" : sert uniquement à sonder si l'API remarche, pas à gérer tous les cas
     // d'erreur comme l'ancienne version de sellBatch() — sur échec on bascule sur sellCardViaUI.
-    async function trySellViaApiUnlocked(cardId, price, duration) {
+    async function trySellViaApi(cardId, price, duration) {
         try {
             const res = await fetch("https://www.wiki-masters.com/api/marketplace", {
                 method: "POST", credentials: "include",
@@ -12382,13 +12504,6 @@
         } catch (e) {
             return { ok: false };
         }
-    }
-
-    async function trySellViaApi(cardId, price, duration) {
-        return withMarketplaceCreateLock(
-            `trash-api:${String(cardId || '').slice(0, 8)}`,
-            () => trySellViaApiUnlocked(cardId, price, duration)
-        );
     }
 
     // S'assure qu'on est sur /collection avant de continuer. Après une vente, le site navigue
@@ -12716,13 +12831,6 @@
     }
 
     async function sellCardViaUI(cardId, title, rarity, price, duration) {
-        return withMarketplaceCreateLock(
-            `ui:${title || String(cardId || '').slice(0, 8)}`,
-            () => sellCardViaUIUnlocked(cardId, title, rarity, price, duration)
-        );
-    }
-
-    async function sellCardViaUIUnlocked(cardId, title, rarity, price, duration) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
         const requestedPrice = Math.max(1, Math.round(Number(price) || 0));
@@ -12862,26 +12970,16 @@
         );
 
         _lastUiListingAuctionId = null;
-        _activeUiListingCapture = {
-            cardId: String(cardId || ''),
-            auctionId: null,
-            startedAt: Date.now()
-        };
         launchBtn.click();
 
         await new Promise(r => setTimeout(r, 900));
-
-        // Snapshot puis libération du contexte de capture : une vente manuelle ultérieure ne
-        // peut plus écraser l'auction_id associé à CET appel.
-        const capturedAuctionId = _activeUiListingCapture?.auctionId || null;
-        _activeUiListingCapture = null;
 
         // Si le modal existe encore, le site a refusé ou n'a pas encore accepté le listing.
         if (document.body.contains(launchBtn)) {
             return { ok: false, reason: 'modal_still_open' };
         }
 
-        let createdAuctionId = capturedAuctionId || _lastUiListingAuctionId;
+        let createdAuctionId = _lastUiListingAuctionId;
         if (!createdAuctionId) {
             const m = location.pathname.match(/\/marketplace\/([0-9a-f-]{20,})/i);
             if (m) createdAuctionId = m[1];
@@ -12903,9 +13001,6 @@
                 if (Number.isFinite(serverPrice)) actualPrice = serverPrice;
                 if (Number.isFinite(serverDuration)) actualDurationMin = serverDuration;
 
-                const serverCardId = String(row.card_id || '');
-                const cardMismatch = !!serverCardId && serverCardId !== String(cardId || '');
-
                 const priceMismatch =
                     Number.isFinite(serverPrice) &&
                     serverPrice !== requestedPrice;
@@ -12914,52 +13009,16 @@
                     Number.isFinite(serverDuration) &&
                     Math.abs(serverDuration - requestedDuration) > 1;
 
-                if (cardMismatch || priceMismatch || durationMismatch) {
+                if (priceMismatch || durationMismatch) {
                     anomaly =
                         `ANOMALIE listing serveur : demandé ${requestedPrice} 💰 / ` +
                         `${DURATION_BUTTON_LABELS[requestedDuration] || requestedDuration + ' min'}, ` +
                         `créé ${Number.isFinite(serverPrice) ? serverPrice : '?'} 💰 / ` +
-                        `${Number.isFinite(serverDuration) ? serverDuration + ' min' : '?'}` +
-                        `${cardMismatch ? ' · card_id différent' : ''}`;
+                        `${Number.isFinite(serverDuration) ? serverDuration + ' min' : '?'}`;
 
                     wmLog(
-                        `🚨 Flip Seller : <b>${title}</b> — ${anomaly}.`
-                    );
-
-                    // Si c'est bien la carte attendue et qu'aucune mise n'existe encore,
-                    // annule immédiatement le listing dangereux au lieu de laisser partir une
-                    // carte très sous-évaluée. Si l'annulation échoue / une mise existe déjà,
-                    // on garde le suivi sur l'enchère réelle et on NE crée jamais un doublon.
-                    if (!cardMismatch && !row.current_bidder_id) {
-                        try {
-                            const cancelRes = await fetch(
-                                `https://www.wiki-masters.com/api/marketplace/${createdAuctionId}`,
-                                { method: 'DELETE', credentials: 'include' }
-                            );
-                            if (cancelRes.ok) {
-                                wmLog(
-                                    `🛑 Flip Seller : listing incohérent annulé automatiquement → ` +
-                                    `<b>${title}</b> · demandé ${requestedPrice} 💰, créé ${Number.isFinite(serverPrice) ? serverPrice : '?'} 💰.`
-                                );
-                                invalidateSalesDetail();
-                                await ensureOnCollectionPage();
-                                return {
-                                    ok: false,
-                                    reason: 'server_listing_mismatch_cancelled',
-                                    auctionId: createdAuctionId,
-                                    actualPrice: serverPrice,
-                                    actualDurationMin: serverDuration,
-                                    anomaly,
-                                    requestedPrice,
-                                    requestedDuration
-                                };
-                            }
-                        } catch (e) { }
-                    }
-
-                    wmLog(
-                        `⚠️ Flip Seller : listing incohérent conservé sous surveillance ` +
-                        `(annulation auto impossible ou enchère déjà mise). Aucun deuxième listing ne sera créé.`
+                        `🚨 Flip Seller : <b>${title}</b> — ${anomaly}. ` +
+                        `Aucun deuxième listing ne sera créé.`
                     );
                 }
             }
@@ -13094,18 +13153,6 @@
             removeFromTrashPoolCache(cardId);
         }
     }
-    function flipProtectsCollectionCard(cardId, rarity) {
-        const cid = String(cardId || '');
-        const rr = String(rarity || '').toUpperCase();
-        if (!cid) return false;
-        return flipLedger.some(rec =>
-            rec &&
-            rec.cardId === cid &&
-            (!rr || !rec.rarity || String(rec.rarity).toUpperCase() === rr) &&
-            (rec.status === 'tagged' || rec.status === 'pending_tag')
-        );
-    }
-
     async function sellBatch(cards, statusEl) {
         let sold = 0, skipped = 0, deferred = 0;
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
@@ -13116,15 +13163,6 @@
             const duration = getSellDuration(rarity);
             const title = item.card?.wikipedia_title || item.wikipedia_title || '?';
             if (!cardId) { skipped++; wmLog(`⚠️ Carte ignorée (ID manquant) : ${title}`); continue; }
-
-            // Une copie Flip de même carte/rareté présente dans la collection rend le ciblage
-            // DOM ambigu (le site ne donne pas le user_card_id sur la tuile). Dans ce cas Trash
-            // attend : mieux vaut bloquer temporairement un doublon que vendre le Flip au prix Trash.
-            if (flipProtectsCollectionCard(cardId, rarity)) {
-                skipped++;
-                wmLog(`🛡️ Trash Seller : <b>${title}</b> [${rarity}] ignoré — exemplaire Flip protégé présent dans la collection.`);
-                continue;
-            }
 
             // Prix de base : marché (moyenne × %) si activé & historique dispo, sinon tableau
             const priceInfo = await resolveSellBasePrice(rarity, cardId);
@@ -14706,8 +14744,7 @@
             .filter(v => Number.isFinite(v) && v > 0)
             .slice(0, RECENT_MARKET_LIMIT);
 
-        const recent = computeRobustRecentAverage(prices);
-
+        const recent = buildRecentMarketSnapshot(probe, cardId, rarity);
         const recentAverage = prices.length
             ? Math.round(prices.reduce((a, b) => a + b, 0) / prices.length)
             : null;
@@ -14715,34 +14752,29 @@
         const robustRounded = recent.eligible
             ? Math.round(recent.robustAverage * 10) / 10
             : null;
-
         const trendAwareRounded = recent.eligible
             ? Math.round(recent.marketReference * 10) / 10
             : null;
-
-        const weightedRounded =
-            Number.isFinite(Number(recent.recencyWeightedAverage))
-                ? Math.round(Number(recent.recencyWeightedAverage) * 10) / 10
-                : null;
+        const hunterRefRounded = Number.isFinite(Number(recent.hunterReference))
+            ? Math.round(Number(recent.hunterReference) * 10) / 10
+            : null;
+        const weightedRounded = Number.isFinite(Number(recent.recencyWeightedAverage))
+            ? Math.round(Number(recent.recencyWeightedAverage) * 10) / 10
+            : null;
 
         const wm = Number(wmAverage);
         const ratioToWm =
-            Number.isFinite(trendAwareRounded) &&
-            trendAwareRounded > 0 &&
-            Number.isFinite(wm) &&
-            wm > 0
+            Number.isFinite(trendAwareRounded) && trendAwareRounded > 0 &&
+            Number.isFinite(wm) && wm > 0
                 ? Math.round((trendAwareRounded / wm) * 1000) / 10
                 : null;
 
         const hunterRecentCap =
-            recent.eligible &&
+            recent.hunterEligible &&
             hunterRecentReferenceAllowed(recent.robustAverage) &&
-            Number.isFinite(Number(recent.marketReference)) &&
-            Number(recent.marketReference) > 0
-                ? dynamicHunterCapFromReference(
-                    recent.marketReference,
-                    'recent_market'
-                )
+            Number.isFinite(Number(recent.hunterReference)) &&
+            Number(recent.hunterReference) > 0
+                ? dynamicHunterCapFromReference(recent.hunterReference, 'recent_market')
                 : null;
 
         return {
@@ -14757,42 +14789,63 @@
             moyenneVentesVisibles: recentAverage,
             moyenneRobusteRecente: robustRounded,
             moyennePondereeRecence: weightedRounded,
-            moyenne5DernieresFiltrees:
-                Number.isFinite(recent.recentBlockAverage)
-                    ? Math.round(Number(recent.recentBlockAverage) * 10) / 10
-                    : null,
-            moyenne5PrecedentesFiltrees:
-                Number.isFinite(recent.previousBlockAverage)
-                    ? Math.round(Number(recent.previousBlockAverage) * 10) / 10
-                    : null,
-            tendancePct:
-                Number.isFinite(recent.trendPct)
-                    ? Math.round(Number(recent.trendPct) * 10) / 10
-                    : null,
-            poidsTendancePct:
-                Number.isFinite(Number(recent.trendBlend))
-                    ? Math.round(Number(recent.trendBlend) * 100)
-                    : null,
+            borneBassePlafonnement: recent.lowerBound ?? null,
+            borneHautePlafonnement: recent.upperBound ?? null,
+            prixPlafonnes: recent.boundedPrices ?? [],
+            moyenne5Dernieres: Number.isFinite(recent.recentBlockAverage)
+                ? Math.round(Number(recent.recentBlockAverage) * 10) / 10
+                : null,
+            moyenne5Precedentes: Number.isFinite(recent.previousBlockAverage)
+                ? Math.round(Number(recent.previousBlockAverage) * 10) / 10
+                : null,
+            tendancePct: Number.isFinite(recent.trendPct)
+                ? Math.round(Number(recent.trendPct) * 10) / 10
+                : null,
+            poidsTendancePct: Number.isFinite(Number(recent.trendBlend))
+                ? Math.round(Number(recent.trendBlend) * 100)
+                : null,
             modeTendance: recent.trendMode,
+            valeurTrendAwareV3: trendAwareRounded,
+            // Compatibilité console/UI avec les versions précédentes.
             valeurTrendAware: trendAwareRounded,
-            ventesUtilisees: recent.trimmedPrices,
-            venteBasseRetiree: recent.removedLow,
-            venteHauteRetiree: recent.removedHigh,
-            ventesBassesRetirees: recent.removedLows,
-            ventesHautesRetirees: recent.removedHighs,
-            trimChaqueCote: recent.trimEachSide,
-            tendanceDisponible: recent.trendAvailable,
-            recentMarketEligible: recent.eligible,
+            ventesUtilisees: recent.boundedPrices ?? [],
+            moyenne5DernieresFiltrees: Number.isFinite(recent.recentBlockAverage)
+                ? Math.round(Number(recent.recentBlockAverage) * 10) / 10
+                : null,
+            moyenne5PrecedentesFiltrees: Number.isFinite(recent.previousBlockAverage)
+                ? Math.round(Number(recent.previousBlockAverage) * 10) / 10
+                : null,
+            dispersionPct: Number.isFinite(Number(recent.dispersionPct))
+                ? Math.round(Number(recent.dispersionPct) * 10) / 10
+                : null,
+            ventesParJour: Number.isFinite(Number(recent.saleRatePerDay))
+                ? Math.round(Number(recent.saleRatePerDay) * 100) / 100
+                : null,
+            ageDerniereVenteHeures: Number.isFinite(Number(recent.newestSaleAgeMs))
+                ? Math.round(Number(recent.newestSaleAgeMs) / 360000) / 10
+                : null,
+            scoreLiquidite: recent.liquidityScore ?? null,
+            scoreVolatilite: recent.volatilityScore ?? null,
+            scoreDiversite: recent.diversityScore ?? null,
+            scoreConfiance: recent.confidenceScore ?? null,
+            facteurRisqueHunterPct: Number.isFinite(Number(recent.hunterRiskFactor))
+                ? Math.round(Number(recent.hunterRiskFactor) * 100)
+                : null,
+            referenceAchatHunter: hunterRefRounded,
+            hunterLiquiditeOK: !!recent.liquidityEligible,
             hunterAchatAutorise: !!(
-                recent.eligible &&
+                recent.hunterEligible &&
                 hunterRecentReferenceAllowed(recent.robustAverage)
             ),
-            seuilHunterRecent: `robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
             hunterRecentCap,
-            moyenneWM:
-                Number.isFinite(wm) && wm > 0
-                    ? wm
-                    : null,
+            remiseUrgenceFlipPct: recent.sellUrgencyDiscountPct ?? null,
+            acheteursUniques: recent.uniqueWinners ?? null,
+            vendeursUniques: recent.uniqueSellers ?? null,
+            concentrationMaxPct: Number.isFinite(Number(recent.participantConcentration))
+                ? Math.round(Number(recent.participantConcentration) * 100)
+                : null,
+            seuilHunterRecent: `15 ventes + robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} + liquidité`,
+            moyenneWM: Number.isFinite(wm) && wm > 0 ? wm : null,
             marcheRecentSurWM_Pct: ratioToWm,
             erreur: probe?.ok ? null : (probe?.error || 'échec inconnu'),
             code: probe?.code || null,
@@ -16873,7 +16926,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.1 Trend-Aware v2 + Listing Safety : historique strict de <b>15 ventes</b> requis pour acheter comme pour vendre ; sous 15 ventes la carte est ignorée. Hunter bloqué si la robuste ≤ <b>790</b>. Extrêmes filtrés avant tendance/pondération (2 basses + 2 hautes), puis 5 dernières filtrées vs 5 précédentes ; bascule robuste → récence entre 15% et 30%, puis <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Toujours sous protection de la marge mini.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.0 Trend-Aware v3 : <b>15 ventes obligatoires</b>. Prix juste = moyenne des 11 valeurs centrales ; les extrêmes sont <b>plafonnés</b> (pas supprimés) pour conserver le 5v5 chronologique, récence adoucie à 0,80. Hunter : dernière vente ≤48h, rythme ≥0,75/j et référence d’achat réduite selon risque avant le ratio Hunter. Flip : base <b>100% → 95% → 90%</b>, avec jusqu’à -8pt d’urgence si le marché ralentit/baisse. <b>Aucun fallback WM</b>. Marge mini toujours protégée.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -17024,10 +17077,10 @@
                     <div class="wm-set-title">Comportement</div>
                     <div class="wm-set-sub">Hunter : mode de décision</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="fixed"><span>Seuil fixe (mise si prix ≤ valeur définie)</span></label>
-                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v2 (15 dernières ventes)</span></label>
+                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v3 (15 dernières ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v2 : jusqu’à <b>${RECENT_MARKET_LIMIT}</b> ventes, minimum strict <b>${RECENT_MARKET_MIN_SALES}</b>. Le bot retire les <b>${RECENT_MARKET_TRIM_EACH_SIDE} plus basses + ${RECENT_MARKET_TRIM_EACH_SIDE} plus hautes</b> avant tout calcul. S’il reste au moins ${RECENT_TREND_BLOCK_SIZE * 2} ventes filtrées, il compare les <b>${RECENT_TREND_BLOCK_SIZE} dernières</b> aux <b>${RECENT_TREND_BLOCK_SIZE} précédentes</b> : sous ${RECENT_TREND_START_PCT}% il garde la robuste ; entre ${RECENT_TREND_START_PCT}% et ${RECENT_TREND_FULL_PCT}% il bascule vers la pondérée récence ; dès ${RECENT_TREND_FULL_PCT}% il utilise entièrement la pondérée. Hunter = <b>70%</b>. Sous <b>${RECENT_MARKET_MIN_SALES} ventes</b> : <b>aucune mise et aucune vente</b>. Hunter également bloqué si robuste ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}. Aucun fallback WM.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v3 : <b>15 ventes strictes</b>. Robuste = 11 valeurs centrales ; 2 basses + 2 hautes sont plafonnées pour la série temporelle. Récence = <b>0,80</b>, tendance ${RECENT_TREND_BLOCK_SIZE}v${RECENT_TREND_BLOCK_SIZE} avec bascule ${RECENT_TREND_START_PCT}%→${RECENT_TREND_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h et rythme ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour ; volatilité, liquidité, baisse et concentration réduisent ensuite la référence d’achat de 0 à 25%, puis le ratio Hunter (70% par défaut) s’applique. Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -17691,7 +17744,7 @@
             syncFlipSaleResults().catch(() => { });
 
             // Le Flip Seller ne dépend que du Recent Market : rafraîchissement périodique
-            // pour débloquer automatiquement une carte dès qu'elle atteint 10 ventes.
+            // pour débloquer automatiquement une carte dès qu'elle atteint 15 ventes.
             refreshTrackedFlipRecentMarkets(false).catch(() => { });
 
             renderFlipHistory();
@@ -17816,7 +17869,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? `🎯 Hunter en mode <b>Trend-Aware v2</b> (robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
+                        ? `🎯 Hunter en mode <b>Trend-Aware v3</b> (robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
 
                     if (autoSnipeEnabled) {
@@ -20248,7 +20301,6 @@
             // l'associer à sellHistory. Déclarée ici (comme les variables au-dessus) pour rester
             // accessible après le try — url/method y sont en `const`, portée bloc uniquement.
             let isMarketplaceCreate = false;
-            let marketplaceCreateCardId = null;
             let shouldHarvestUsernames = false;
             let isMarketplaceListScan = false;
             try {
@@ -20263,12 +20315,6 @@
                 // stricte sur l'URL absolue ne matchait jamais, donc auctionId restait toujours
                 // null (bug du 2026-08-20 : plus de re-tag Trash sur les invendus).
                 isMarketplaceCreate = method === 'POST' && /\/api\/marketplace(\?|$)/.test(url);
-                if (isMarketplaceCreate && args[1] && typeof args[1].body === 'string') {
-                    try {
-                        const payload = JSON.parse(args[1].body);
-                        marketplaceCreateCardId = payload?.card_id || payload?.cardId || null;
-                    } catch (e) { }
-                }
 
                 // Les pages de scan marketplace sont volumineuses et déjà parsées par le moteur.
                 // Les cloner + JSON.parse une DEUXIÈME fois juste pour récolter des pseudos
@@ -20345,24 +20391,7 @@
                 p.then(res => {
                     if (res && res.ok) {
                         res.clone().json().then(d => {
-                            if (!d?.auction_id) return;
-
-                            const cap = _activeUiListingCapture;
-                            if (cap) {
-                                const requestCard = String(marketplaceCreateCardId || '');
-                                const expectedCard = String(cap.cardId || '');
-
-                                // Quand le payload expose card_id, exige le match exact.
-                                // Si le navigateur masque le body du Request, le verrou global
-                                // garantit au moins qu'aucune autre création WMaster ne chevauche.
-                                if (!requestCard || requestCard === expectedCard) {
-                                    cap.auctionId = d.auction_id;
-                                    _lastUiListingAuctionId = d.auction_id;
-                                }
-                                return;
-                            }
-
-                            _lastUiListingAuctionId = d.auction_id;
+                            if (d && d.auction_id) _lastUiListingAuctionId = d.auction_id;
                         }).catch(() => { });
                     }
                 }).catch(() => { });
@@ -21137,7 +21166,7 @@
         ============================================================ */
 
     wmLog(
-        `⚡ v3.3.0 Trend-Aware v2 + Headless Hunter : 15 ventes, filtrage 2+2, tendance 5v5 · ` +
+        `⚡ v3.4.0 Trend-Aware v3 + Headless Hunter : 15 ventes strictes, robuste 11 centrales, plafonnement 2+2, récence 0.80, liquidité/risque · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
