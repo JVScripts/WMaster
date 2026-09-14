@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.11';
+    const WM_VERSION = '3.4.12';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -16029,6 +16029,40 @@
         seen.add(value);
 
         let found = 0;
+
+        // v3.4.12 — certaines réponses d'enchère exposent le meneur à plat :
+        // { current_bidder_id, current_bidder_username } ou { bidder_id, bidder_username }.
+        // On associe uniquement ces paires explicites pour ne jamais confondre le meneur
+        // avec seller_id / owner_id éventuellement présents dans le même objet.
+        const currentBidderId = value.current_bidder_id || value.currentBidderId || null;
+        const currentBidderName = validResolvedUsername(
+            value.current_bidder_username ||
+            value.currentBidderUsername ||
+            value.current_bidder?.username ||
+            value.current_bidder?.user_name ||
+            value.current_bidder?.display_name ||
+            value.currentBidder?.username ||
+            value.currentBidder?.user_name ||
+            value.currentBidder?.display_name
+        );
+        if (looksLikeUuid(currentBidderId) && currentBidderName) {
+            cacheResolvedBidderName(currentBidderId, currentBidderName);
+            found++;
+        }
+
+        const flatBidderId = value.bidder_id || value.bidderId || null;
+        const flatBidderName = validResolvedUsername(
+            value.bidder_username ||
+            value.bidderUsername ||
+            value.bidder?.username ||
+            value.bidder?.user_name ||
+            value.bidder?.display_name
+        );
+        if (looksLikeUuid(flatBidderId) && flatBidderName) {
+            cacheResolvedBidderName(flatBidderId, flatBidderName);
+            found++;
+        }
+
         const username = pickUsername(value);
         const candidateIds = [
             value.id,
@@ -16059,6 +16093,16 @@
             }
         }
         return found;
+    }
+
+    function hasPendingActiveSaleUsernameResolution() {
+        if (_activeSaleNameRetryState.size > 0) return true;
+        try {
+            return [...document.querySelectorAll('[data-wm-active-bidder-id]')]
+                .some(el => /résolution du pseudo/i.test(el.textContent || ''));
+        } catch (e) {
+            return false;
+        }
     }
 
     function cacheResolvedBidderName(bidderId, name) {
@@ -21368,17 +21412,32 @@
                         /[?&]sort=ending_soon/i.test(url)
                     );
 
-                // Lecture passive uniquement sur des réponses susceptibles de contenir des
-                // objets utilisateur. Aucun appel supplémentaire n'est déclenché ici.
+                // Lecture passive des réponses susceptibles de contenir UUID + pseudo.
+                // Tant qu'une vente active reste non résolue, on élargit TEMPORAIREMENT
+                // aux réponses JSON applicatives du site, y compris POST/PATCH de bid.
+                // Aucun appel réseau supplémentaire n'est déclenché.
+                const pendingActiveSaleName = hasPendingActiveSaleUsernameResolution();
+                const appJsonCandidate =
+                    /\/api\//i.test(url) ||
+                    /\/rest\/v1\//i.test(url) ||
+                    /wiki-masters\.com/i.test(url);
+
                 shouldHarvestUsernames =
-                    method === 'GET' &&
                     (
+                        method === 'GET' &&
                         (
-                            url.includes('/api/marketplace') &&
-                            !isMarketplaceListScan
-                        ) ||
-                        /\/api\/(friends|messages|chat|guild|leaderboard|profile|users?)(\/|\?|$)/i.test(url) ||
-                        /\/rest\/v1\/(profiles|users|user_profiles|accounts|players|members)(\?|$)/i.test(url)
+                            (
+                                url.includes('/api/marketplace') &&
+                                !isMarketplaceListScan
+                            ) ||
+                            /\/api\/(friends|messages|chat|guild|leaderboard|profile|users?)(\/|\?|$)/i.test(url) ||
+                            /\/rest\/v1\/(profiles|users|user_profiles|accounts|players|members)(\?|$)/i.test(url)
+                        )
+                    ) ||
+                    (
+                        pendingActiveSaleName &&
+                        ['GET', 'POST', 'PATCH', 'PUT'].includes(method) &&
+                        appJsonCandidate
                     );
 
                 // Capture le payload d'un POST /rest/v1/... pour le rejouer/exploiter côté bot.
@@ -21516,6 +21575,58 @@
 
             return p;
         };
+
+        // v3.4.12 — même filet passif pour les appels XMLHttpRequest du site.
+        // Actif seulement pendant qu'un pseudo de vente active est inconnu.
+        try {
+            const XHR = window.XMLHttpRequest;
+            if (XHR && XHR.prototype && !XHR.prototype.__wmUsernameHarvestInstalled) {
+                const nativeOpen = XHR.prototype.open;
+                const nativeSend = XHR.prototype.send;
+
+                XHR.prototype.open = function (method, url, ...rest) {
+                    try {
+                        this.__wmMethod = String(method || 'GET').toUpperCase();
+                        this.__wmUrl = String(url || '');
+                    } catch (e) { }
+                    return nativeOpen.call(this, method, url, ...rest);
+                };
+
+                XHR.prototype.send = function (...sendArgs) {
+                    try {
+                        if (!this.__wmUsernameHarvestHooked) {
+                            this.__wmUsernameHarvestHooked = true;
+                            this.addEventListener('load', () => {
+                                try {
+                                    if (!hasPendingActiveSaleUsernameResolution()) return;
+                                    const method = String(this.__wmMethod || 'GET').toUpperCase();
+                                    if (!['GET', 'POST', 'PATCH', 'PUT'].includes(method)) return;
+                                    const url = String(this.__wmUrl || '');
+                                    if (!(/\/api\//i.test(url) || /\/rest\/v1\//i.test(url) || /wiki-masters\.com/i.test(url))) return;
+                                    const ct = String(this.getResponseHeader?.('content-type') || '');
+                                    if (ct && !ct.includes('json')) return;
+
+                                    let data = null;
+                                    if (this.responseType === 'json') data = this.response;
+                                    else if (!this.responseType || this.responseType === 'text') {
+                                        const text = this.responseText;
+                                        if (!text || text.length > 2_000_000) return;
+                                        data = JSON.parse(text);
+                                    }
+                                    if (data) harvestUsernamesFromJson(data);
+                                } catch (e) { }
+                            });
+                        }
+                    } catch (e) { }
+                    return nativeSend.apply(this, sendArgs);
+                };
+
+                Object.defineProperty(XHR.prototype, '__wmUsernameHarvestInstalled', {
+                    value: true,
+                    configurable: true
+                });
+            }
+        } catch (e) { }
     })();
 
     /* ===================== LOOP ===================== */
