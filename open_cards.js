@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.10';
+    const WM_VERSION = '3.4.11';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3810,8 +3810,9 @@
 
         const bidderId = auctionCurrentBidderId(a);
         const before = findKnownBidderNameForActiveSale(a);
-        const pageName = before ? null : await fetchBidderNameFromAuctionPage(a);
-        const resolved = before || pageName || cachedResolvedBidderName(bidderId);
+        const indexName = before ? null : await fetchBidderNameFromMarketplaceIndex(a, true);
+        const pageName = (before || indexName) ? null : await fetchBidderNameFromAuctionPage(a);
+        const resolved = before || indexName || pageName || cachedResolvedBidderName(bidderId);
 
         if (resolved) applyBidderNameToAuction(a, resolved);
 
@@ -3821,6 +3822,7 @@
             carte: a.card?.wikipedia_title || '?',
             bidderId,
             pseudoAvant: before || null,
+            pseudoIndexMarketplace: indexName || null,
             pseudoPageEnchere: pageName || null,
             pseudoFinal: resolved || null,
             tableProfil: _profileTable || null,
@@ -8373,7 +8375,16 @@
         const res = await fetch(url, { credentials: "include" });
         syncServerClockFromResponse(res, t0);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
+        const data = await res.json();
+
+        // v3.4.11 — la liste marketplace contient déjà `current_bidder.username`.
+        // L'intercepteur réseau évite volontairement de cloner/reparser ces grosses réponses,
+        // mais ici le JSON EST DÉJÀ parsé par le Market Watcher/Hunter : on peut donc récolter
+        // gratuitement les couples UUID → pseudo. Cela débloque aussi "Ventes actives" sans
+        // attendre une nouvelle surenchère ni dépendre de la table `profiles` (RLS / schéma).
+        try { harvestUsernamesFromJson(data); } catch (e) { }
+
+        return data;
     }
 
     // Fetch TOUTES les pages et retourne tous les auctions
@@ -15887,6 +15898,13 @@
     const ACTIVE_SALE_PROBE_COOLDOWN_MS = 3500;
     const ACTIVE_SALE_NAME_RETRY_DELAYS_MS = [4000, 8000, 16000];
 
+    // v3.4.11 — fallback sur l'index public "ending_soon".
+    // La source `profiles` peut être illisible pour les autres joueurs alors que la réponse
+    // marketplace expose leur pseudo. Une petite photographie partagée évite 1 fetch par vente.
+    let _activeSaleMarketIndexSnapshot = null; // {ts, rows}
+    let _activeSaleMarketIndexInflight = null;
+    const ACTIVE_SALE_MARKET_INDEX_CACHE_MS = 5000;
+
     function validResolvedUsername(name) {
         const s = String(name || '').trim();
         return s && s !== '?' ? s : null;
@@ -16204,6 +16222,74 @@
         }
     }
 
+    async function fetchActiveSaleMarketplaceIndexRows(force = false) {
+        const now = Date.now();
+        if (!force && _activeSaleMarketIndexSnapshot &&
+            now - Number(_activeSaleMarketIndexSnapshot.ts || 0) < ACTIVE_SALE_MARKET_INDEX_CACHE_MS) {
+            return _activeSaleMarketIndexSnapshot.rows || [];
+        }
+        if (_activeSaleMarketIndexInflight) return await _activeSaleMarketIndexInflight;
+
+        _activeSaleMarketIndexInflight = (async () => {
+            const merged = [];
+            const seen = new Set();
+
+            // Les ventes réellement proches de leur fin sont en page 1. Une seconde page sert
+            // de marge contre le glissement de pagination pendant les enchères de dernière minute.
+            // On ne va PAS scanner tout le marché : ce fallback n'est qu'un filet d'affichage.
+            for (const page of [1, 2]) {
+                try {
+                    const data = await fetchMarketPage(page);
+                    const rows = Array.isArray(data?.auctions)
+                        ? data.auctions
+                        : Array.isArray(data) ? data : [];
+                    for (const row of rows) {
+                        if (!row?.id || seen.has(row.id)) continue;
+                        seen.add(row.id);
+                        merged.push(row);
+                    }
+                } catch (e) { }
+            }
+
+            _activeSaleMarketIndexSnapshot = { ts: Date.now(), rows: merged };
+            return merged;
+        })();
+
+        try {
+            return await _activeSaleMarketIndexInflight;
+        } finally {
+            _activeSaleMarketIndexInflight = null;
+        }
+    }
+
+    async function fetchBidderNameFromMarketplaceIndex(a, force = false) {
+        if (!a?.id) return null;
+        const bidderId = auctionCurrentBidderId(a);
+        if (!bidderId) return null;
+
+        const rows = await fetchActiveSaleMarketplaceIndexRows(force);
+
+        // Priorité à l'annonce exacte. Si elle n'est pas dans les 2 premières pages, le simple
+        // harvest ci-dessus peut tout de même avoir appris ce même joueur sur une autre annonce.
+        const exact = rows.find(row => row?.id === a.id);
+        let name = extractAuctionBidderName(exact) || cachedResolvedBidderName(bidderId);
+
+        // Dernier filet : recherche explicite du même UUID dans les annonces déjà reçues.
+        if (!name) {
+            const sameBidder = rows.find(row =>
+                String(auctionCurrentBidderId(row) || '') === String(bidderId) &&
+                extractAuctionBidderName(row)
+            );
+            name = extractAuctionBidderName(sameBidder);
+        }
+
+        if (name) {
+            applyBidderNameToAuction(a, name);
+            return name;
+        }
+        return null;
+    }
+
     async function fetchActiveSaleBidderFromMarketplace(a) {
         if (!a?.id) return null;
 
@@ -16266,15 +16352,19 @@
             } catch (e) { }
         }
 
-        // 2) La page exacte de l'enchère contient souvent les données Next/RSC même lorsque
-        // l'API de liste omet le profil du meneur.
+        // 2) Fallback sur les pages publiques `ending_soon` qui, elles, exposent souvent
+        // `current_bidder.username` même lorsque le filtre card_id ou `profiles` ne le fait pas.
+        const indexName = await fetchBidderNameFromMarketplaceIndex(a);
+        if (indexName) return indexName;
+
+        // 3) La page exacte de l'enchère contient parfois les données Next/RSC.
         const pageName = await fetchBidderNameFromAuctionPage(a);
         if (pageName) {
             applyBidderNameToAuction(a, pageName);
             return pageName;
         }
 
-        // 3) Dernière chance : entre-temps une autre réponse du site a pu alimenter le cache.
+        // 4) Dernière chance : entre-temps une autre réponse du site a pu alimenter le cache.
         const harvested = cachedResolvedBidderName(bidderId);
         if (harvested) {
             applyBidderNameToAuction(a, harvested);
