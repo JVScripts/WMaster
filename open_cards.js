@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.9';
+    const WM_VERSION = '3.4.10';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -15218,6 +15218,10 @@
     // historique sondait déjà profiles/users/…) : on retient celle qui répond.
     const PROFILE_TABLES = ['profiles', 'users', 'user_profiles', 'accounts', 'players', 'members'];
     const PROFILE_TABLE_KEY = 'wm_profile_table';
+    const PROFILE_ID_COLUMN_KEY = 'wm_profile_id_column';
+    // L'UUID de auth.users n'est pas forcément la PK `id` de la table profil.
+    // Suivant le schéma, il peut être porté par user_id/auth_user_id/account_id/etc.
+    const PROFILE_ID_KEYS = ['id', 'user_id', 'auth_user_id', 'account_id', 'profile_id', 'owner_id'];
     // Noms de colonne possibles pour le pseudo, du plus au moins spécifique.
     const USERNAME_KEYS = ['username', 'user_name', 'pseudo', 'handle', 'nickname',
         'display_name', 'displayName', 'name', 'full_name'];
@@ -15229,55 +15233,107 @@
         return null;
     }
     let _profileTable = null;
+    let _profileIdColumn = null;
     try { _profileTable = localStorage.getItem(PROFILE_TABLE_KEY); } catch (e) { }
+    try { _profileIdColumn = localStorage.getItem(PROFILE_ID_COLUMN_KEY); } catch (e) { }
     let _profileProbeLogged = false;
+    const _profileIdentityProbeUnsupported = new Set();
     const _usernameCache = new Map();
+
+    function cacheUsernameFromProfileRow(row, wantedIds) {
+        const name = validResolvedUsername(pickUsername(row));
+        if (!row || !name) return 0;
+
+        const wanted = wantedIds instanceof Set ? wantedIds : new Set();
+        let matched = 0;
+        for (const key of PROFILE_ID_KEYS) {
+            const value = row?.[key];
+            if (value == null || value === '') continue;
+            const id = String(value);
+            if (!wanted.has(id)) continue;
+            _usernameCache.set(id, name);
+            wanted.delete(id);
+            matched++;
+        }
+        return matched;
+    }
+
     async function resolveUsernames(ids) {
         // Un ancien échec ne doit jamais figer un UUID sur « ? » : seuls les vrais pseudos
         // sont considérés comme résolus. Cela permet aux ventes actives de retenter rapidement.
-        const missing = [...new Set((ids || []).filter(id => {
-            if (!id) return false;
-            return !validResolvedUsername(_usernameCache.get(String(id)));
-        }))];
-        if (missing.length > 0) {
+        const requested = [...new Set((ids || []).filter(Boolean).map(String))];
+        const unresolved = new Set(
+            requested.filter(id => !validResolvedUsername(_usernameCache.get(id)))
+        );
+
+        if (unresolved.size > 0) {
             const tried = [];
+            const seenTables = new Set();
             const tables = _profileTable ? [_profileTable, ...PROFILE_TABLES] : PROFILE_TABLES;
+            const idColumns = _profileIdColumn
+                ? [_profileIdColumn, ...PROFILE_ID_KEYS]
+                : PROFILE_ID_KEYS;
+
+            outer:
             for (const t of tables) {
-                if (tried.includes(t)) continue;
-                tried.push(t);
-                // `select=*` et NON une liste de colonnes : PostgREST répond 400 dès qu'UNE
-                // colonne demandée n'existe pas, ce qui faisait rejeter une table pourtant
-                // valide (d'où les pseudos affichés « ? »). On prend la ligne entière et on
-                // choisit ensuite le champ qui porte le pseudo.
-                const rows = await supabaseSelect(`${t}?id=in.(${missing.join(',')})&select=*`);
-                if (!Array.isArray(rows) || rows.length === 0) continue;
-                if (_profileTable !== t) {
-                    _profileTable = t;
-                    try { localStorage.setItem(PROFILE_TABLE_KEY, t); } catch (e) { }
+                if (!t || seenTables.has(t)) continue;
+                seenTables.add(t);
+
+                const seenColumns = new Set();
+                for (const idColumn of idColumns) {
+                    if (!idColumn || seenColumns.has(idColumn)) continue;
+                    seenColumns.add(idColumn);
+                    if (unresolved.size === 0) break outer;
+
+                    const probeKey = `${t}:${idColumn}`;
+                    if (_profileIdentityProbeUnsupported.has(probeKey)) continue;
+                    tried.push(`${t}.${idColumn}`);
+
+                    // IMPORTANT : current_bidder_id est l'UUID auth. Il n'est pas forcément dans
+                    // `profiles.id`. On essaie donc chaque colonne d'identité plausible séparément.
+                    // Une colonne inexistante fait répondre PostgREST 400 ; ce couple table/colonne
+                    // est alors simplement ignoré pour le reste de la session.
+                    const wantedNow = [...unresolved];
+                    const rows = await supabaseSelect(
+                        `${t}?${idColumn}=in.(${wantedNow.join(',')})&select=*`
+                    );
+                    if (!Array.isArray(rows)) {
+                        _profileIdentityProbeUnsupported.add(probeKey);
+                        continue;
+                    }
+                    if (rows.length === 0) continue;
+
+                    let matched = 0;
+                    for (const row of rows) {
+                        matched += cacheUsernameFromProfileRow(row, unresolved);
+                    }
+
+                    if (matched > 0) {
+                        _profileTable = t;
+                        _profileIdColumn = idColumn;
+                        try { localStorage.setItem(PROFILE_TABLE_KEY, t); } catch (e) { }
+                        try { localStorage.setItem(PROFILE_ID_COLUMN_KEY, idColumn); } catch (e) { }
+                    }
+
+                    // Diagnostic si la table répond avec des lignes mais aucune colonne ne porte
+                    // un pseudo exploitable. On continue quand même les autres tables/colonnes.
+                    if (!_profileProbeLogged && rows[0] && !pickUsername(rows[0])) {
+                        _profileProbeLogged = true;
+                        wmLog(`🔬 Table profils <b>${t}</b> trouvée via <b>${idColumn}</b>, mais aucune colonne de pseudo reconnue. Colonnes : <span style="color:#888;font-size:9px;">${Object.keys(rows[0]).join(', ')}</span>`);
+                    }
                 }
-                rows.forEach(r => {
-                    if (!r?.id) return;
-                    const name = validResolvedUsername(pickUsername(r));
-                    if (name) _usernameCache.set(String(r.id), name);
-                    else _usernameCache.delete(String(r.id));
-                });
-                // Diagnostic si la table répond mais qu'aucune colonne ne ressemble à un pseudo.
-                if (!_profileProbeLogged && rows[0] && !pickUsername(rows[0])) {
-                    _profileProbeLogged = true;
-                    wmLog(`🔬 Table profils <b>${t}</b> trouvée, mais aucune colonne de pseudo reconnue. Colonnes : <span style="color:#888;font-size:9px;">${Object.keys(rows[0]).join(', ')}</span>`);
-                }
-                break;
             }
-            if (!_profileProbeLogged && missing.some(id => !_usernameCache.has(id))) {
+
+            if (!_profileProbeLogged && unresolved.size > 0) {
                 _profileProbeLogged = true;
-                wmLog(`🔬 Pseudos non résolus : aucune table de profils lisible parmi <span style="color:#888;">${tried.join(', ')}</span>. Les enchérisseurs s'afficheront « ? ».`);
+                wmLog(`🔬 Pseudos non résolus pour ${unresolved.size} UUID : aucune correspondance profil via <span style="color:#888;">${tried.join(', ') || 'aucune sonde disponible'}</span>. Le fallback marketplace reste actif.`);
             }
             // Ne PAS mémoriser '?' durablement : le pseudo peut être récupéré ensuite par
-            // l'API marketplace publique, ou une table de profil peut devenir lisible après
-            // reconnexion. Le cache ne conserve que les pseudos réellement résolus.
+            // l'API marketplace publique, une page d'enchère ou une réponse interceptée du site.
         }
+
         const out = {};
-        (ids || []).forEach(id => { if (id) out[id] = _usernameCache.get(id) || '?'; });
+        requested.forEach(id => { out[id] = validResolvedUsername(_usernameCache.get(id)) || '?'; });
         return out;
     }
 
@@ -15289,6 +15345,7 @@
         if (!uid) { wmLog(`🔬 Test pseudos : aucun id utilisateur (JWT absent — connecté au site ?)`); return null; }
         _usernameCache.delete(uid); // force une vraie requête plutôt qu'un cache
         _profileProbeLogged = false;
+        _profileIdentityProbeUnsupported.clear();
         const names = await resolveUsernames([uid]);
         const got = names[uid];
         wmLog(got && got !== '?'
@@ -15959,8 +16016,14 @@
             value.id,
             value.user_id,
             value.userId,
+            value.auth_user_id,
+            value.authUserId,
+            value.account_id,
+            value.accountId,
             value.profile_id,
             value.profileId,
+            value.owner_id,
+            value.ownerId,
             value.bidder_id,
             value.bidderId
         ].filter(looksLikeUuid);
