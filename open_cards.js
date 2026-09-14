@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.12';
+    const WM_VERSION = '3.4.13';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -13032,14 +13032,22 @@
             const bid = a.current_bid ?? a.base_amount ?? 0;
             const bidderId = auctionCurrentBidderId(a);
             const bidder = validResolvedUsername(a.current_bidder?.username);
-            const hasBid = !!bidderId || !!bidder;
-            const bidderLabel = bidder || (hasBid ? 'résolution du pseudo…' : null);
+            // v3.4.13 — `current_bid` est une preuve de mise à lui seul. WikiMasters peut
+            // mettre à jour le montant avant d'exposer current_bidder_id / le pseudo au vendeur.
+            // L'ancien test affichait alors à tort « pas de mise » jusqu'à la résolution du profil.
+            const hasBidAmount = a.current_bid != null && Number.isFinite(Number(a.current_bid)) && Number(a.current_bid) > 0;
+            const hasBid = hasBidAmount || !!bidderId || !!bidder;
+            const bidderLabel = bidder
+                || (bidderId ? 'résolution du pseudo…'
+                    : (hasBidAmount ? 'mise reçue · pseudo en attente' : null));
             if (bidderId && !bidder) pendingBidderNames.push(a);
             const bidderTitle = bidder
                 ? bidder
                 : bidderId
                     ? `Pseudo en cours de résolution · id ${String(bidderId).slice(0, 8)}…`
-                    : 'aucune mise';
+                    : hasBidAmount
+                        ? 'Mise reçue · identité de l’enchérisseur non encore exposée par le site'
+                        : 'aucune mise';
             const marketUrl = `https://www.wiki-masters.com/marketplace/${a.id}`;
             // Échappe le titre pour l'attribut data-* (peut contenir guillemets, apostrophes…)
             const titleAttr = String(title).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
@@ -14704,6 +14712,15 @@
         });
         saveSellHistory();
         renderSellHistory();
+
+        // v3.4.13 — l'UI de WikiMasters ne renvoie pas toujours auction_id après création.
+        // Sans cet id, les anciens réconciliateurs ignoraient définitivement la vente.
+        // On tente donc de rattacher l'annonce réelle juste après le listing.
+        if (status === 'pending' && !auctionId) {
+            setTimeout(() => {
+                recoverMissingSaleAuctionIds().catch(() => { });
+            }, 1200);
+        }
     }
 
     const SUPABASE_REF = "cyrxjeppjqsxxjayfrur";
@@ -16887,6 +16904,173 @@
         }
     }
 
+
+    /* ── v3.4.13 : récupération des auctionId manquants des ventes créées par le bot ──
+       sellCardViaUI() peut réussir alors que la réponse de création ne fournit pas auction_id.
+       L'entrée sellHistory est alors bien créée, mais avec auctionId=null ; historiquement,
+       checkSellHistoryResults()/reconcilePendingSales() la filtraient et elle ne pouvait donc
+       jamais passer en sold/unsold ni alimenter le récap de session.
+
+       On rattache uniquement des enchères appartenant au vendeur courant, avec plusieurs
+       signaux concordants (card_id, titre, rareté, prix de départ, heure de création).
+       En cas d'ambiguïté réelle entre deux doublons quasi identiques, on ne devine pas. */
+    let _saleIdRecoveryRunning = false;
+
+    function localSaleAuctionMatchScore(s, auction) {
+        if (!s || !auction?.id) return { score: -1, deltaMs: Infinity };
+
+        const sTitle = String(s.title || '').trim();
+        const aTitle = String(auction.card?.wikipedia_title || '').trim();
+        const sRarity = String(s.rarity || '').toUpperCase();
+        const aRarity = String(
+            auction.snapshot_rarity || auction.card?.rarity || ''
+        ).toUpperCase();
+
+        let score = 0;
+
+        if (s.cardId && auction.card_id === s.cardId) score += 100;
+        if (sTitle && sTitle !== '?' && aTitle && aTitle === sTitle) score += 60;
+        if (sRarity && aRarity && sRarity === aRarity) score += 25;
+
+        const wantedPrice = Number(s.price);
+        const auctionBase = Number(
+            auction.listing_base_amount ?? auction.base_amount
+        );
+        if (
+            Number.isFinite(wantedPrice) && wantedPrice > 0 &&
+            Number.isFinite(auctionBase) && auctionBase === wantedPrice
+        ) {
+            score += 30;
+        }
+
+        const saleTs = Number(s.timestamp);
+        const createdTs = new Date(auction.created_at || NaN).getTime();
+        let deltaMs = Infinity;
+        if (Number.isFinite(saleTs) && Number.isFinite(createdTs)) {
+            deltaMs = Math.abs(createdTs - saleTs);
+            if (deltaMs <= 2 * 60 * 1000) score += 50;
+            else if (deltaMs <= 10 * 60 * 1000) score += 20;
+            else if (deltaMs > 60 * 60 * 1000) score -= 80;
+        }
+
+        return { score, deltaMs };
+    }
+
+    function chooseUniqueAuctionForLocalSale(s, auctions, usedIds = new Set()) {
+        if (!s || !Array.isArray(auctions) || auctions.length === 0) return null;
+
+        const ranked = auctions
+            .filter(a => a?.id && !usedIds.has(a.id))
+            .map(a => ({ a, ...localSaleAuctionMatchScore(s, a) }))
+            .filter(x => x.score >= 130)
+            .sort((x, y) => y.score - x.score || x.deltaMs - y.deltaMs);
+
+        if (ranked.length === 0) return null;
+        if (ranked.length === 1) return ranked[0].a;
+
+        const first = ranked[0];
+        const second = ranked[1];
+
+        // Si deux annonces ont exactement les mêmes signaux et des timestamps quasi
+        // indiscernables, on refuse de rattacher au hasard.
+        if (
+            first.score === second.score &&
+            Math.abs(first.deltaMs - second.deltaMs) < 1500
+        ) {
+            return null;
+        }
+
+        return first.a;
+    }
+
+    function findPendingLocalSaleForAuction(auction) {
+        if (!auction?.id) return null;
+
+        const exact = sellHistory.find(
+            s => s.status === 'pending' && s.auctionId === auction.id
+        );
+        if (exact) return exact;
+
+        const candidates = sellHistory.filter(
+            s => s.status === 'pending' && !s.auctionId
+        );
+        if (candidates.length === 0) return null;
+
+        const ranked = candidates
+            .map(s => ({ s, ...localSaleAuctionMatchScore(s, auction) }))
+            .filter(x => x.score >= 130)
+            .sort((x, y) => y.score - x.score || x.deltaMs - y.deltaMs);
+
+        if (ranked.length === 0) return null;
+        if (
+            ranked.length > 1 &&
+            ranked[0].score === ranked[1].score &&
+            Math.abs(ranked[0].deltaMs - ranked[1].deltaMs) < 1500
+        ) {
+            return null;
+        }
+        return ranked[0].s;
+    }
+
+    async function recoverMissingSaleAuctionIds() {
+        if (_saleIdRecoveryRunning || !navigator.onLine) return 0;
+
+        const missing = sellHistory.filter(
+            s => s.status === 'pending' && !s.auctionId
+        );
+        if (missing.length === 0) return 0;
+
+        _saleIdRecoveryRunning = true;
+        try {
+            // Actives + ventes conclues : couvre aussi la carte vendue très vite avant
+            // la première tentative de récupération de l'id.
+            const [active, sold] = await Promise.all([
+                fetchActiveSalesFromDb().catch(() => null),
+                fetchSoldFromDb(500).catch(() => null)
+            ]);
+
+            const poolMap = new Map();
+            for (const a of (Array.isArray(active) ? active : [])) {
+                if (a?.id) poolMap.set(a.id, a);
+            }
+            for (const a of (Array.isArray(sold) ? sold : [])) {
+                if (a?.id) poolMap.set(a.id, a);
+            }
+            const pool = [...poolMap.values()];
+            if (pool.length === 0) return 0;
+
+            const usedIds = new Set(
+                sellHistory.map(s => s.auctionId).filter(Boolean)
+            );
+
+            let recovered = 0;
+            for (const s of missing) {
+                const match = chooseUniqueAuctionForLocalSale(s, pool, usedIds);
+                if (!match?.id) continue;
+
+                s.auctionId = match.id;
+                usedIds.add(match.id);
+                recovered++;
+
+                // On ne clôt pas ici : les routines existantes restent la source de vérité
+                // pour sold/unsold, final_price, retag et statistiques.
+            }
+
+            if (recovered > 0) {
+                saveSellHistory();
+                renderSellHistory();
+                wmLog(
+                    `🧭 Vente(s) bot rattachée(s) : <b>${recovered}</b> auctionId ` +
+                    `récupéré(s) automatiquement.`
+                );
+            }
+
+            return recovered;
+        } finally {
+            _saleIdRecoveryRunning = false;
+        }
+    }
+
     // Réconciliation des ventes en attente — robuste à l'extinction du PC pendant les
     // enchères. Contrairement à checkSellHistoryResults (qui dépend de l'endpoint history,
     // potentiellement tronqué pour d'anciennes enchères), on se fie à la COLLECTION RÉELLE :
@@ -16896,8 +17080,14 @@
     let _reconcileRunning = false;
     async function reconcilePendingSales() {
         if (_reconcileRunning) return;
+        if (!navigator.onLine) return;
+
+        // Avant de filtrer sur auctionId, tente de réparer les listings dont l'id de
+        // création n'a pas été renvoyé par l'UI.
+        await recoverMissingSaleAuctionIds().catch(() => { });
+
         const pending = sellHistory.filter(s => s.status === 'pending' && s.auctionId);
-        if (pending.length === 0 || !navigator.onLine) return;
+        if (pending.length === 0) return;
         _reconcileRunning = true;
         try {
             // Interroge `auctions` UNIQUEMENT sur les IDs qui nous intéressent, plutôt que
@@ -16952,6 +17142,7 @@
     }
 
     async function checkSellHistoryResults() {
+        await recoverMissingSaleAuctionIds().catch(() => { });
         const pending = sellHistory.filter(s => s.status === 'pending' && s.auctionId);
         if (pending.length === 0) return;
         try {
@@ -20789,12 +20980,53 @@
             if (!Array.isArray(recentSales)) return;
 
             for (const sale of recentSales) {
+                if (!sale?.id) continue;
+
+                // v3.4.13 — le monitor des ventes devient aussi un filet de sécurité pour
+                // l'historique local du bot. Si auctionId avait été perdu à la création,
+                // on rattache ici la vente conclue et on crédite immédiatement le récap.
+                let local = sellHistory.find(s => s.auctionId === sale.id) || null;
+                if (!local) {
+                    local = findPendingLocalSaleForAuction(sale);
+                    if (local) local.auctionId = sale.id;
+                }
+
+                if (local && local.status === 'pending') {
+                    const final = sale.final_price ?? sale.current_bid ?? local.price ?? 0;
+                    local.status = 'sold';
+                    local.finalPrice = final;
+
+                    const credited = creditSoldSale(local, final);
+                    saveSellHistory();
+                    renderSellHistory();
+
+                    if (credited) {
+                        const gain = (Number(final) || 0) - (Number(local.price) || 0);
+                        const gainStr = gain > 0
+                            ? ` <span style="color:#4ade80;">(+${gain} 💰 🔥)</span>`
+                            : '';
+                        wmLog(
+                            `💰 Vendu : <b>${local.title}</b> [${local.rarity}] · ` +
+                            `base ${local.price} → <span style="color:#fbbf24;">${final} 💰</span>${gainStr}`
+                        );
+                        sendToDiscord(
+                            "💰 **VENDU !**\n" +
+                            "**" + local.title + "** [" + local.rarity + "]\n" +
+                            "Base : " + local.price + " 💰 → Vendu : **" + final + " 💰**" +
+                            (gain > 0 ? " (+" + gain + " 💰 🔥)" : ""),
+                            5763719
+                        );
+                    }
+
+                    knownSoldIds.add(sale.id);
+                    continue;
+                }
+
                 if (knownSoldIds.has(sale.id)) continue;
                 knownSoldIds.add(sale.id);
 
-                // Skip si la vente est déjà tracée dans sellHistory : checkSellHistoryResults
-                // s'en chargera (avec plus de contexte). Évite la double notification.
-                if (sellHistory.some(s => s.auctionId === sale.id)) continue;
+                // Si elle est déjà dans sellHistory mais déjà clôturée, aucune notification doublon.
+                if (local) continue;
 
                 // Ne notifier que les ventes récentes (< 2 minutes)
                 const soldAt = new Date(sale.settled_at).getTime();
