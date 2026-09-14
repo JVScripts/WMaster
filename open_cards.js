@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.13';
+    const WM_VERSION = '3.4.14';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -16501,6 +16501,103 @@
         return rows.filter(a => isActiveSellingStatus(a?.status));
     }
 
+    // v3.4.14 — hot-lane légère pour MES ventes actives.
+    // Le refresh complet passe volontairement par /mine + reconstruction et reste à 30 s, mais
+    // attendre ce cycle rendait l'affichage d'une nouvelle mise visiblement en retard sur le site.
+    // Ici on ne relit que les quelques enchères déjà affichées (maxActiveSales est faible) et
+    // seulement 5 colonnes utiles : une requête Supabase groupée toutes les 2 s quand le panneau
+    // est réellement visible. Aucun scan marketplace, aucune logique Hunter/Flip n'est impliquée.
+    let _activeSalesFastRefreshBusy = false;
+    const ACTIVE_SALES_FAST_REFRESH_MS = 2000;
+
+    async function refreshActiveSaleBidStatesFast() {
+        if (_activeSalesFastRefreshBusy || !Array.isArray(lastActiveSales) || lastActiveSales.length === 0) return;
+        if (document.hidden) return;
+        const overlay = document.getElementById('wm-overlay');
+        if (!overlay || overlay.style.display === 'none') return;
+
+        const ids = [...new Set(lastActiveSales
+            .filter(a => a?.id)
+            .filter(a => {
+                const end = new Date(a.end_at || NaN).getTime();
+                return !(Number.isFinite(end) && end <= Date.now());
+            })
+            .map(a => a.id))];
+        if (ids.length === 0) return;
+
+        _activeSalesFastRefreshBusy = true;
+        try {
+            const rows = await supabaseSelect(
+                `auctions?id=in.(${ids.join(',')})&select=id,current_bid,current_bidder_id,end_at,status`
+            );
+            if (!Array.isArray(rows)) return;
+
+            const localById = new Map(lastActiveSales.map(a => [a?.id, a]));
+            const cacheById = Array.isArray(_detailCache)
+                ? new Map(_detailCache.map(a => [a?.id, a]))
+                : new Map();
+            let changed = false;
+
+            const patchAuction = (a, row) => {
+                if (!a || !row) return false;
+                let did = false;
+
+                if ('current_bid' in row && a.current_bid !== row.current_bid) {
+                    a.current_bid = row.current_bid;
+                    did = true;
+                }
+
+                const prevBidderId = auctionCurrentBidderId(a);
+                const nextBidderId = row.current_bidder_id || null;
+                if (String(prevBidderId || '') !== String(nextBidderId || '')) {
+                    a.current_bidder_id = nextBidderId;
+                    if (nextBidderId) {
+                        const known = cachedResolvedBidderName(nextBidderId);
+                        a.current_bidder = { id: nextBidderId, username: known || '?' };
+                    } else {
+                        a.current_bidder = null;
+                    }
+                    clearActiveSaleNameRetry(a.id);
+                    did = true;
+                } else if (nextBidderId) {
+                    // Le bidder n'a pas changé, mais son pseudo a pu être appris entre-temps.
+                    const known = cachedResolvedBidderName(nextBidderId);
+                    if (known && validResolvedUsername(a.current_bidder?.username) !== known) {
+                        a.current_bidder = { ...(a.current_bidder || {}), id: nextBidderId, username: known };
+                        did = true;
+                    }
+                }
+
+                if (row.end_at && a.end_at !== row.end_at) {
+                    a.end_at = row.end_at;
+                    did = true;
+                }
+                if (row.status != null && a.status !== row.status) {
+                    a.status = row.status;
+                    did = true;
+                }
+                return did;
+            };
+
+            for (const row of rows) {
+                if (!row?.id) continue;
+                const local = localById.get(row.id);
+                if (patchAuction(local, row)) changed = true;
+
+                // activeSalesDetail() peut encore servir son cache de 10 s au refresh complet.
+                // On le garde synchronisé pour qu'il ne réinjecte pas un ancien « pas de mise ».
+                const cached = cacheById.get(row.id);
+                if (cached && cached !== local) patchAuction(cached, row);
+            }
+
+            if (changed) renderActiveSales(lastActiveSales);
+        } catch (e) {
+            // Best-effort : le refresh complet 30 s reste le filet de sécurité.
+        } finally {
+            _activeSalesFastRefreshBusy = false;
+        }
+    }
+
     // Mes enchères gagnées — remplace le `won` disparu. Alimente l'historique des achats.
     async function fetchWonFromDb(limit) {
         const uid = currentUserId();
@@ -20796,6 +20893,10 @@
         };
         refreshActiveSales(); // initial
         setInterval(refreshActiveSales, 30000);
+
+        // v3.4.14 : état prix/meneur des ventes déjà visibles quasi temps réel (<= ~2 s).
+        // Le refresh complet 30 s reste chargé de découvrir/retirer les ventes et des compteurs.
+        setInterval(() => { refreshActiveSaleBidStatesFast().catch(() => { }); }, ACTIVE_SALES_FAST_REFRESH_MS);
 
         // Filet de sécurité : réconcilie les ventes en attente toutes les 5 min (retag des
         // invendues revenues), même si le Trash Seller n'est pas lancé. Sans effet si rien
