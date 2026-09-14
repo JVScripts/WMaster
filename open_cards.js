@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.4';
+    const WM_VERSION = '3.4.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -990,7 +990,38 @@
         if (!Number.isFinite(Number(r.lastTagAttemptAt))) r.lastTagAttemptAt = 0;
         if (!Number.isFinite(Number(r.nextTagRetryAt))) r.nextTagRetryAt = 0;
         if (typeof r.returningFromUnsold !== 'boolean') r.returningFromUnsold = false;
+
+        // v3.4.3 — file d'attente Flip persistante. Les anciennes lignes commencent
+        // dans l'ordre d'achat historique ; chaque invendu sera ensuite déplacé au fond.
+        if (!Number.isFinite(Number(r.queueAt)) || Number(r.queueAt) <= 0) {
+            const legacyOrder = Number(r.boughtAt || 0);
+            r.queueAt = Number.isFinite(legacyOrder) && legacyOrder > 0 ? legacyOrder : Date.now();
+        }
     });
+
+    let flipQueueClock = Math.max(
+        Date.now(),
+        ...flipLedger.map(r => Number(r?.queueAt || 0)).filter(Number.isFinite)
+    );
+
+    function nextFlipQueueAt() {
+        flipQueueClock = Math.max(Date.now(), flipQueueClock + 1);
+        return flipQueueClock;
+    }
+
+    function flipQueueOrder(rec) {
+        const q = Number(rec?.queueAt || 0);
+        if (Number.isFinite(q) && q > 0) return q;
+        const bought = Number(rec?.boughtAt || 0);
+        return Number.isFinite(bought) && bought > 0 ? bought : Number.MAX_SAFE_INTEGER;
+    }
+
+    function moveFlipToQueueTail(rec, reason = 'rotation') {
+        if (!rec || typeof rec !== 'object') return;
+        rec.queueAt = nextFlipQueueAt();
+        rec.queueMovedAt = Date.now();
+        rec.queueMoveReason = reason;
+    }
 
     // v2.3.8 : le bug de relation PostgREST pouvait avoir envoyé les pending dans un long
     // backoff. On remet leur échéance à zéro UNE fois pour tester immédiatement le nouveau chemin.
@@ -1182,7 +1213,7 @@
     } catch (e) { }
 
     // v2.6.0 : les invendus bloqués en attente sont relancés avec la recherche
-    // ciblée par rareté et le relisting immédiat.
+    // ciblée par rareté ; le roulement v3.4.3 décide ensuite quand les relister.
     try {
         const k = 'wm_flip_v260_rarity_return_retry_done';
         if (!localStorage.getItem(k)) {
@@ -1247,6 +1278,11 @@
                 soldAt: null,
                 profit: null,
                 relists: 0,
+                // v3.4.3 : position persistante dans la file de vente.
+                // Un achat neuf arrive au fond de la file courante.
+                queueAt: nextFlipQueueAt(),
+                queueMovedAt: null,
+                queueMoveReason: 'achat',
                 wmAverage: null,
                 wmAverageFetchedAt: 0,
                 wmAverageReason: null,
@@ -3406,44 +3442,8 @@
         return null;
     }
 
-    async function immediateRelistUnsoldFlip(rec) {
-        if (!rec || rec.status !== 'tagged' || !rec.userCardId) return false;
-
-        const state = await fetchSellingState().catch(() => null);
-        if (!state) {
-            rec.lastError = 'retaguée vente · état des slots illisible';
-            saveFlipLedger();
-            return false;
-        }
-
-        const maxActive = effectiveMaxActive(state.max);
-        if (state.count >= maxActive) {
-            rec.lastError = `retaguée vente · attente slot (${state.count}/${maxActive})`;
-            saveFlipLedger();
-            return false;
-        }
-
-        await new Promise(r => setTimeout(r, 350));
-
-        const result = await listFlipRecord(rec).catch(e => ({
-            ok: false,
-            reason: e?.message || String(e)
-        }));
-
-        if (result?.ok) {
-            wmLog(
-                `🔁 Flip invendu relisté immédiatement : <b>${rec.title}</b> [${rec.rarity}] ` +
-                `→ <b>${rec.listPrice} 💰</b>.`
-            );
-            return true;
-        }
-
-        // Le tag reste en place : la boucle Flip Seller pourra reprendre sans refaire tout le cycle.
-        rec.status = 'tagged';
-        rec.lastError = `relist immédiat échoué · ${result?.reason || 'raison inconnue'}`;
-        saveFlipLedger();
-        return false;
-    }
+    // v3.4.3 : aucun relisting immédiat des invendus. Ils sont retagués puis
+    // replacés au fond de la file round-robin afin de laisser tourner le stock.
 
     // Une enchère Flip vient de finir sans acheteur : on attend le retour réel dans la
     // collection, on récupère le NOUVEL user_card_id puis on remet immédiatement `vente`.
@@ -3500,16 +3500,12 @@
             `→ tag <b>vente</b> remis.`
         );
 
-        // Ne pas attendre le prochain tour de 10–15 s : l'enchère qui vient de finir a libéré
-        // un slot. On tente immédiatement le relisting.
-        const relisted = await immediateRelistUnsoldFlip(rec).catch(() => false);
-
-        if (!relisted && rec.status === 'tagged') {
-            wmLog(
-                `⏳ Flip Seller : <b>${rec.title}</b> retagué vente, ` +
-                `relisting automatique au prochain slot/cycle.`
-            );
-        }
+        // v3.4.3 — roulement strict : un invendu ne reprend JAMAIS immédiatement
+        // le slot qu'il vient de libérer. Il a déjà été déplacé au fond de la file lors
+        // de la confirmation d'invendu ; le Flip Seller choisira donc les suivants.
+        wmLog(
+            `🔄 Flip Seller : <b>${rec.title}</b> retagué vente et replacé au <b>fond de la file</b>.`
+        );
 
         return true;
     }
@@ -3586,6 +3582,9 @@
 
             rec.saleAuctionId = null;
             rec.relists = Number(rec.relists || 0) + 1;
+            // v3.4.3 — round-robin : toute carte réellement invendue repart au fond.
+            // Ainsi 1,2,3,4,5 laissent la place aux suivantes avant de revenir.
+            moveFlipToQueueTail(rec, `invendue #${rec.relists}`);
             changed = true;
 
             // Ne bloque pas toute la boucle si le retour collection prend quelques secondes.
@@ -3645,7 +3644,7 @@
         };
 
         const hidden = Math.max(0, sorted.filter(r => r && r.status !== 'sold').length - openRows.length);
-        el.innerHTML = `<div style="font-size:8px;color:#555;margin-bottom:4px;">Prix live = moyenne officielle WikiMasters · actualisée automatiquement pour les Flips.</div>` +
+        el.innerHTML = `<div style="font-size:8px;color:#555;margin-bottom:4px;">Flip Seller en file FIFO/round-robin · un invendu repart au fond de la file avant un nouveau passage.</div>` +
             rows.map(r => {
                 const rarNow = htmlEsc(r.rarity || '?');
                 const boughtRar = String(r.purchaseRarity || '').toUpperCase();
@@ -3699,7 +3698,12 @@
 
                 const ready = flipLedger
                     .filter(r => r && r.status === 'tagged' && r.userCardId && taggedIds.has(r.userCardId))
-                    .sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
+                    // v3.4.3 — vraie file FIFO/round-robin persistante, indépendante de boughtAt.
+                    // Un invendu reçoit un nouveau queueAt et passe derrière les cartes en attente.
+                    .sort((a, b) =>
+                        flipQueueOrder(a) - flipQueueOrder(b) ||
+                        Number(a.boughtAt || 0) - Number(b.boughtAt || 0)
+                    );
 
                 const state = await fetchSellingState();
                 if (!state) {
@@ -3721,11 +3725,15 @@
                     continue;
                 }
 
-                const batch = ready.slice(0, slots);
-                if (statusEl) statusEl.innerHTML = `<span style="color:#06b6d4;">💸 Mise en vente de ${batch.length} flip(s)…</span>`;
-                let ok = 0, fail = 0, blockedMarket = 0;
-                for (const rec of batch) {
-                    if (!flipSellerRunning) break;
+                // v3.4.3 — ne prend plus seulement `ready.slice(0, slots)` : une carte
+                // non vendable (<15 ventes, erreur ponctuelle...) ne doit pas bloquer celles
+                // placées derrière elle. On parcourt la file jusqu'à remplir les slots ou
+                // épuiser les candidats de CE tour, sans retenter deux fois la même carte.
+                if (statusEl) statusEl.innerHTML = `<span style="color:#06b6d4;">💸 Roulement Flip · jusqu'à ${slots} slot(s) à remplir…</span>`;
+                let ok = 0, fail = 0, blockedMarket = 0, attempted = 0;
+                for (const rec of ready) {
+                    if (!flipSellerRunning || ok >= slots) break;
+                    attempted++;
                     const r = await listFlipRecord(rec);
                     if (r.ok) ok++;
                     else {
@@ -3735,16 +3743,16 @@
                         saveFlipLedger();
                         wmLog(
                             r?.blockedMarket
-                                ? `⏳ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
+                                ? `⏳ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)} · suivant de la file essayé`
                                 : `⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                         );
                     }
                     await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
                 }
                 if (statusEl) {
-                    statusEl.innerHTML = blockedMarket === batch.length && ok === 0
-                        ? `<span style="color:#fbbf24;">⏳ ${blockedMarket} flip(s) en attente d'au moins ${RECENT_MARKET_MIN_SALES} ventes</span>`
-                        : `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} non listé(s)</span>` : ''}`;
+                    statusEl.innerHTML = attempted > 0 && blockedMarket === attempted && ok === 0
+                        ? `<span style="color:#fbbf24;">⏳ ${blockedMarket} flip(s) parcouru(s), tous en attente d'au moins ${RECENT_MARKET_MIN_SALES} ventes</span>`
+                        : `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} candidat(s) passé(s)</span>` : ''}`;
                 }
                 renderFlipHistory();
 
@@ -3990,6 +3998,33 @@
 
         renderFlipHistory();
         return rec;
+    };
+
+    // v3.4.3 — diagnostic de la file de vente round-robin.
+    window.wmFlipQueueDiag = function () {
+        const rows = flipLedger
+            .filter(r => r && r.status !== 'sold')
+            .sort((a, b) =>
+                flipQueueOrder(a) - flipQueueOrder(b) ||
+                Number(a.boughtAt || 0) - Number(b.boughtAt || 0)
+            )
+            .map((r, i) => ({
+                position: i + 1,
+                carte: r.title || '?',
+                rarete: r.rarity || '?',
+                statut: r.status || '?',
+                relists: Number(r.relists || 0),
+                queueAt: Number.isFinite(Number(r.queueAt))
+                    ? new Date(Number(r.queueAt)).toISOString()
+                    : null,
+                raisonDernierDeplacement: r.queueMoveReason || null,
+                achat: Number.isFinite(Number(r.boughtAt))
+                    ? new Date(Number(r.boughtAt)).toISOString()
+                    : null
+            }));
+
+        console.table(rows);
+        return rows;
     };
 
     window.wmActiveSalesUsernames = async function () {
@@ -17192,7 +17227,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.2 Trend-Aware v3 : <b>15 ventes obligatoires</b>. Le prix juste détecte les <b>changements de régime</b>. Hunter et Flip sont maintenant liés : le Hunter part du <b>prix de sortie réel du 1er listing</b> (100% - urgence), ajoute seulement une sécurité achat-only, puis applique le ratio Hunter. Ainsi une urgence -8pt baisse aussi le plafond d’achat. Flip : base <b>100% → 95% → 90%</b>, jusqu’à -12pt d’urgence selon baisse, fraîcheur, rythme global <b>et rythme des 5 dernières</b>. <b>Aucun fallback WM</b>. Marge mini toujours protégée.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.3 Trend-Aware v3 : <b>15 ventes obligatoires</b>. Le prix juste détecte les <b>changements de régime</b>. Hunter et Flip sont maintenant liés : le Hunter part du <b>prix de sortie réel du 1er listing</b> (100% - urgence), ajoute seulement une sécurité achat-only, puis applique le ratio Hunter. Ainsi une urgence -8pt baisse aussi le plafond d’achat. Flip : base <b>100% → 95% → 90%</b>, jusqu’à -12pt d’urgence selon baisse, fraîcheur, rythme global <b>et rythme des 5 dernières</b>. <b>Aucun fallback WM</b>. Marge mini toujours protégée. <b>Flip en roulement FIFO</b> : tout invendu repart au fond de la file au lieu de reprendre immédiatement un slot.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -21432,7 +21467,7 @@
         ============================================================ */
 
     wmLog(
-        `⚡ v3.4.2 Trend-Aware v3 Purchase↔Exit + Headless Hunter : 15 ventes strictes, régime 5 ventes, robuste 11 centrales, sortie Flip intégrée à l’achat · ` +
+        `⚡ v3.4.3 Trend-Aware v3 Purchase↔Exit + Flip Round-Robin + Headless Hunter : 15 ventes strictes, régime 5 ventes, robuste 11 centrales, sortie Flip intégrée à l’achat · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
