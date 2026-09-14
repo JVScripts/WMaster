@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.6';
+    const WM_VERSION = '3.4.7';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -656,6 +656,7 @@
     }
 
     function getFlipTargetFromRecentMarket(rec, recentAverage, recent = null) {
+        if (!recentMarketIntegrityAllowed(recent)) return 0;
         const avg = Number(recentAverage);
         if (!Number.isFinite(avg) || avg <= 0) return 0;
         return roundFlipReferencePriceDown(avg * (getFlipRecentSellPct(rec, recent) / 100));
@@ -947,6 +948,10 @@
             (!prev.source || prev.source === 'wmaster_manual')
         ) {
             resolvedSource = nextSource;
+        }
+
+        if (nextSource === 'hunter_dynamic' || isDynamicHunterAuction(auction)) {
+            resolvedSource = 'hunter_dynamic';
         }
 
         autoFlipCandidates.set(auction.id, {
@@ -2652,6 +2657,10 @@
 
         const stage = getFlipWmSellStage(rec);
 
+        if (recent?.ok && !recentMarketIntegrityAllowed(recent)) {
+            return recentMarketIntegrityHtml(recent);
+        }
+
         if (recent?.eligible && Number(recent?.count || 0) >= RECENT_MARKET_MIN_SALES) {
             const ageSec = Math.floor(Number(recent.ageMs || 0) / 1000);
             const ageText = ageSec < 60
@@ -2728,16 +2737,13 @@
             true
         ).catch(() => null);
 
-        const recentStored = getCachedRecentMarket(
-            cardId,
-            rarity,
-            RECENT_MARKET_FLIP_MAX_STALE_MS
-        );
-
-        const recent = recentFresh?.ok ? recentFresh : recentStored;
+        // Le contrôle doit réussir sur cette lecture de l'historique.
+        // Ne pas réutiliser une ancienne référence après un échec de la requête.
+        const recent = recentFresh?.ok ? recentFresh : null;
         const recentCount = Number(recent?.count || 0);
         const recentEligible =
             recent?.eligible &&
+            recentMarketIntegrityAllowed(recent) &&
             recentCount >= RECENT_MARKET_MIN_SALES &&
             Number.isFinite(Number(recent.marketReference)) &&
             Number(recent.marketReference) > 0;
@@ -2748,7 +2754,11 @@
                 blockedByRecentMarket: true,
                 price: null,
                 floor,
-                basis: `marché récent insuffisant · ${recentCount}/${RECENT_MARKET_MIN_SALES} ventes · aucune vente automatique`,
+                blockedByMarketIntegrity: !!recent?.ok && !recentMarketIntegrityAllowed(recent),
+                marketIntegrity: recent?.marketIntegrity ?? null,
+                basis: recent?.ok && !recentMarketIntegrityAllowed(recent)
+                    ? `prix automatique en attente · ${recentMarketIntegrityReason(recent)}`
+                    : `marché récent insuffisant · ${recentCount}/${RECENT_MARKET_MIN_SALES} ventes · aucune vente automatique`,
                 reference: null,
                 referenceKind: null,
                 wmAverage: null,
@@ -4108,6 +4118,9 @@
             scoreLiquidite: recent?.liquidityScore ?? null,
             scoreVolatilite: recent?.volatilityScore ?? null,
             scoreConfiance: recent?.confidenceScore ?? null,
+            controleMarche: recent?.marketIntegrity?.status ?? 'unverifiable',
+            motifsControleMarche: recentMarketIntegrityReason(recent),
+            detailsControleMarche: recent?.marketIntegrity ?? null,
             liquiditeHunterOK: !!recent?.liquidityEligible,
             seuilVentesHunter: HUNTER_RECENT_MIN_SALES,
             seuilStrictRobuste: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
@@ -4143,6 +4156,8 @@
             blocage = 'Recent Market inaccessible';
         } else if (!recent?.eligible || !hunterRecentSalesAllowed(recent)) {
             blocage = `seulement ${recent?.count ?? 0}/${HUNTER_RECENT_MIN_SALES} ventes Hunter`;
+        } else if (!recentMarketIntegrityAllowed(recent)) {
+            blocage = recentMarketIntegrityReason(recent);
         } else if (!hunterRecentReferenceAllowed(robust)) {
             blocage = `moyenne robuste ${Math.round(robust)} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
         } else if (!recent?.liquidityEligible) {
@@ -4213,6 +4228,9 @@
             scoreVolatilite: recent?.volatilityScore ?? null,
             scoreDiversite: recent?.diversityScore ?? null,
             scoreConfiance: recent?.confidenceScore ?? null,
+            controleMarche: recent?.marketIntegrity?.status ?? 'unverifiable',
+            motifsControleMarche: recentMarketIntegrityReason(recent),
+            detailsControleMarche: recent?.marketIntegrity ?? null,
             sortieFlipPrevuePct: Number.isFinite(Number(recent?.expectedExitPct))
                 ? Math.round(Number(recent.expectedExitPct) * 10) / 10
                 : null,
@@ -5603,6 +5621,285 @@
         };
     }
 
+    // v3.4.7 — garde-fou sur les 15 ventes de la même carte / rareté.
+    // Ce sont des heuristiques de prudence, pas une preuve de comptes liés.
+    // Un signal fort met l'achat ET la référence de vente automatique en attente.
+    const MARKET_INTEGRITY_POLICY = Object.freeze({
+        repeatedPairMin: 3,
+        reciprocalTradesMin: 4,
+        cycleTradesMin: 5,
+        maxBuyerShare: 0.50,
+        topTwoBuyerShare: 0.80,
+        dominantSellerShare: 0.60,
+        concentratedBuyerCount: 3,
+        clusterMinCount: 3,
+        clusterGapRatio: 3,
+        clusterMedianRatio: 6,
+        highClusterMinCount: 5,
+        repeatedHighPriceMin: 3,
+        lowReturnRatio: 0.35,
+        recentRiseRatio: 3,
+        burstMinCount: 4,
+        burstWindowMs: 30 * 60 * 1000,
+        maxFutureSkewMs: 5 * 60 * 1000
+    });
+
+    function recentSaleTimestamp(row) {
+        // Une date absente n'est pas une vente à l'époque Unix.
+        for (const value of [row?.settled_at, row?.end_at]) {
+            if (value == null || value === '') continue;
+            const ts = new Date(value).getTime();
+            if (Number.isFinite(ts) && ts > 0) return ts;
+        }
+        return null;
+    }
+
+    function assessRecentMarketIntegrity(rows, nowTs = Date.now()) {
+        const policy = MARKET_INTEGRITY_POLICY;
+        const sales = (Array.isArray(rows) ? rows : []).slice(0, RECENT_MARKET_LIMIT);
+        const reasons = [];
+        const warnings = [];
+        const metrics = {};
+        const add = (code, detail) => {
+            if (!reasons.some(r => r.code === code)) reasons.push({ code, detail });
+        };
+        const warn = (code, detail) => warnings.push({ code, detail });
+        const result = (status) => ({
+            checked: true,
+            status,
+            allowed: status === 'clear',
+            reasons,
+            warnings,
+            metrics
+        });
+        const median = (values) => {
+            const sorted = values.slice().sort((a, b) => a - b);
+            const mid = Math.floor(sorted.length / 2);
+            return sorted.length
+                ? (sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2)
+                : null;
+        };
+        const normalizeId = value => String(value ?? '').trim().toLowerCase();
+        const increment = (map, key) => map.set(key, (map.get(key) || 0) + 1);
+        const largest = map => map.size ? Math.max(...map.values()) : 0;
+
+        if (sales.length < RECENT_MARKET_MIN_SALES) {
+            add('insufficient_sales', `${sales.length}/${RECENT_MARKET_MIN_SALES} ventes vérifiables`);
+            return result('unverifiable');
+        }
+
+        const auctionIds = new Set();
+        const parsed = sales.map(row => {
+            const id = normalizeId(row?.id);
+            const buyer = normalizeId(row?.winner_id);
+            const seller = normalizeId(row?.seller_id);
+            const price = Number(row?.final_price);
+            const ts = recentSaleTimestamp(row);
+            if (!id || !buyer || !seller) {
+                add('missing_identity', 'identifiants de vente, acheteur ou vendeur manquants');
+            }
+            if (id && auctionIds.has(id)) {
+                add('duplicate_auction', 'une même vente apparaît plusieurs fois dans l’historique');
+            }
+            if (id) auctionIds.add(id);
+            if (!Number.isFinite(price) || price <= 0) {
+                add('invalid_price', 'prix final manquant ou invalide');
+            }
+            if (!Number.isFinite(ts) || ts > nowTs + policy.maxFutureSkewMs) {
+                add('invalid_time', 'date de vente absente ou incohérente');
+            }
+            if (/^(active|open|pending|cancelled|canceled|expired)$/i.test(String(row?.status || ''))) {
+                add('unsettled_sale', 'l’historique contient une vente non conclue');
+            }
+            return { id, buyer, seller, price, ts };
+        });
+        if (reasons.length) return result('unverifiable');
+        parsed.sort((a, b) => b.ts - a.ts);
+
+        const buyers = new Map();
+        const sellers = new Map();
+        const pairs = new Map();
+        const graph = new Map();
+        for (const sale of parsed) {
+            increment(buyers, sale.buyer);
+            increment(sellers, sale.seller);
+            const pairKey = JSON.stringify([sale.seller, sale.buyer]);
+            const pair = pairs.get(pairKey) || { seller: sale.seller, buyer: sale.buyer, count: 0 };
+            pair.count++;
+            pairs.set(pairKey, pair);
+            if (!graph.has(sale.seller)) graph.set(sale.seller, new Set());
+            if (!graph.has(sale.buyer)) graph.set(sale.buyer, new Set());
+            graph.get(sale.seller).add(sale.buyer);
+            if (sale.seller === sale.buyer) {
+                add('self_trade', 'une vente a le même identifiant acheteur et vendeur');
+            }
+        }
+
+        const buyerCounts = [...buyers.values()].sort((a, b) => b - a);
+        const maxBuyerShare = largest(buyers) / parsed.length;
+        const maxSellerShare = largest(sellers) / parsed.length;
+        const topTwoBuyerShare = (buyerCounts[0] + (buyerCounts[1] || 0)) / parsed.length;
+        const repeatedPairs = [...pairs.values()].filter(p => p.count >= policy.repeatedPairMin);
+        Object.assign(metrics, {
+            uniqueBuyers: buyers.size,
+            uniqueSellers: sellers.size,
+            maxBuyerShare,
+            maxSellerShare,
+            topTwoBuyerShare,
+            repeatedPairCount: repeatedPairs.length,
+            maxPairTrades: Math.max(...[...pairs.values()].map(p => p.count))
+        });
+        if (repeatedPairs.length) {
+            add('repeated_pair', `même couple vendeur–acheteur : jusqu’à ${metrics.maxPairTrades}/${parsed.length} ventes`);
+        }
+        if (maxBuyerShare >= policy.maxBuyerShare || topTwoBuyerShare >= policy.topTwoBuyerShare) {
+            add('buyer_concentration', `demande concentrée : premier acheteur ${Math.round(maxBuyerShare * 100)} %, deux premiers ${Math.round(topTwoBuyerShare * 100)} %`);
+        }
+        // Un vendeur qui écoule un stock à beaucoup d'acheteurs n'est pas bloqué pour ce seul motif.
+        if (maxSellerShare >= policy.dominantSellerShare) {
+            if (buyers.size <= policy.concentratedBuyerCount) {
+                add('closed_demand', `vendeur dominant (${Math.round(maxSellerShare * 100)} %) et seulement ${buyers.size} acheteurs`);
+            } else {
+                warn('seller_concentration', `un vendeur représente ${Math.round(maxSellerShare * 100)} % des ventes`);
+            }
+        }
+
+        const seenReciprocal = new Set();
+        let reciprocalTrades = 0;
+        let maxReciprocalTrades = 0;
+        for (const pair of pairs.values()) {
+            if (pair.seller === pair.buyer) continue;
+            const reverse = pairs.get(JSON.stringify([pair.buyer, pair.seller]));
+            const key = JSON.stringify([pair.seller, pair.buyer].sort());
+            if (!reverse || seenReciprocal.has(key)) continue;
+            seenReciprocal.add(key);
+            const count = pair.count + reverse.count;
+            reciprocalTrades += count;
+            maxReciprocalTrades = Math.max(maxReciprocalTrades, count);
+        }
+        Object.assign(metrics, { reciprocalPairCount: seenReciprocal.size, reciprocalTrades });
+        if (maxReciprocalTrades >= policy.reciprocalTradesMin ||
+            (seenReciprocal.size >= 2 && reciprocalTrades >= policy.reciprocalTradesMin)) {
+            add('reciprocal_trades', `${reciprocalTrades} ventes dans les deux sens entre les mêmes comptes`);
+        } else if (reciprocalTrades) {
+            warn('isolated_return', 'un échange dans les deux sens, insuffisant à lui seul pour bloquer');
+        }
+
+        // Composantes fortement connexes sur au plus 30 comptes / 15 ventes.
+        // Repère aussi A → B → C → A, sans demander le profil privé des comptes.
+        const reach = new Map();
+        for (const id of graph.keys()) {
+            const visited = new Set();
+            const stack = [id];
+            while (stack.length) {
+                const node = stack.pop();
+                if (visited.has(node)) continue;
+                visited.add(node);
+                for (const next of graph.get(node) || []) stack.push(next);
+            }
+            reach.set(id, visited);
+        }
+        const assigned = new Set();
+        let maxCycleTrades = 0;
+        for (const id of graph.keys()) {
+            if (assigned.has(id)) continue;
+            const members = new Set([...graph.keys()].filter(other =>
+                reach.get(id).has(other) && reach.get(other).has(id)
+            ));
+            for (const member of members) assigned.add(member);
+            if (members.size < 3) continue;
+            const count = parsed.filter(s => members.has(s.seller) && members.has(s.buyer)).length;
+            maxCycleTrades = Math.max(maxCycleTrades, count);
+            if (count >= Math.max(policy.cycleTradesMin, members.size)) {
+                add('trade_cycle', `${count} ventes dans un circuit fermé de ${members.size} comptes`);
+            }
+        }
+        metrics.maxCycleTrades = maxCycleTrades;
+
+        // Ne pas éliminer les anciennes ventes basses avant de chercher une hausse artificielle.
+        // Un seul prix aberrant ou des prix ronds stables ne suffisent jamais.
+        const byPrice = parsed.slice().sort((a, b) => a.price - b.price);
+        let splitAt = -1;
+        let largestGapRatio = 1;
+        // Trois montants extrêmes au sommet ne doivent pas masquer un groupe gonflé plus large.
+        for (let i = policy.clusterMinCount; i <= byPrice.length - policy.highClusterMinCount; i++) {
+            const ratio = byPrice[i].price / byPrice[i - 1].price;
+            if (ratio > largestGapRatio) { largestGapRatio = ratio; splitAt = i; }
+        }
+        const recentMedian = median(parsed.slice(0, RECENT_TREND_BLOCK_SIZE).map(s => s.price));
+        const olderMedian = median(parsed.slice(-RECENT_TREND_BLOCK_SIZE).map(s => s.price));
+        const recentRiseRatio = recentMedian / olderMedian;
+        Object.assign(metrics, { recentMedian, olderMedian, recentRiseRatio, largestGapRatio });
+
+        if (splitAt >= 0 && largestGapRatio >= policy.clusterGapRatio) {
+            const low = byPrice.slice(0, splitAt);
+            const high = byPrice.slice(splitAt);
+            const lowMedian = median(low.map(s => s.price));
+            const highMedian = median(high.map(s => s.price));
+            const highPriceCounts = new Map();
+            for (const s of high) increment(highPriceCounts, s.price);
+            const repeatedHighPrice = largest(highPriceCounts);
+            const latestReturnLow = parsed[0].price <= highMedian * policy.lowReturnRatio;
+            const highBuyers = new Set(high.map(s => s.buyer)).size;
+            Object.assign(metrics, {
+                lowClusterMedian: lowMedian,
+                highClusterMedian: highMedian,
+                highClusterCount: high.length,
+                highClusterBuyers: highBuyers,
+                repeatedHighPrice,
+                latestReturnLow
+            });
+            if (high.length >= policy.highClusterMinCount &&
+                highMedian / lowMedian >= policy.clusterMedianRatio &&
+                (repeatedHighPrice >= policy.repeatedHighPriceMin || latestReturnLow || highBuyers <= 2)) {
+                add('price_regimes', `deux niveaux de prix séparés par ×${(highMedian / lowMedian).toFixed(1)}, avec répétitions, demande concentrée ou retour récent vers le bas`);
+            }
+        }
+
+        if (recentRiseRatio >= policy.recentRiseRatio) {
+            const recent = parsed.slice(0, RECENT_TREND_BLOCK_SIZE);
+            const recentBuyers = new Set(recent.map(s => s.buyer)).size;
+            if (recentBuyers <= 2) {
+                add('concentrated_rise', `hausse récente ×${recentRiseRatio.toFixed(1)} portée par ${recentBuyers} acheteurs sur les 5 dernières ventes`);
+            } else {
+                warn('rapid_rise', `hausse récente ×${recentRiseRatio.toFixed(1)} ; les comptes distincts ne prouvent pas leur indépendance`);
+            }
+            for (let i = 0; i <= parsed.length - policy.burstMinCount; i++) {
+                const burst = parsed.slice(i, i + policy.burstMinCount);
+                const span = burst[0].ts - burst[burst.length - 1].ts;
+                if (span <= policy.burstWindowMs &&
+                    new Set(burst.map(s => s.buyer)).size <= 2 &&
+                    median(burst.map(s => s.price)) >= olderMedian * policy.recentRiseRatio) {
+                    add('concentrated_burst', `${policy.burstMinCount} ventes élevées en moins de 30 min auprès de deux acheteurs au plus`);
+                    break;
+                }
+            }
+        }
+        return result(reasons.length ? 'suspicious' : 'clear');
+    }
+
+    function recentMarketIntegrityAllowed(recent) {
+        return recent?.marketIntegrity?.checked === true &&
+            recent.marketIntegrity.status === 'clear' && recent.marketIntegrity.allowed === true;
+    }
+
+    function recentMarketIntegrityReason(recent) {
+        const check = recent?.marketIntegrity;
+        if (!check?.checked) return 'contrôle de l’historique indisponible';
+        if (check.allowed) return '';
+        return check.reasons.map(r => r.detail).join(' · ') || 'historique non vérifiable';
+    }
+
+    function recentMarketIntegrityHtml(recent) {
+        const check = recent?.marketIntegrity;
+        if (recentMarketIntegrityAllowed(recent)) {
+            const warning = (check.warnings || []).map(r => r.detail).join(' · ');
+            return `<span style="color:${warning ? '#fbbf24' : '#4ade80'};" title="${htmlEsc(warning)}">🛡 ${warning ? 'Contrôle OK · prudence' : 'Aucun signal détecté'}</span>`;
+        }
+        const label = check?.status === 'suspicious' ? 'Historique suspect' : 'Historique non vérifiable';
+        return `<span style="color:#f59e0b;">🛡 ${label} · achats et prix Flip automatiques en attente — ${htmlEsc(recentMarketIntegrityReason(recent))}</span>`;
+    }
+
     function buildRecentMarketSnapshot(probe, cardId, rarity) {
         if (!probe?.ok) {
             return {
@@ -5614,6 +5911,11 @@
                 fetchedAt: Date.now(),
                 eligible: false,
                 hunterEligible: false,
+                marketIntegrity: {
+                    checked: false, status: 'unverifiable', allowed: false,
+                    reasons: [{ code: 'api_unavailable', detail: 'historique des ventes inaccessible' }],
+                    warnings: [], metrics: {}
+                },
                 count: 0,
                 prices: [],
                 trimmedPrices: [],
@@ -5632,16 +5934,18 @@
 
         const rows = (Array.isArray(probe.rows) ? probe.rows : [])
             .filter(r => Number.isFinite(Number(r?.final_price)) && Number(r.final_price) > 0)
-            .slice(0, RECENT_MARKET_LIMIT);
+            .slice(0, RECENT_MARKET_LIMIT)
+            .sort((a, b) => (recentSaleTimestamp(b) ?? 0) - (recentSaleTimestamp(a) ?? 0));
         const prices = rows.map(r => Number(r.final_price));
         const calc = computeRobustRecentAverage(prices);
+        const nowTs = typeof serverNow === 'function' ? serverNow() : Date.now();
+        const marketIntegrity = assessRecentMarketIntegrity(rows, nowTs);
 
         const saleTimes = rows
-            .map(r => new Date(r?.settled_at || r?.end_at || 0).getTime())
+            .map(recentSaleTimestamp)
             .filter(Number.isFinite);
         const newestTs = saleTimes.length ? saleTimes[0] : null;
         const oldestTs = saleTimes.length ? saleTimes[saleTimes.length - 1] : null;
-        const nowTs = typeof serverNow === 'function' ? serverNow() : Date.now();
         const newestSaleAgeMs = Number.isFinite(newestTs)
             ? Math.max(0, nowTs - newestTs)
             : null;
@@ -5662,7 +5966,7 @@
 
         const recentSaleTimes = rows
             .slice(0, RECENT_TREND_BLOCK_SIZE)
-            .map(r => new Date(r?.settled_at || r?.end_at || 0).getTime())
+            .map(recentSaleTimestamp)
             .filter(Number.isFinite);
         const recentSalesSpanMs = recentSaleTimes.length >= 2
             ? Math.max(0, recentSaleTimes[0] - recentSaleTimes[recentSaleTimes.length - 1])
@@ -5778,15 +6082,15 @@
         const relist2ExitPct = Math.max(1, relist2ExitBasePct - sellUrgencyDiscountPct);
 
         const expectedExitReference =
-            calc.eligible && Number.isFinite(calc.marketReference)
+            calc.eligible && marketIntegrity.allowed && Number.isFinite(calc.marketReference)
                 ? calc.marketReference * (expectedExitPct / 100)
                 : null;
         const relist1ExitReference =
-            calc.eligible && Number.isFinite(calc.marketReference)
+            calc.eligible && marketIntegrity.allowed && Number.isFinite(calc.marketReference)
                 ? calc.marketReference * (relist1ExitPct / 100)
                 : null;
         const relist2ExitReference =
-            calc.eligible && Number.isFinite(calc.marketReference)
+            calc.eligible && marketIntegrity.allowed && Number.isFinite(calc.marketReference)
                 ? calc.marketReference * (relist2ExitPct / 100)
                 : null;
 
@@ -5802,7 +6106,7 @@
         );
 
         const hunterReference =
-            calc.eligible && liquidityEligible &&
+            calc.eligible && liquidityEligible && marketIntegrity.allowed &&
             Number.isFinite(expectedExitReference) && expectedExitReference > 0
                 ? expectedExitReference * hunterPurchaseSafetyFactor
                 : null;
@@ -5841,8 +6145,10 @@
             sellUrgencyDiscountPct,
             ...participants,
             ...calc,
+            marketIntegrity,
             hunterEligible:
                 calc.eligible &&
+                marketIntegrity.allowed &&
                 liquidityEligible &&
                 Number.isFinite(hunterReference) && hunterReference > 0
         };
@@ -5924,6 +6230,7 @@
     }
 
     function recentMarketLabel(snap) {
+        if (!recentMarketIntegrityAllowed(snap)) return 'Historique en attente de vérification';
         const ref = Number(snap?.marketReference);
         if (!snap?.eligible || !Number.isFinite(ref) || ref <= 0) return null;
 
@@ -5938,7 +6245,7 @@
     // v3.4.2 — Hunter RECENT MARKET + TREND-AWARE v3 · Purchase ↔ Exit.
     // Conditions obligatoires :
     // - 15 ventes valides obligatoires
-    // - moyenne robuste STRICTEMENT supérieure à 500
+    // - moyenne robuste STRICTEMENT supérieure à 790
     // - liquidité minimale obligatoire (vente récente + rythme suffisant)
     // - la valeur d'achat part de la sortie Flip réelle (1er listing - urgence), puis sécurité achat-only
     // - référence récente <= 60 s pour décider
@@ -5970,9 +6277,9 @@
     function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
         const ref = Number(reference);
 
-        // Le seuil >500 porte volontairement sur la MOYENNE ROBUSTE dans
+        // Le seuil >790 porte volontairement sur la MOYENNE ROBUSTE dans
         // getHunterPricingReference()/ensureFreshHunterReference().
-        // Ici, la référence d'achat Trend v3 peut légitimement tomber sous 500
+        // Ici, la référence d'achat Trend v3 peut légitimement tomber sous 790
         // après ajustement du risque ; on applique alors simplement le ratio Hunter.
         if (
             kind !== 'recent_market' ||
@@ -5990,7 +6297,8 @@
     }
 
     function hunterRecentLiquidityAllowed(recent) {
-        return !!recent?.hunterEligible && !!recent?.liquidityEligible;
+        return !!recent?.hunterEligible && !!recent?.liquidityEligible &&
+            recentMarketIntegrityAllowed(recent);
     }
 
     function hunterPricingReferenceFromRecent(recent, cardId, rarity) {
@@ -6053,7 +6361,8 @@
             sellUrgencyDiscountPct: Number(recent.sellUrgencyDiscountPct || 0),
             uniqueWinners: Number(recent.uniqueWinners || 0),
             uniqueSellers: Number(recent.uniqueSellers || 0),
-            participantConcentration: Number(recent.participantConcentration || 0)
+            participantConcentration: Number(recent.participantConcentration || 0),
+            marketIntegrity: recent.marketIntegrity
         };
     }
 
@@ -6085,8 +6394,11 @@
             maxAgeMs
         );
 
-        // Fail-safe : API inaccessible, <15 ventes, robuste <=500,
-        // liquidité insuffisante ou référence d'achat v3 invalide => aucune mise.
+        // API inaccessible, contrôle rejeté, <15 ventes, robuste <=790 ou liquidité insuffisante : aucune mise.
+        if (recent?.ok && !recentMarketIntegrityAllowed(recent)) {
+            stopHunterForMarketIntegrity(auction, recent);
+            return null;
+        }
         return hunterPricingReferenceFromRecent(recent, cardId, rarity);
     }
 
@@ -6152,19 +6464,50 @@
     // depuis le Recent Market. Un ancien plafond n'est jamais conservé.
     const dynamicOfficialAverageBlockLogged = new Set();
 
+    function isDynamicHunterAuction(auction) {
+        if (!auction?.id) return false;
+        if (autoFlipCandidates.get(auction.id)?.source === 'hunter_dynamic') return true;
+        if (!hunterFourbeMap.has(auction.id)) return false;
+        const arm = hunterFourbeMap.get(auction.id);
+        // Ancien format : mode d'origine inconnu => revalidation prudente.
+        return !arm || typeof arm !== 'object' || arm.dynamic !== false;
+    }
+
+    const marketIntegrityBlockLog = new Map();
+    function stopHunterForMarketIntegrity(auction, recent) {
+        if (!recent?.ok || recentMarketIntegrityAllowed(recent)) return false;
+        if (isDynamicHunterAuction(auction)) {
+            if (autoBidSet.delete(auction.id)) saveAutoBidSet();
+            if (disarmHunterFourbe(auction.id)) { saveSnipeSet(); saveHunterFourbe(); }
+            setAutoBidMax(auction.id, null);
+        }
+        const key = recentMarketKey(recent.cardId, recent.rarity);
+        const reason = recentMarketIntegrityReason(recent);
+        const prior = marketIntegrityBlockLog.get(key);
+        if (!prior || prior.reason !== reason || Date.now() - prior.at >= 5 * 60 * 1000) {
+            marketIntegrityBlockLog.delete(key);
+            marketIntegrityBlockLog.set(key, { reason, at: Date.now() });
+            if (marketIntegrityBlockLog.size > RECENT_MARKET_CACHE_MAX_ENTRIES) marketIntegrityBlockLog.delete(marketIntegrityBlockLog.keys().next().value);
+            wmLog(`🛡 Hunter en attente : <b>${htmlEsc(auction?.card?.wikipedia_title || 'carte')}</b> · ${htmlEsc(reason)}`);
+        }
+        return true;
+    }
+
     function dynamicHunterContinuationAllowed(auction) {
         if (!auction?.id) return false;
 
         const candidate = autoFlipCandidates.get(auction.id);
-        if (!candidate || candidate.source !== 'hunter_dynamic') return true;
+        if (!isDynamicHunterAuction(auction)) return true;
 
-        const cardId = auction.card?.id ?? auction.card_id ?? candidate.cardId;
-        const rarity = globalAuctionRarity(auction) || candidate.rarity || '';
+        const cardId = auction.card?.id ?? auction.card_id ?? candidate?.cardId;
+        const rarity = globalAuctionRarity(auction) || candidate?.rarity || '';
 
         const ref = getHunterPricingReference(cardId, rarity);
 
-        // Pas de référence synchrone fraîche : pause et refresh async.
+        // Une référence rejetée désarme réellement l'automatisme ; cache absent = pause.
         if (!ref) {
+            const recent = getCachedRecentMarket(cardId, rarity, HUNTER_RECENT_REFERENCE_MAX_AGE_MS);
+            if (stopHunterForMarketIntegrity(auction, recent)) return false;
             ensureFreshHunterReference(
                 auction,
                 HUNTER_RECENT_REFERENCE_MAX_AGE_MS
@@ -6190,11 +6533,11 @@
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.4.2 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec 15 ventes, liquidité suffisante et moyenne robuste STRICTEMENT > 500.
+    //   avec 15 ventes, liquidité suffisante et moyenne robuste STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
-        const mode = getSetting('autoSnipeMode');
+        const mode = isDynamicHunterAuction(auction) ? 'adaptive' : getSetting('autoSnipeMode');
 
         if (mode === 'adaptive') {
             const cardId = auction.card?.id ?? auction.card_id;
@@ -6213,6 +6556,9 @@
                     if (!recent.eligible || !hunterRecentSalesAllowed(recent)) {
                         reason =
                             `historique insuffisant (${recent.count ?? 0}/${HUNTER_RECENT_MIN_SALES} ventes Hunter)`;
+                    } else if (!recentMarketIntegrityAllowed(recent)) {
+                        stopHunterForMarketIntegrity(auction, recent);
+                        reason = `historique en attente · ${recentMarketIntegrityReason(recent)}`;
                     } else if (!hunterRecentReferenceAllowed(recent.robustAverage)) {
                         const robust = Number(recent.robustAverage);
                         reason =
@@ -8318,7 +8664,7 @@
        (null = aucun) : le désarmement restitue exactement l'état d'origine et ne touche
        jamais aux enchères armées à la main ou par les mots-clés fourbe. */
     const HUNTER_FOURBE_KEY = 'wm_hunter_fourbe';
-    let hunterFourbeMap = new Map(); // auctionId → plafond précédent (number | null)
+    let hunterFourbeMap = new Map(); // auctionId → { previousCap, dynamic } ; ancien number|null accepté
     try {
         const raw = JSON.parse(localStorage.getItem(HUNTER_FOURBE_KEY) || '[]');
         if (Array.isArray(raw)) hunterFourbeMap = new Map(raw);
@@ -8338,7 +8684,10 @@
         if (!id || hunterFourbeMap.has(id)) return false;
         // Déjà un plan sur cette enchère (fourbe manuel/mot-clé, ou auto-bid) → on respecte.
         if (snipeSet.has(id) || autoBidSet.has(id)) return false;
-        hunterFourbeMap.set(id, getAutoBidMax(id));
+        hunterFourbeMap.set(id, {
+            previousCap: getAutoBidMax(id),
+            dynamic: getSetting('autoSnipeMode') === 'adaptive'
+        });
         snipeSet.add(id);
         if (Number.isFinite(cap) && cap > 0) setAutoBidMax(id, cap); // persiste déjà
         saveSnipeSet();
@@ -8349,7 +8698,8 @@
     // No-op (false) si elle n'a pas été armée par ce mode.
     function disarmHunterFourbe(id) {
         if (!hunterFourbeMap.has(id)) return false;
-        const prevCap = hunterFourbeMap.get(id);
+        const arm = hunterFourbeMap.get(id);
+        const prevCap = arm && typeof arm === 'object' ? arm.previousCap : arm;
         hunterFourbeMap.delete(id);
         snipeSet.delete(id);
         setAutoBidMax(id, Number.isFinite(prevCap) && prevCap > 0 ? prevCap : null);
@@ -8800,7 +9150,7 @@
             const listingRarity = globalAuctionRarity(fresh);
             if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) return null;
 
-            if (getSetting('autoSnipeMode') === 'adaptive') {
+            if (getSetting('autoSnipeMode') === 'adaptive' || isDynamicHunterAuction(fresh)) {
                 const freshRef = await ensureFreshHunterReference(
                     fresh,
                     Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
@@ -8820,7 +9170,7 @@
             }
 
             const mode = getSetting('autoSnipeMode');
-            const isDynamic = mode === 'adaptive';
+            const isDynamic = mode === 'adaptive' || isDynamicHunterAuction(fresh);
             if (isDynamic) {
                 const cap = Number(decision.cap);
                 if (!Number.isFinite(cap) || cap <= 0 || amount > cap) return null;
@@ -8909,7 +9259,7 @@
                     }
 
                     markAuctionAsMine(auction.id, amount, auction);
-                    markAutoFlipCandidate(auction, getSetting('autoSnipeMode') === 'adaptive' ? 'hunter_dynamic' : 'hunter_fixed', amount);
+                    markAutoFlipCandidate(auction, isDynamic ? 'hunter_dynamic' : 'hunter_fixed', amount);
                     placed++;
 
                     if (isDynamic) {
@@ -8962,7 +9312,7 @@
             if (iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) continue;
             if (isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a))) continue; // déjà possédée DANS cette rareté
 
-            if (getSetting('autoSnipeMode') === 'adaptive') {
+            if (getSetting('autoSnipeMode') === 'adaptive' || isDynamicHunterAuction(a)) {
                 const freshRef = await ensureFreshHunterReference(
                     a,
                     HUNTER_RECENT_REFERENCE_MAX_AGE_MS
@@ -9832,8 +10182,7 @@
 
                 applyFreshAuctionState(freshBidAuction, { render: false, logExtension: true });
 
-                const normalCandidate = autoFlipCandidates.get(freshBidAuction.id);
-                if (normalCandidate?.source === 'hunter_dynamic') {
+                if (isDynamicHunterAuction(freshBidAuction)) {
                     const freshRef = await ensureFreshHunterReference(
                         freshBidAuction,
                         HUNTER_RECENT_PRE_BID_MAX_AGE_MS
@@ -11375,8 +11724,7 @@
                 // Si ce Fourbe a été armé par le Hunter dynamique, son seuil WM
                 // doit être revérifié au moment réel du snipe.
                 if (
-                    hunterFourbeMap.has(a.id) &&
-                    getSetting('autoSnipeMode') === 'adaptive'
+                    isDynamicHunterAuction(a)
                 ) {
                     const freshRef = await ensureFreshHunterReference(
                         a,
@@ -11477,8 +11825,7 @@
                 // ⚠️ NE PAS faire `continue` si le plafond est atteint : ça sauterait la MàJ de
                 // leadingBidsMap plus bas → l'outbid serait re-détecté au tick suivant.
                 let hunterHotFresh = true;
-                const hunterHotCandidate = autoFlipCandidates.get(a.id);
-                if (hunterHotCandidate?.source === 'hunter_dynamic') {
+                if (isDynamicHunterAuction(a)) {
                     hunterHotFresh = !!(await ensureFreshHunterReference(
                         a,
                         Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
@@ -11538,8 +11885,7 @@
                                             applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
 
                                             let retryHunterFresh = true;
-                                            const retryHunterCandidate = autoFlipCandidates.get(retryFresh.id);
-                                            if (retryHunterCandidate?.source === 'hunter_dynamic') {
+                                            if (isDynamicHunterAuction(retryFresh)) {
                                                 retryHunterFresh = !!(await ensureFreshHunterReference(
                                                     retryFresh,
                                                     Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
@@ -15133,6 +15479,9 @@
                 ? Math.round(Number(recent.hunterRiskFactor) * 100)
                 : null,
             referenceAchatHunter: hunterRefRounded,
+            marketIntegrity: recent.marketIntegrity,
+            controleMarche: recent.marketIntegrity?.status ?? 'unverifiable',
+            motifsControleMarche: recentMarketIntegrityReason(recent),
             hunterLiquiditeOK: !!recent.liquidityEligible,
             hunterAchatAutorise: !!(
                 recent.hunterEligible &&
@@ -15145,7 +15494,7 @@
             concentrationMaxPct: Number.isFinite(Number(recent.participantConcentration))
                 ? Math.round(Number(recent.participantConcentration) * 100)
                 : null,
-            seuilHunterRecent: `15 ventes + robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} + liquidité`,
+            seuilHunterRecent: `15 ventes vérifiables + robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} + liquidité + contrôle manipulation`,
             moyenneWM: Number.isFinite(wm) && wm > 0 ? wm : null,
             marcheRecentSurWM_Pct: ratioToWm,
             erreur: probe?.ok ? null : (probe?.error || 'échec inconnu'),
@@ -15195,7 +15544,9 @@
                     finalPrice: r.final_price,
                     settledAt: r.settled_at,
                     endAt: r.end_at,
-                    status: r.status
+                    status: r.status,
+                    sellerId: r.seller_id,
+                    buyerId: r.winner_id
                 }))
             );
 
@@ -15203,6 +15554,7 @@
                 `🧪 Historique auctions : <b>${probe.rows.length}</b> vente(s) visible(s) ` +
                 `[${rr || 'toutes'}] · ` +
                 `Trend <b>${summary.valeurTrendAware ?? '—'} 💰</b>` +
+                ` · ${recentMarketIntegrityHtml(summary)}` +
                 (summary.tendancePct != null
                     ? ` · tendance <b>${summary.tendancePct >= 0 ? '+' : ''}${summary.tendancePct}%</b>`
                     : '') +
@@ -15336,6 +15688,8 @@
                     poidsTrendPct: x.poidsTendancePct,
                     valeurTrend: x.valeurTrendAware,
                     capHunter: x.hunterRecentCap,
+                    controle: x.controleMarche,
+                    motifs: x.motifsControleMarche,
                     moyWM: x.moyenneWM,
                     ratioPct: x.marcheRecentSurWM_Pct,
                     erreur: x.erreur
@@ -21423,10 +21777,11 @@
                 <div style="color:#888;">
                     ${pricesHtml || '—'}
                 </div>
+                <div style="color:#aaa;">${recentMarketIntegrityHtml(r)}</div>
                 <div style="color:#777;">
                     simple <b>${r.moyenneVentesVisibles ?? '—'}</b> ·
                     robuste <b>${r.moyenneRobusteRecente ?? '—'}</b> ·
-                    Trend <b style="color:#4ade80;">${r.valeurTrendAware ?? '—'}</b> ·
+                    ${recentMarketIntegrityAllowed(r) ? 'Trend' : 'Trend indicative'} <b style="color:${recentMarketIntegrityAllowed(r) ? '#4ade80' : '#888'};">${r.valeurTrendAware ?? '—'}</b> ·
                     tendance <b style="color:${Number(r.tendancePct) < -RECENT_TREND_START_PCT ? '#f59e0b' : Number(r.tendancePct) > RECENT_TREND_START_PCT ? '#67e8f9' : '#aaa'};">${r.tendancePct != null ? `${r.tendancePct >= 0 ? '+' : ''}${r.tendancePct}%` : '—'}</b> ·
                     cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
                     seuil robuste <b>&gt;${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b> ·
@@ -21467,7 +21822,8 @@
         ============================================================ */
 
     wmLog(
-        `⚡ v3.4.3 Trend-Aware v3 Purchase↔Exit + Flip Round-Robin + Headless Hunter : 15 ventes strictes, régime 5 ventes, robuste 11 centrales, sortie Flip intégrée à l’achat · ` +
+        `⚡ v${WM_VERSION} · protection contre les historiques suspects : couples répétés, échanges croisés, circuits de comptes et anomalies de prix · ` +
+        `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes strictes · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
