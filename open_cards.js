@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.8';
+    const WM_VERSION = '3.4.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -13009,6 +13009,9 @@
 
         // Trie par fin la plus proche
         const sorted = [...auctions].sort((a, b) => new Date(a.end_at) - new Date(b.end_at));
+        const activeIds = new Set(sorted.map(a => a?.id).filter(Boolean));
+        pruneActiveSaleNameRetries(activeIds);
+        const pendingBidderNames = [];
 
         el.innerHTML = partialNote + sorted.map(a => {
             const title = a.card?.wikipedia_title || '?';
@@ -13020,6 +13023,7 @@
             const bidder = validResolvedUsername(a.current_bidder?.username);
             const hasBid = !!bidderId || !!bidder;
             const bidderLabel = bidder || (hasBid ? 'résolution du pseudo…' : null);
+            if (bidderId && !bidder) pendingBidderNames.push(a);
             const bidderTitle = bidder
                 ? bidder
                 : bidderId
@@ -13059,7 +13063,7 @@
                         style="background:none;border:1px solid rgba(239,68,68,0.3);color:#ef4444;font-size:10px;line-height:1;padding:1px 5px;border-radius:3px;cursor:pointer;flex-shrink:0;">✕</button>` : ''}
                 </div>
                 <div style="display:flex;justify-content:space-between;align-items:center;font-size:9px;gap:6px;">
-                    <span style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${bidderTitle}">
+                    <span ${bidderId ? `data-wm-active-bidder-id="${htmlEsc(String(bidderId))}"` : ''} style="color:${hasBid ? '#4ade80' : '#666'};white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;flex:1;" title="${bidderTitle}">
                         ${hasBid ? `👤 ${bidderLabel}` : '— pas de mise'}
                     </span>
                     <span style="color:#fbbf24;font-weight:700;white-space:nowrap;">
@@ -13071,6 +13075,10 @@
                 </div>
             </div>`;
         }).join('');
+
+        // Trois retries courts au maximum pour les seuls pseudos encore inconnus. Ensuite,
+        // le refresh normal de 30 s reprend la main : pas de polling agressif permanent.
+        pendingBidderNames.forEach(scheduleActiveSaleNameRetry);
     }
 
     // Prix de mise en vente d'une carte. Par défaut : valeur manuelle du tableau par rareté.
@@ -15225,7 +15233,12 @@
     let _profileProbeLogged = false;
     const _usernameCache = new Map();
     async function resolveUsernames(ids) {
-        const missing = [...new Set((ids || []).filter(id => id && !_usernameCache.has(id)))];
+        // Un ancien échec ne doit jamais figer un UUID sur « ? » : seuls les vrais pseudos
+        // sont considérés comme résolus. Cela permet aux ventes actives de retenter rapidement.
+        const missing = [...new Set((ids || []).filter(id => {
+            if (!id) return false;
+            return !validResolvedUsername(_usernameCache.get(String(id)));
+        }))];
         if (missing.length > 0) {
             const tried = [];
             const tables = _profileTable ? [_profileTable, ...PROFILE_TABLES] : PROFILE_TABLES;
@@ -15242,7 +15255,12 @@
                     _profileTable = t;
                     try { localStorage.setItem(PROFILE_TABLE_KEY, t); } catch (e) { }
                 }
-                rows.forEach(r => { if (r && r.id) _usernameCache.set(r.id, pickUsername(r) || '?'); });
+                rows.forEach(r => {
+                    if (!r?.id) return;
+                    const name = validResolvedUsername(pickUsername(r));
+                    if (name) _usernameCache.set(String(r.id), name);
+                    else _usernameCache.delete(String(r.id));
+                });
                 // Diagnostic si la table répond mais qu'aucune colonne ne ressemble à un pseudo.
                 if (!_profileProbeLogged && rows[0] && !pickUsername(rows[0])) {
                     _profileProbeLogged = true;
@@ -15804,13 +15822,105 @@
        annonces (même source que le Market Watcher). On l'utilise uniquement pour enrichir
        les ventes dont le pseudo est encore inconnu. */
     const _activeSaleBidderNameCache = new Map(); // bidderId -> {name, ts}
-    const _activeSaleAuctionProbeAt = new Map();  // auctionId -> timestamp
+    // auctionId -> {ts, bidderId}. Un changement de meneur doit pouvoir être sondé immédiatement.
+    const _activeSaleAuctionProbeAt = new Map();
+    const _activeSaleNameRetryState = new Map(); // auctionId -> {bidderId, attempts}
+    const _activeSaleNameRetryTimers = new Map(); // auctionId -> timeout
     const ACTIVE_SALE_NAME_TTL_MS = 6 * 60 * 60 * 1000;
-    const ACTIVE_SALE_PROBE_COOLDOWN_MS = 20 * 1000;
+    const ACTIVE_SALE_PROBE_COOLDOWN_MS = 3500;
+    const ACTIVE_SALE_NAME_RETRY_DELAYS_MS = [4000, 8000, 16000];
 
     function validResolvedUsername(name) {
         const s = String(name || '').trim();
         return s && s !== '?' ? s : null;
+    }
+
+    // Mise à jour ciblée : lorsqu'un pseudo est appris, on remplace immédiatement
+    // « résolution du pseudo… » sans attendre le prochain refresh complet des ventes.
+    function updateActiveSaleBidderDom(bidderId, name) {
+        const clean = validResolvedUsername(name);
+        if (!bidderId || !clean || typeof document === 'undefined') return;
+        const wanted = String(bidderId);
+        document.querySelectorAll('[data-wm-active-bidder-id]').forEach(el => {
+            if (String(el.dataset.wmActiveBidderId || '') !== wanted) return;
+            el.textContent = `👤 ${clean}`;
+            el.title = clean;
+        });
+    }
+
+    function clearActiveSaleNameRetry(auctionId) {
+        if (!auctionId) return;
+        const timer = _activeSaleNameRetryTimers.get(auctionId);
+        if (timer) clearTimeout(timer);
+        _activeSaleNameRetryTimers.delete(auctionId);
+        _activeSaleNameRetryState.delete(auctionId);
+    }
+
+    function pruneActiveSaleNameRetries(activeIds) {
+        const keep = activeIds instanceof Set ? activeIds : new Set();
+        for (const auctionId of [..._activeSaleNameRetryState.keys()]) {
+            if (!keep.has(auctionId)) clearActiveSaleNameRetry(auctionId);
+        }
+    }
+
+    function scheduleActiveSaleNameRetry(a) {
+        if (!a?.id) return;
+        const bidderId = auctionCurrentBidderId(a);
+        if (!bidderId || findKnownBidderNameForActiveSale(a)) {
+            clearActiveSaleNameRetry(a.id);
+            return;
+        }
+
+        const id = String(bidderId);
+        let state = _activeSaleNameRetryState.get(a.id);
+        if (!state || state.bidderId !== id) {
+            clearActiveSaleNameRetry(a.id);
+            state = { bidderId: id, attempts: 0 };
+            _activeSaleNameRetryState.set(a.id, state);
+        }
+
+        if (state.attempts >= ACTIVE_SALE_NAME_RETRY_DELAYS_MS.length ||
+            _activeSaleNameRetryTimers.has(a.id)) return;
+
+        const delay = ACTIVE_SALE_NAME_RETRY_DELAYS_MS[state.attempts];
+        const timer = setTimeout(async () => {
+            _activeSaleNameRetryTimers.delete(a.id);
+
+            // On travaille sur l'objet le plus récent du panneau, car une surenchère peut
+            // avoir changé current_bidder_id entre-temps.
+            const live = (lastActiveSales || []).find(x => x?.id === a.id) || a;
+            const liveBidderId = auctionCurrentBidderId(live);
+            if (!liveBidderId) { clearActiveSaleNameRetry(a.id); return; }
+            if (String(liveBidderId) !== state.bidderId) {
+                clearActiveSaleNameRetry(a.id);
+                scheduleActiveSaleNameRetry(live);
+                return;
+            }
+
+            const known = findKnownBidderNameForActiveSale(live);
+            if (known) {
+                applyBidderNameToAuction(live, known);
+                clearActiveSaleNameRetry(a.id);
+                return;
+            }
+
+            state.attempts++;
+            try {
+                // Essai profil direct d'abord, puis marketplace/page exacte si nécessaire.
+                const names = await resolveUsernames([liveBidderId]).catch(() => ({}));
+                const direct = validResolvedUsername(names?.[liveBidderId]);
+                if (direct) applyBidderNameToAuction(live, direct);
+                else await fetchActiveSaleBidderFromMarketplace(live);
+            } catch (e) { }
+
+            if (findKnownBidderNameForActiveSale(live)) {
+                clearActiveSaleNameRetry(a.id);
+            } else {
+                scheduleActiveSaleNameRetry(live);
+            }
+        }, delay);
+
+        _activeSaleNameRetryTimers.set(a.id, timer);
     }
 
     function extractAuctionBidderName(a) {
@@ -15873,11 +15983,18 @@
     function cacheResolvedBidderName(bidderId, name) {
         const clean = validResolvedUsername(name);
         if (!bidderId || !clean) return;
-        _activeSaleBidderNameCache.set(String(bidderId), {
+        const id = String(bidderId);
+        _activeSaleBidderNameCache.set(id, {
             name: clean,
             ts: Date.now()
         });
-        _usernameCache.set(String(bidderId), clean);
+        _usernameCache.set(id, clean);
+        updateActiveSaleBidderDom(id, clean);
+
+        // Si ce pseudo correspond à une vente en attente, plus besoin des retries ciblés.
+        for (const [auctionId, state] of _activeSaleNameRetryState.entries()) {
+            if (state?.bidderId === id) clearActiveSaleNameRetry(auctionId);
+        }
     }
 
     function cachedResolvedBidderName(bidderId) {
@@ -16036,9 +16153,12 @@
         const bidderId = auctionCurrentBidderId(a);
         if (!bidderId) return null;
 
-        const lastProbe = Number(_activeSaleAuctionProbeAt.get(a.id) || 0);
-        if (Date.now() - lastProbe < ACTIVE_SALE_PROBE_COOLDOWN_MS) return null;
-        _activeSaleAuctionProbeAt.set(a.id, Date.now());
+        const probeState = _activeSaleAuctionProbeAt.get(a.id);
+        const now = Date.now();
+        if (probeState &&
+            probeState.bidderId === String(bidderId) &&
+            now - Number(probeState.ts || 0) < ACTIVE_SALE_PROBE_COOLDOWN_MS) return null;
+        _activeSaleAuctionProbeAt.set(a.id, { ts: now, bidderId: String(bidderId) });
 
         const cardId = a.card?.id ?? a.card_id;
 
@@ -16119,18 +16239,33 @@
 
         if (needs.length === 0) return auctions;
 
+        // Résolution groupée des UUID avant les probes marketplace. C'est plus rapide et évite
+        // de laisser « résolution du pseudo… » si la table profil est déjà disponible.
+        const ids = [...new Set(needs.map(auctionCurrentBidderId).filter(Boolean))];
+        const directNames = await resolveUsernames(ids).catch(() => ({}));
+        const unresolved = [];
+        for (const a of needs) {
+            const bidderId = auctionCurrentBidderId(a);
+            const name = validResolvedUsername(directNames?.[bidderId])
+                || cachedResolvedBidderName(bidderId);
+            if (name) applyBidderNameToAuction(a, name);
+            else unresolved.push(a);
+        }
+
+        if (unresolved.length === 0) return auctions;
+
         // Peu de ventes actives simultanées ; 3 workers évitent néanmoins une rafale de fetch.
         let idx = 0;
         const worker = async () => {
-            while (idx < needs.length) {
-                const a = needs[idx++];
+            while (idx < unresolved.length) {
+                const a = unresolved[idx++];
                 await fetchActiveSaleBidderFromMarketplace(a);
                 await new Promise(r => setTimeout(r, 90));
             }
         };
 
         await Promise.all(
-            Array.from({ length: Math.min(3, needs.length) }, () => worker())
+            Array.from({ length: Math.min(3, unresolved.length) }, () => worker())
         );
 
         return auctions;
