@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.5';
+    const WM_VERSION = '3.4.6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5945,7 +5945,7 @@
     // - référence récente <= 5 s juste avant une mise
     //
     // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
-    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 500;
+    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 790;
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
