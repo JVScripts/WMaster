@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.14';
+    const WM_VERSION = '3.4.15';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -15266,7 +15266,71 @@
     try { _profileIdColumn = localStorage.getItem(PROFILE_ID_COLUMN_KEY); } catch (e) { }
     let _profileProbeLogged = false;
     const _profileIdentityProbeUnsupported = new Set();
+
+    // v3.4.15 — cache UUID → pseudo persistant.
+    // Avant, tous les pseudos appris pendant un scan disparaissaient au moindre F5 : une vente
+    // pouvait donc repasser de « huglz » à « résolution du pseudo… » alors que WMaster connaissait
+    // déjà parfaitement ce joueur quelques secondes plus tôt.
+    const USERNAME_CACHE_STORAGE_KEY = 'wm_username_cache_v1';
+    const USERNAME_CACHE_MAX = 10000;
+    const USERNAME_CACHE_MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
     const _usernameCache = new Map();
+    const _usernameCacheTs = new Map();
+    let _usernameCachePersistTimer = null;
+
+    function loadPersistedUsernameCache() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(USERNAME_CACHE_STORAGE_KEY) || 'null');
+            const items = Array.isArray(raw?.items) ? raw.items : [];
+            const now = Date.now();
+            for (const item of items) {
+                if (!Array.isArray(item) || item.length < 2) continue;
+                const id = String(item[0] || '');
+                const name = validResolvedUsername(item[1]);
+                const ts = Number(item[2] || 0);
+                if (!id || !name) continue;
+                if (Number.isFinite(ts) && ts > 0 && now - ts > USERNAME_CACHE_MAX_AGE_MS) continue;
+                _usernameCache.set(id, name);
+                _usernameCacheTs.set(id, Number.isFinite(ts) && ts > 0 ? ts : now);
+            }
+        } catch (e) { }
+    }
+
+    function persistUsernameCacheNow() {
+        _usernameCachePersistTimer = null;
+        try {
+            const now = Date.now();
+            const rows = [];
+            for (const [id, name] of _usernameCache.entries()) {
+                const clean = validResolvedUsername(name);
+                if (!id || !clean) continue;
+                const ts = Number(_usernameCacheTs.get(id) || now);
+                if (now - ts > USERNAME_CACHE_MAX_AGE_MS) continue;
+                rows.push([String(id), clean, ts]);
+            }
+            rows.sort((a, b) => b[2] - a[2]);
+            if (rows.length > USERNAME_CACHE_MAX) rows.length = USERNAME_CACHE_MAX;
+            localStorage.setItem(USERNAME_CACHE_STORAGE_KEY, JSON.stringify({ v: 1, items: rows }));
+        } catch (e) { }
+    }
+
+    function persistUsernameCacheSoon() {
+        if (_usernameCachePersistTimer) return;
+        _usernameCachePersistTimer = setTimeout(persistUsernameCacheNow, 2500);
+    }
+
+    function rememberResolvedUsername(id, name) {
+        const clean = validResolvedUsername(name);
+        if (!id || !clean) return false;
+        const key = String(id);
+        const changed = _usernameCache.get(key) !== clean;
+        _usernameCache.set(key, clean);
+        _usernameCacheTs.set(key, Date.now());
+        if (changed) persistUsernameCacheSoon();
+        return true;
+    }
+
+    loadPersistedUsernameCache();
 
     function cacheUsernameFromProfileRow(row, wantedIds) {
         const name = validResolvedUsername(pickUsername(row));
@@ -15279,7 +15343,7 @@
             if (value == null || value === '') continue;
             const id = String(value);
             if (!wanted.has(id)) continue;
-            _usernameCache.set(id, name);
+            rememberResolvedUsername(id, name);
             wanted.delete(id);
             matched++;
         }
@@ -15913,7 +15977,11 @@
     const _activeSaleNameRetryTimers = new Map(); // auctionId -> timeout
     const ACTIVE_SALE_NAME_TTL_MS = 6 * 60 * 60 * 1000;
     const ACTIVE_SALE_PROBE_COOLDOWN_MS = 3500;
-    const ACTIVE_SALE_NAME_RETRY_DELAYS_MS = [4000, 8000, 16000];
+    // v3.4.15 : première tentative immédiate. Les anciennes versions s'arrêtaient définitivement
+    // après 3 échecs ; une nouvelle surenchère recréait l'état, ce qui donnait l'impression que
+    // la surenchère « débloquait » magiquement le pseudo.
+    const ACTIVE_SALE_NAME_RETRY_DELAYS_MS = [0, 3000, 8000, 15000];
+    const ACTIVE_SALE_NAME_SLOW_RETRY_MS = 30000;
 
     // v3.4.11 — fallback sur l'index public "ending_soon".
     // La source `profiles` peut être illisible pour les autres joueurs alors que la réponse
@@ -15971,10 +16039,12 @@
             _activeSaleNameRetryState.set(a.id, state);
         }
 
-        if (state.attempts >= ACTIVE_SALE_NAME_RETRY_DELAYS_MS.length ||
-            _activeSaleNameRetryTimers.has(a.id)) return;
+        if (_activeSaleNameRetryTimers.has(a.id)) return;
 
-        const delay = ACTIVE_SALE_NAME_RETRY_DELAYS_MS[state.attempts];
+        const fastRetry = state.attempts < ACTIVE_SALE_NAME_RETRY_DELAYS_MS.length;
+        const delay = fastRetry
+            ? ACTIVE_SALE_NAME_RETRY_DELAYS_MS[state.attempts]
+            : ACTIVE_SALE_NAME_SLOW_RETRY_MS;
         const timer = setTimeout(async () => {
             _activeSaleNameRetryTimers.delete(a.id);
 
@@ -15998,11 +16068,30 @@
 
             state.attempts++;
             try {
-                // Essai profil direct d'abord, puis marketplace/page exacte si nécessaire.
-                const names = await resolveUsernames([liveBidderId]).catch(() => ({}));
-                const direct = validResolvedUsername(names?.[liveBidderId]);
-                if (direct) applyBidderNameToAuction(live, direct);
-                else await fetchActiveSaleBidderFromMarketplace(live);
+                if (fastRetry) {
+                    // Phase rapide : profil direct puis tous les fallbacks connus.
+                    const names = await resolveUsernames([liveBidderId]).catch(() => ({}));
+                    const direct = validResolvedUsername(names?.[liveBidderId]);
+                    if (direct) applyBidderNameToAuction(live, direct);
+                    else await fetchActiveSaleBidderFromMarketplace(live);
+                } else {
+                    // Phase lente : surtout vérifier l'index partagé / cache fraîchement appris.
+                    // On évite de marteler profiles + page HTML toutes les 30 s pour chaque vente.
+                    const indexName = await fetchBidderNameFromMarketplaceIndex(live, true).catch(() => null);
+                    if (indexName) {
+                        applyBidderNameToAuction(live, indexName);
+                    } else {
+                        const learned = cachedResolvedBidderName(liveBidderId);
+                        if (learned) applyBidderNameToAuction(live, learned);
+
+                        // Toutes les 3 passes lentes (~90 s), on rejoue aussi les fallbacks complets
+                        // au cas où WikiMasters aurait commencé à exposer le profil entre-temps.
+                        const slowPass = state.attempts - ACTIVE_SALE_NAME_RETRY_DELAYS_MS.length;
+                        if (!learned && slowPass > 0 && slowPass % 3 === 0) {
+                            await fetchActiveSaleBidderFromMarketplace(live);
+                        }
+                    }
+                }
             } catch (e) { }
 
             if (findKnownBidderNameForActiveSale(live)) {
@@ -16130,7 +16219,7 @@
             name: clean,
             ts: Date.now()
         });
-        _usernameCache.set(id, clean);
+        rememberResolvedUsername(id, clean);
         updateActiveSaleBidderDom(id, clean);
 
         // Si ce pseudo correspond à une vente en attente, plus besoin des retries ciblés.
