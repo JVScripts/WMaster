@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.16';
+    const WM_VERSION = '3.4.17';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4113,6 +4113,18 @@
             basculeRegimePct: Number.isFinite(Number(recent?.regimeShiftStrength))
                 ? Math.round(Number(recent.regimeShiftStrength) * 100)
                 : 0,
+            confianceRegimePct: Number.isFinite(Number(recent?.regimeConfidence))
+                ? Math.round(Number(recent.regimeConfidence) * 100)
+                : 0,
+            accordDirection5Pct: Number.isFinite(Number(recent?.regimeDirectionAgreement))
+                ? Math.round(Number(recent.regimeDirectionAgreement) * 100)
+                : 0,
+            confirmationDernierePct: Number.isFinite(Number(recent?.regimeLatestConfirmation))
+                ? Math.round(Number(recent.regimeLatestConfirmation) * 100)
+                : 0,
+            confianceDispersion5Pct: Number.isFinite(Number(recent?.regimeDispersionConfidence))
+                ? Math.round(Number(recent.regimeDispersionConfidence) * 100)
+                : 0,
             modeRegime: recent?.regimeShiftMode ?? null,
             ageDerniereVenteHeures: Number.isFinite(Number(recent?.newestSaleAgeMs))
                 ? Math.round(Number(recent.newestSaleAgeMs) / 360000) / 10
@@ -4199,6 +4211,18 @@
             basculeRegimePct: Number.isFinite(Number(recent?.regimeShiftStrength))
                 ? Math.round(Number(recent.regimeShiftStrength) * 100)
                 : 0,
+            confianceRegimePct: Number.isFinite(Number(recent?.regimeConfidence))
+                ? Math.round(Number(recent.regimeConfidence) * 100)
+                : 0,
+            accordDirection5Pct: Number.isFinite(Number(recent?.regimeDirectionAgreement))
+                ? Math.round(Number(recent.regimeDirectionAgreement) * 100)
+                : 0,
+            confirmationDernierePct: Number.isFinite(Number(recent?.regimeLatestConfirmation))
+                ? Math.round(Number(recent.regimeLatestConfirmation) * 100)
+                : 0,
+            confianceDispersion5Pct: Number.isFinite(Number(recent?.regimeDispersionConfidence))
+                ? Math.round(Number(recent.regimeDispersionConfidence) * 100)
+                : 0,
             modeRegime: recent?.regimeShiftMode ?? null,
             tendancePct: Number.isFinite(recent?.trendPct)
                 ? Math.round(Number(recent.trendPct) * 10) / 10
@@ -4221,6 +4245,18 @@
                 : null,
             basculeRegimePct: Number.isFinite(Number(recent?.regimeShiftStrength))
                 ? Math.round(Number(recent.regimeShiftStrength) * 100)
+                : 0,
+            confianceRegimePct: Number.isFinite(Number(recent?.regimeConfidence))
+                ? Math.round(Number(recent.regimeConfidence) * 100)
+                : 0,
+            accordDirection5Pct: Number.isFinite(Number(recent?.regimeDirectionAgreement))
+                ? Math.round(Number(recent.regimeDirectionAgreement) * 100)
+                : 0,
+            confirmationDernierePct: Number.isFinite(Number(recent?.regimeLatestConfirmation))
+                ? Math.round(Number(recent.regimeLatestConfirmation) * 100)
+                : 0,
+            confianceDispersion5Pct: Number.isFinite(Number(recent?.regimeDispersionConfidence))
+                ? Math.round(Number(recent.regimeDispersionConfidence) * 100)
                 : 0,
             modeRegime: recent?.regimeShiftMode ?? null,
             ageDerniereVenteHeures: Number.isFinite(Number(recent?.newestSaleAgeMs))
@@ -4357,7 +4393,7 @@
             recentMinVentesFlip: RECENT_MARKET_MIN_SALES,
             recentMinVentesHunter: HUNTER_RECENT_MIN_SALES,
             trendDetection: `${RECENT_TREND_BLOCK_SIZE} dernières plafonnées vs ${RECENT_TREND_BLOCK_SIZE} précédentes · ${RECENT_TREND_START_PCT}%→${RECENT_TREND_FULL_PCT}%`,
-            regimeShift: `baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}% · hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}% · référence sur les 5 dernières robustifiées`,
+            regimeShift: `baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}% · hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}% · bascule pondérée par confiance des 5 dernières`,
             filtreExtremes: `${RECENT_MARKET_LIMIT} ventes strictes · robuste sur 11 centrales · extrêmes plafonnés dans la série temporelle`,
             recencyDecay: RECENT_RECENCY_DECAY,
             recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
@@ -5311,6 +5347,18 @@
     const RECENT_REGIME_UP_FULL_PCT = 70;
     const RECENT_REGIME_WEIGHTED_SHARE = 0.70;
 
+    // v3.4.17 — un changement de régime n'est plus validé par son amplitude seule.
+    // La confiance dépend de signaux relatifs, donc comparables entre cartes à 100 ou 100 000 :
+    // cohérence directionnelle des 5 dernières, confirmation par la vente la plus récente,
+    // et dispersion relative du bloc. Une seule vente récente qui contredit brutalement
+    // la hausse/baisse empêche ainsi un basculement complet sans interdire une vraie transition.
+    const RECENT_REGIME_LATEST_CONTRADICTION_FLOOR = 0.10;
+    const RECENT_REGIME_NEAR_ROBUST_PCT = 0.05;
+    const RECENT_REGIME_LATEST_FULL_CONFIRM_MOVE_PCT = 0.25;
+    const RECENT_REGIME_DISPERSION_FULL_CONF_PCT = 20;
+    const RECENT_REGIME_DISPERSION_ZERO_CONF_PCT = 80;
+    const RECENT_REGIME_AGREEMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55, 0.40];
+
     // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
     // une carte déjà acquise dès lors que ses 15 ventes existent, avec prix d'urgence.
     const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
@@ -5436,12 +5484,20 @@
                 dispersionPct: null,
                 baseTrendReference: null,
                 recentRegimeTrimmedAverage: null,
+                recentRegimeMedian: null,
                 recentRegimeWeightedAverage: null,
                 recentRegimeReference: null,
                 recentRegimeBoundedPrices: [],
+                regimeMagnitudeStrength: 0,
                 regimeShiftStrength: 0,
                 regimeShiftMode: 'none',
+                regimeDirectionAgreement: 0,
+                regimeLatestConfirmation: 0,
+                regimeDispersionConfidence: 0,
+                regimeConfidence: 0,
                 recentRegimeDispersionPct: null,
+                trendMagnitudeBlend: 0,
+                effectiveTrendBlend: 0,
                 marketReference: null
             };
         }
@@ -5540,33 +5596,51 @@
                     : 'stable';
         }
 
-        const baseTrendReference =
-            Number.isFinite(robustAverage) && robustAverage > 0 &&
-            Number.isFinite(recencyWeightedAverage) && recencyWeightedAverage > 0
-                ? robustAverage * (1 - trendBlend) +
-                  recencyWeightedAverage * trendBlend
-                : robustAverage;
-
-        // Référence du régime courant : uniquement les 5 ventes les plus récentes.
-        // On retire l'effet d'une valeur basse et d'une valeur haute en les plafonnant
-        // à la 2e plus basse / 2e plus haute, puis on combine récence + moyenne centrale.
+        // v3.4.17 — référence du régime courant sur les 5 ventes les plus récentes.
+        // IMPORTANT : le winsorizing devient DIRECTIONNEL.
+        // - hausse : on plafonne seulement l'extrême HAUT ; une vente basse récente reste visible ;
+        // - baisse  : on relève seulement l'extrême BAS ; une vente haute récente reste visible.
+        // Cela évite de transformer artificiellement un contre-signal récent en confirmation.
         const recentRegimeRawPrices = safetyClean.slice(0, RECENT_TREND_BLOCK_SIZE);
         let recentRegimeTrimmedAverage = null;
+        let recentRegimeMedian = null;
         let recentRegimeWeightedAverage = null;
         let recentRegimeReference = null;
         let recentRegimeBoundedPrices = [];
         let recentRegimeDispersionPct = null;
+        let regimeDirectionAgreement = 0;
+        let regimeLatestConfirmation = 0;
+        let regimeDispersionConfidence = 0;
+        let regimeConfidence = 0;
 
         if (recentRegimeRawPrices.length === RECENT_TREND_BLOCK_SIZE) {
             const recentSorted = recentRegimeRawPrices.slice().sort((a, b) => a - b);
             const recentLowerBound = recentSorted[1];
             const recentUpperBound = recentSorted[recentSorted.length - 2];
-            recentRegimeBoundedPrices = recentRegimeRawPrices.map(price =>
-                Math.min(recentUpperBound, Math.max(recentLowerBound, price))
-            );
+
+            if (trendDirection === 'up') {
+                recentRegimeBoundedPrices = recentRegimeRawPrices.map(price =>
+                    Math.min(recentUpperBound, price)
+                );
+            } else if (trendDirection === 'down') {
+                recentRegimeBoundedPrices = recentRegimeRawPrices.map(price =>
+                    Math.max(recentLowerBound, price)
+                );
+            } else {
+                recentRegimeBoundedPrices = recentRegimeRawPrices.map(price =>
+                    Math.min(recentUpperBound, Math.max(recentLowerBound, price))
+                );
+            }
+
             recentRegimeTrimmedAverage = meanOf(
                 recentSorted.slice(1, recentSorted.length - 1)
             );
+            const recentDirectionalSorted = recentRegimeBoundedPrices
+                .slice()
+                .sort((a, b) => a - b);
+            recentRegimeMedian = recentDirectionalSorted[
+                Math.floor(recentDirectionalSorted.length / 2)
+            ] ?? null;
 
             let regimeWeightedSum = 0;
             let regimeWeightTotal = 0;
@@ -5581,33 +5655,118 @@
 
             if (
                 Number.isFinite(recentRegimeWeightedAverage) && recentRegimeWeightedAverage > 0 &&
-                Number.isFinite(recentRegimeTrimmedAverage) && recentRegimeTrimmedAverage > 0
+                Number.isFinite(recentRegimeMedian) && recentRegimeMedian > 0
             ) {
+                // La médiane fournit le centre robuste ; la récence garde 70 % du poids pour
+                // qu'un vrai déplacement de marché soit suivi rapidement sans courir après un pic.
                 recentRegimeReference =
                     recentRegimeWeightedAverage * RECENT_REGIME_WEIGHTED_SHARE +
-                    recentRegimeTrimmedAverage * (1 - RECENT_REGIME_WEIGHTED_SHARE);
+                    recentRegimeMedian * (1 - RECENT_REGIME_WEIGHTED_SHARE);
+
                 recentRegimeDispersionPct =
                     meanOf(recentRegimeBoundedPrices.map(v =>
-                        Math.abs(v - recentRegimeReference)
-                    )) / recentRegimeReference * 100;
+                        Math.abs(v - recentRegimeMedian)
+                    )) / recentRegimeMedian * 100;
+            }
+
+            if (
+                Number.isFinite(robustAverage) && robustAverage > 0 &&
+                (trendDirection === 'up' || trendDirection === 'down')
+            ) {
+                // 1) Accord directionnel, avec poids maximal pour la vente la plus récente.
+                let agreementWeighted = 0;
+                let agreementWeightTotal = 0;
+                for (let i = 0; i < recentRegimeRawPrices.length; i++) {
+                    const price = recentRegimeRawPrices[i];
+                    const weight = RECENT_REGIME_AGREEMENT_WEIGHTS[i] || 0;
+                    let score = 0;
+
+                    if (trendDirection === 'up') {
+                        if (price >= robustAverage) score = 1;
+                        else if (price >= robustAverage * (1 - RECENT_REGIME_NEAR_ROBUST_PCT)) score = 0.5;
+                    } else {
+                        if (price <= robustAverage) score = 1;
+                        else if (price <= robustAverage * (1 + RECENT_REGIME_NEAR_ROBUST_PCT)) score = 0.5;
+                    }
+
+                    agreementWeighted += score * weight;
+                    agreementWeightTotal += weight;
+                }
+                regimeDirectionAgreement = agreementWeightTotal > 0
+                    ? agreementWeighted / agreementWeightTotal
+                    : 0;
+
+                // 2) Confirmation par LA dernière vente. Une contradiction nette ne met pas
+                // la confiance à zéro : floor 10 %, afin de ne pas ignorer quatre signaux cohérents.
+                const latest = Number(recentRegimeRawPrices[0]);
+                const latestRatio = latest / robustAverage;
+                if (trendDirection === 'up') {
+                    regimeLatestConfirmation = clamp01(
+                        (latestRatio - (1 - RECENT_REGIME_NEAR_ROBUST_PCT)) /
+                        RECENT_REGIME_LATEST_FULL_CONFIRM_MOVE_PCT
+                    );
+                } else {
+                    regimeLatestConfirmation = clamp01(
+                        ((1 + RECENT_REGIME_NEAR_ROBUST_PCT) - latestRatio) /
+                        RECENT_REGIME_LATEST_FULL_CONFIRM_MOVE_PCT
+                    );
+                }
+
+                // 3) Cohérence interne : dispersion <=20 % = pleine confiance,
+                // >=80 % = aucune confiance supplémentaire dans le nouveau régime.
+                if (Number.isFinite(recentRegimeDispersionPct)) {
+                    regimeDispersionConfidence = 1 - clamp01(
+                        (recentRegimeDispersionPct - RECENT_REGIME_DISPERSION_FULL_CONF_PCT) /
+                        (RECENT_REGIME_DISPERSION_ZERO_CONF_PCT - RECENT_REGIME_DISPERSION_FULL_CONF_PCT)
+                    );
+                }
+
+                regimeConfidence = clamp01(
+                    regimeDirectionAgreement *
+                    (
+                        RECENT_REGIME_LATEST_CONTRADICTION_FLOOR +
+                        (1 - RECENT_REGIME_LATEST_CONTRADICTION_FLOOR) *
+                        regimeLatestConfirmation
+                    ) *
+                    regimeDispersionConfidence
+                );
+            } else if (trendDirection === 'flat') {
+                regimeDirectionAgreement = 1;
+                regimeLatestConfirmation = 1;
+                regimeDispersionConfidence = 1;
+                regimeConfidence = 1;
             }
         }
 
-        let regimeShiftStrength = 0;
+        // L'amplitude de tendance seule ne suffit plus : son poids réel est modulé par
+        // la confiance du bloc récent. Une vraie hausse/baisse cohérente conserve 100 %,
+        // une rupture désordonnée ou contredite reste ancrée sur la robuste.
+        const trendMagnitudeBlend = trendBlend;
+        const effectiveTrendBlend = trendMagnitudeBlend * regimeConfidence;
+        const baseTrendReference =
+            Number.isFinite(robustAverage) && robustAverage > 0 &&
+            Number.isFinite(recencyWeightedAverage) && recencyWeightedAverage > 0
+                ? robustAverage * (1 - effectiveTrendBlend) +
+                  recencyWeightedAverage * effectiveTrendBlend
+                : robustAverage;
+
+        let regimeMagnitudeStrength = 0;
         let regimeShiftMode = 'none';
         if (trendDirection === 'down' && Number.isFinite(trendAbsPct)) {
-            regimeShiftStrength = clamp01(
+            regimeMagnitudeStrength = clamp01(
                 (trendAbsPct - RECENT_REGIME_DOWN_START_PCT) /
                 (RECENT_REGIME_DOWN_FULL_PCT - RECENT_REGIME_DOWN_START_PCT)
             );
-            if (regimeShiftStrength > 0) regimeShiftMode = 'down';
+            if (regimeMagnitudeStrength > 0) regimeShiftMode = 'down';
         } else if (trendDirection === 'up' && Number.isFinite(trendAbsPct)) {
-            regimeShiftStrength = clamp01(
+            regimeMagnitudeStrength = clamp01(
                 (trendAbsPct - RECENT_REGIME_UP_START_PCT) /
                 (RECENT_REGIME_UP_FULL_PCT - RECENT_REGIME_UP_START_PCT)
             );
-            if (regimeShiftStrength > 0) regimeShiftMode = 'up';
+            if (regimeMagnitudeStrength > 0) regimeShiftMode = 'up';
         }
+
+        const regimeShiftStrength = regimeMagnitudeStrength * regimeConfidence;
 
         const marketReference =
             Number.isFinite(baseTrendReference) && baseTrendReference > 0 &&
@@ -5652,16 +5811,24 @@
             trendPct,
             trendAbsPct,
             trendDirection,
-            trendBlend,
+            trendBlend: effectiveTrendBlend,
+            trendMagnitudeBlend,
+            effectiveTrendBlend,
             trendMode,
             dispersionPct,
             baseTrendReference,
             recentRegimeTrimmedAverage,
+            recentRegimeMedian,
             recentRegimeWeightedAverage,
             recentRegimeReference,
             recentRegimeBoundedPrices,
+            regimeMagnitudeStrength,
             regimeShiftStrength,
             regimeShiftMode,
+            regimeDirectionAgreement,
+            regimeLatestConfirmation,
+            regimeDispersionConfidence,
+            regimeConfidence,
             recentRegimeDispersionPct,
             marketReference
         };
@@ -15861,6 +16028,15 @@
             poidsTendancePct: Number.isFinite(Number(recent.trendBlend))
                 ? Math.round(Number(recent.trendBlend) * 100)
                 : null,
+            confianceRegimePct: Number.isFinite(Number(recent.regimeConfidence))
+                ? Math.round(Number(recent.regimeConfidence) * 100)
+                : null,
+            accordDirection5Pct: Number.isFinite(Number(recent.regimeDirectionAgreement))
+                ? Math.round(Number(recent.regimeDirectionAgreement) * 100)
+                : null,
+            confirmationDernierePct: Number.isFinite(Number(recent.regimeLatestConfirmation))
+                ? Math.round(Number(recent.regimeLatestConfirmation) * 100)
+                : null,
             modeTendance: recent.trendMode,
             valeurTrendAwareV3: trendAwareRounded,
             // Compatibilité console/UI avec les versions précédentes.
@@ -18699,7 +18875,7 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v3 (15 dernières ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v3 : <b>15 ventes strictes</b>. Robuste = 11 valeurs centrales ; les 15 restent ordonnées pour la tendance. En changement de régime, la référence bascule vers les <b>5 ventes les plus récentes robustifiées</b> : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v3 : <b>15 ventes strictes</b>. Robuste = 11 valeurs centrales ; les 15 restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -22859,6 +23035,7 @@
                     robuste <b>${r.moyenneRobusteRecente ?? '—'}</b> ·
                     ${recentMarketIntegrityAllowed(r) ? 'Trend' : 'Trend indicative'} <b style="color:${recentMarketIntegrityAllowed(r) ? '#4ade80' : '#888'};">${r.valeurTrendAware ?? '—'}</b> ·
                     tendance <b style="color:${Number(r.tendancePct) < -RECENT_TREND_START_PCT ? '#f59e0b' : Number(r.tendancePct) > RECENT_TREND_START_PCT ? '#67e8f9' : '#aaa'};">${r.tendancePct != null ? `${r.tendancePct >= 0 ? '+' : ''}${r.tendancePct}%` : '—'}</b> ·
+                    confiance régime <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b> ·
                     cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
                     seuil robuste <b>&gt;${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
