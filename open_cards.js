@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.5.1';
+    const WM_VERSION = '3.5.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4071,6 +4071,7 @@
         );
 
         const robust = Number(recent?.robustAverage);
+        const consensus = Number(recent?.hunterConsensusReference);
         const fair = Number(recent?.marketReference);
         const buyRef = Number(recent?.hunterReference);
         const ageMs = Number(recent?.ageMs);
@@ -4147,7 +4148,7 @@
             detailsControleMarche: recent?.marketIntegrity ?? null,
             liquiditeHunterOK: !!recent?.liquidityEligible,
             seuilVentesHunter: HUNTER_RECENT_MIN_SALES,
-            seuilStrictRobuste: `> ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`,
+            seuilStrictConsensusHunter: `> ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}`,
             ageCacheSec: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
             cacheAssezFrais: Number.isFinite(ageMs)
                 ? ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
@@ -4156,7 +4157,7 @@
                 recent?.ok &&
                 recent?.hunterEligible &&
                 hunterRecentSalesAllowed(recent) &&
-                hunterRecentReferenceAllowed(robust) &&
+                hunterRecentReferenceAllowed(consensus) &&
                 Number.isFinite(buyRef) && buyRef > 0 &&
                 Number.isFinite(ageMs) &&
                 ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
@@ -4172,6 +4173,7 @@
         const recent = await fetchRecentMarket(cardId, rr, true).catch(() => null);
         const ref = getHunterPricingReference(cardId, rr);
         const robust = Number(recent?.robustAverage);
+        const consensus = Number(recent?.hunterConsensusReference);
         const fair = Number(recent?.marketReference);
         const buyRef = Number(recent?.hunterReference);
 
@@ -4182,8 +4184,8 @@
             blocage = `seulement ${recent?.count ?? 0}/${HUNTER_RECENT_MIN_SALES} ventes Hunter`;
         } else if (!recentMarketIntegrityAllowed(recent)) {
             blocage = recentMarketIntegrityReason(recent);
-        } else if (!hunterRecentReferenceAllowed(robust)) {
-            blocage = `moyenne robuste ${Math.round(robust)} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
+        } else if (!hunterRecentReferenceAllowed(consensus)) {
+            blocage = `consensus Hunter ${Number.isFinite(consensus) ? Math.round(consensus) : '—'} ≤ ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}`;
         } else if (!recent?.liquidityEligible) {
             const rate = Number(recent?.saleRatePerDay);
             const recentRate = Number(recent?.recentSaleRatePerDay);
@@ -4419,7 +4421,7 @@
             hunterPurchaseSafetyFloorPct: Math.round(HUNTER_PURCHASE_SAFETY_FLOOR * 100),
             hunterPurchaseExitModel: `achat = (${getFlipInitialRecentPct()}% - urgence) de la Trend × sécurité achat-only × ratio Hunter`,
             hunterLiquidity: `dernière vente <= 48h · rythme global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · rythme 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
-            recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} ET dernière vente <=48h ET rythme global >=${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/j ET rythme récent >=${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/j · achat lié à la sortie Flip`,
+            recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET consensus H > ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} ET dernière vente <=48h ET rythme global >=${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/j ET rythme récent >=${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/j · achat lié à la sortie Flip`,
             hunterFallbackAchat: 'aucun',
             recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}% · urgence liquidité/fraîcheur 0-${FLIP_MAX_URGENCY_DISCOUNT_PCT}pt`,
             flipMinimum: `${RECENT_MARKET_MIN_SALES} ventes strictes`,
@@ -6581,6 +6583,7 @@
                 calc.eligible &&
                 marketIntegrity.allowed &&
                 liquidityEligible &&
+                hunterRecentReferenceAllowed(calc.hunterConsensusReference) &&
                 Number.isFinite(hunterReference) && hunterReference > 0
         };
     }
@@ -6676,14 +6679,14 @@
     // v3.4.2 — Hunter RECENT MARKET + TREND-AWARE v3 · Purchase ↔ Exit.
     // Conditions obligatoires :
     // - 15 ventes valides minimum ; jusqu'à 25 exploitées
-    // - moyenne robuste STRICTEMENT supérieure à 790
+    // - consensus Hunter 5/10/15 STRICTEMENT supérieur à 790
     // - liquidité minimale obligatoire (vente récente + rythme suffisant)
     // - la valeur d'achat part de la sortie Flip réelle (1er listing - urgence), puis sécurité achat-only
     // - référence récente <= 60 s pour décider
     // - référence récente <= 5 s juste avant une mise
     //
     // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
-    const HUNTER_RECENT_MIN_ROBUST_AVERAGE = 790;
+    const HUNTER_RECENT_MIN_CONSENSUS_REFERENCE = 790;
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
@@ -6696,7 +6699,7 @@
 
     function hunterRecentReferenceAllowed(value) {
         const v = Number(value);
-        return Number.isFinite(v) && v > HUNTER_RECENT_MIN_ROBUST_AVERAGE;
+        return Number.isFinite(v) && v > HUNTER_RECENT_MIN_CONSENSUS_REFERENCE;
     }
 
     function hunterRatioForReferenceKind(kind) {
@@ -6708,10 +6711,9 @@
     function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
         const ref = Number(reference);
 
-        // Le seuil >790 porte volontairement sur la MOYENNE ROBUSTE dans
-        // getHunterPricingReference()/ensureFreshHunterReference().
-        // Ici, la référence d'achat Trend v3 peut légitimement tomber sous 790
-        // après ajustement du risque ; on applique alors simplement le ratio Hunter.
+        // v3.5.2 — le seuil >790 porte sur le CONSENSUS H 5/10/15, pas sur
+        // la robuste longue 25 ventes. La référence d'achat peut ensuite tomber sous 790
+        // après sortie/risque ; le seuil sert à valider la valeur récente avant achat.
         if (
             kind !== 'recent_market' ||
             !Number.isFinite(ref) ||
@@ -6737,7 +6739,7 @@
             !recent?.ok ||
             !recent.eligible ||
             !hunterRecentSalesAllowed(recent) ||
-            !hunterRecentReferenceAllowed(recent.robustAverage) ||
+            !hunterRecentReferenceAllowed(recent.hunterConsensusReference) ||
             !hunterRecentLiquidityAllowed(recent) ||
             !Number.isFinite(Number(recent.hunterReference)) ||
             Number(recent.hunterReference) <= 0
@@ -6964,7 +6966,7 @@
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.4.2 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et moyenne robuste STRICTEMENT > 790.
+    //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et consensus H STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
@@ -6990,10 +6992,10 @@
                     } else if (!recentMarketIntegrityAllowed(recent)) {
                         stopHunterForMarketIntegrity(auction, recent);
                         reason = `historique en attente · ${recentMarketIntegrityReason(recent)}`;
-                    } else if (!hunterRecentReferenceAllowed(recent.robustAverage)) {
-                        const robust = Number(recent.robustAverage);
+                    } else if (!hunterRecentReferenceAllowed(recent.hunterConsensusReference)) {
+                        const consensus = Number(recent.hunterConsensusReference);
                         reason =
-                            `moyenne robuste ${Number.isFinite(robust) ? Math.round(robust) : '—'} ≤ ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}`;
+                            `consensus Hunter ${Number.isFinite(consensus) ? Math.round(consensus) : '—'} ≤ ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}`;
                     } else if (!recent.liquidityEligible) {
                         const rate = Number(recent.saleRatePerDay);
                         const ageH = Number(recent.newestSaleAgeMs) / 3600000;
@@ -9649,7 +9651,7 @@
                 (!marketWatcherActive && enabled)
                     ? ' · autonome'
                     : '';
-            return `⚡ Hunter Trend ${recentPct}% · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
+            return `⚡ Hunter Trend ${recentPct}% · consensus H >${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -16159,7 +16161,7 @@
 
         const hunterRecentCap =
             recent.hunterEligible &&
-            hunterRecentReferenceAllowed(recent.robustAverage) &&
+            hunterRecentReferenceAllowed(recent.hunterConsensusReference) &&
             Number.isFinite(Number(recent.hunterReference)) &&
             Number(recent.hunterReference) > 0
                 ? dynamicHunterCapFromReference(recent.hunterReference, 'recent_market')
@@ -16264,7 +16266,7 @@
             hunterLiquiditeOK: !!recent.liquidityEligible,
             hunterAchatAutorise: !!(
                 recent.hunterEligible &&
-                hunterRecentReferenceAllowed(recent.robustAverage)
+                hunterRecentReferenceAllowed(recent.hunterConsensusReference)
             ),
             hunterRecentCap,
             remiseUrgenceFlipPct: recent.sellUrgencyDiscountPct ?? null,
@@ -16273,7 +16275,7 @@
             concentrationMaxPct: Number.isFinite(Number(recent.participantConcentration))
                 ? Math.round(Number(recent.participantConcentration) * 100)
                 : null,
-            seuilHunterRecent: `15 ventes vérifiables minimum (jusqu’à ${RECENT_MARKET_LIMIT}) + robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} + liquidité + contrôle manipulation`,
+            seuilHunterRecent: `15 ventes vérifiables minimum (jusqu’à ${RECENT_MARKET_LIMIT}) + consensus H > ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} + liquidité + contrôle manipulation`,
             moyenneWM: Number.isFinite(wm) && wm > 0 ? wm : null,
             marcheRecentSurWM_Pct: ratioToWm,
             erreur: probe?.ok ? null : (probe?.error || 'échec inconnu'),
@@ -19845,7 +19847,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? `🎯 Hunter en mode <b>Trend-Aware v3</b> (robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
+                        ? `🎯 Hunter en mode <b>Trend-Aware v3</b> (consensus H > ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
 
                     if (autoSnipeEnabled) {
@@ -19871,8 +19873,8 @@
                 autoSnipeRecentRatioInput.value = pct;
                 setSetting('autoSnipeRecentRatio', pct / 100);
                 wmLog(
-                    `🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la moyenne robuste récente ` +
-                    `si elle est <b>&gt; ${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b>`
+                    `🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la référence achat ` +
+                    `si le consensus H est <b>&gt; ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}</b>`
                 );
             };
         }
@@ -23222,7 +23224,7 @@
                     } ·
                     consensus H <b style="color:#67e8f9;">${r.consensusHunter ?? '—'}</b> ·
                     cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
-                    seuil robuste <b>&gt;${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b> ·
+                    seuil consensus H <b>&gt;${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
                 </div>
             </div>`;
@@ -23261,7 +23263,7 @@
 
     wmLog(
         `⚡ v${WM_VERSION} · protection anti-manipulation renforcée : comptes liés + clusters de prix extrêmes dès 3 ventes · ` +
-        `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes min / ${RECENT_MARKET_LIMIT} max · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ` +
+        `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes min / ${RECENT_MARKET_LIMIT} max · consensus H >${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
