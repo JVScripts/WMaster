@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.5.0';
+    const WM_VERSION = '3.5.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4082,6 +4082,16 @@
             ventesRecentes: recent?.count ?? 0,
             moyenneRobusteRecente: Number.isFinite(robust) ? Math.round(robust * 10) / 10 : null,
             valeurJusteTrendV3: Number.isFinite(fair) ? Math.round(fair * 10) / 10 : null,
+            referenceHunter5: Number.isFinite(Number(recent?.hunterWindow5Reference)) ? Math.round(Number(recent.hunterWindow5Reference) * 10) / 10 : null,
+            referenceHunter10: Number.isFinite(Number(recent?.hunterWindow10Reference)) ? Math.round(Number(recent.hunterWindow10Reference) * 10) / 10 : null,
+            referenceHunter15: Number.isFinite(Number(recent?.hunterWindow15Reference)) ? Math.round(Number(recent.hunterWindow15Reference) * 10) / 10 : null,
+            consensusHunter: Number.isFinite(Number(recent?.hunterConsensusReference)) ? Math.round(Number(recent.hunterConsensusReference) * 10) / 10 : null,
+            ecart5vs10Pct: Number.isFinite(Number(recent?.hunterShortAgreementPct)) ? Math.round(Number(recent.hunterShortAgreementPct) * 10) / 10 : null,
+            dispersion10Pct: Number.isFinite(Number(recent?.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
+            consensusCourtCoherent: recent?.hunterShortCoherent === true,
+            hausseConsensusAcceptee: recent?.hunterUpwardConsensusConfirmed === true,
+            referenceMarcheHunter: Number.isFinite(Number(recent?.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
+            sortieHunterPrevue: Number.isFinite(Number(recent?.hunterExpectedExitReference)) ? Math.round(Number(recent.hunterExpectedExitReference) * 10) / 10 : null,
             sortieFlipPrevuePct: Number.isFinite(Number(recent?.expectedExitPct))
                 ? Math.round(Number(recent.expectedExitPct) * 10) / 10
                 : null,
@@ -4196,6 +4206,15 @@
             borneBasse: recent?.lowerBound ?? null,
             borneHaute: recent?.upperBound ?? null,
             moyenneRobusteRecente: Number.isFinite(robust) ? Math.round(robust * 10) / 10 : null,
+            referenceHunter5: Number.isFinite(Number(recent?.hunterWindow5Reference)) ? Math.round(Number(recent.hunterWindow5Reference) * 10) / 10 : null,
+            referenceHunter10: Number.isFinite(Number(recent?.hunterWindow10Reference)) ? Math.round(Number(recent.hunterWindow10Reference) * 10) / 10 : null,
+            referenceHunter15: Number.isFinite(Number(recent?.hunterWindow15Reference)) ? Math.round(Number(recent.hunterWindow15Reference) * 10) / 10 : null,
+            consensusHunter: Number.isFinite(Number(recent?.hunterConsensusReference)) ? Math.round(Number(recent.hunterConsensusReference) * 10) / 10 : null,
+            ecart5vs10Pct: Number.isFinite(Number(recent?.hunterShortAgreementPct)) ? Math.round(Number(recent.hunterShortAgreementPct) * 10) / 10 : null,
+            dispersion10Pct: Number.isFinite(Number(recent?.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
+            consensusCourtCoherent: recent?.hunterShortCoherent === true,
+            hausseConsensusAcceptee: recent?.hunterUpwardConsensusConfirmed === true,
+            referenceMarcheHunter: Number.isFinite(Number(recent?.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
             moyennePondereeRecence: Number.isFinite(Number(recent?.recencyWeightedAverage))
                 ? Math.round(Number(recent.recencyWeightedAverage) * 10) / 10
                 : null,
@@ -5363,6 +5382,11 @@
     const RECENT_REGIME_DISPERSION_ZERO_CONF_PCT = 80;
     const RECENT_REGIME_AGREEMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55, 0.40];
 
+    // v3.5.1 — une hausse récente peut dépasser l'ancre longue seulement si
+    // les fenêtres 5 et 10 convergent réellement et que les 10 dernières sont cohérentes.
+    const HUNTER_MULTIWINDOW_MAX_5_10_GAP_PCT = 10;
+    const HUNTER_MULTIWINDOW_MAX_10_DISPERSION_PCT = 25;
+
     // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
     // une carte déjà acquise dès lors que ses 15 ventes minimum existent, avec prix d’urgence.
     const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
@@ -5397,6 +5421,79 @@
     function recentMarketTrimEachSide(count) {
         const n = Math.max(0, Number(count) || 0);
         return n >= 20 ? 3 : 2;
+    }
+
+    // v3.5.1 — référence d'achat Hunter multi-fenêtres.
+    // Les 25 ventes restent le contexte long de la Trend, mais elles ne peuvent plus
+    // à elles seules gonfler le plafond d'achat. Le Hunter demande un consensus récent :
+    // 5 dernières = médiane ; 10 = moyenne centrale (-1/+1) ; 15 = moyenne centrale (-2/+2).
+    // La médiane des 3 fenêtres devient le plafond de contexte Hunter.
+    function medianOf(values) {
+        const arr = (Array.isArray(values) ? values : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0)
+            .sort((a, b) => a - b);
+        if (!arr.length) return null;
+        const mid = Math.floor(arr.length / 2);
+        return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
+    }
+
+    function computeHunterWindowReference(prices, size) {
+        const raw = (Array.isArray(prices) ? prices : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0)
+            .slice(0, size);
+        if (raw.length < size) return null;
+
+        const cluster = detectExtremeHighPriceCluster(raw);
+        const cap = Number(cluster?.cap);
+        const safe = Number.isFinite(cap) && cap > 0
+            ? raw.map(v => Math.min(v, cap))
+            : raw.slice();
+
+        if (size <= 5) return medianOf(safe);
+
+        const trimEachSide = size >= 15 ? 2 : 1;
+        const sorted = safe.slice().sort((a, b) => a - b);
+        const core = sorted.slice(trimEachSide, sorted.length - trimEachSide);
+        return meanOf(core);
+    }
+
+    function computeHunterMultiWindowConsensus(prices) {
+        const raw = (Array.isArray(prices) ? prices : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0);
+        const ref5 = computeHunterWindowReference(raw, 5);
+        const ref10 = computeHunterWindowReference(raw, 10);
+        const ref15 = computeHunterWindowReference(raw, 15);
+        const refs = [ref5, ref10, ref15].filter(v => Number.isFinite(v) && v > 0);
+        const consensusReference = refs.length === 3 ? medianOf(refs) : null;
+        const shortAgreementPct =
+            Number.isFinite(ref5) && ref5 > 0 && Number.isFinite(ref10) && ref10 > 0
+                ? Math.abs(ref5 - ref10) / Math.max(ref5, ref10) * 100
+                : null;
+
+        const raw10 = raw.slice(0, 10);
+        const median10 = raw10.length === 10 ? medianOf(raw10) : null;
+        const window10DispersionPct =
+            raw10.length === 10 && Number.isFinite(median10) && median10 > 0
+                ? meanOf(raw10.map(v => Math.abs(v - median10))) / median10 * 100
+                : null;
+        const shortCoherent =
+            Number.isFinite(shortAgreementPct) &&
+            shortAgreementPct <= HUNTER_MULTIWINDOW_MAX_5_10_GAP_PCT &&
+            Number.isFinite(window10DispersionPct) &&
+            window10DispersionPct <= HUNTER_MULTIWINDOW_MAX_10_DISPERSION_PCT;
+
+        return {
+            ref5,
+            ref10,
+            ref15,
+            consensusReference,
+            shortAgreementPct,
+            window10DispersionPct,
+            shortCoherent
+        };
     }
 
     // v3.4.8 — défense en profondeur contre un petit cluster de ventes artificiellement hautes.
@@ -5510,9 +5607,25 @@
                 recentRegimeDispersionPct: null,
                 trendMagnitudeBlend: 0,
                 effectiveTrendBlend: 0,
+                hunterWindow5Reference: null,
+                hunterWindow10Reference: null,
+                hunterWindow15Reference: null,
+                hunterConsensusReference: null,
+                hunterShortAgreementPct: null,
+                hunterWindow10DispersionPct: null,
+                hunterShortCoherent: false,
                 marketReference: null
             };
         }
+
+        const hunterMultiWindow = computeHunterMultiWindowConsensus(clean);
+        const hunterWindow5Reference = hunterMultiWindow.ref5;
+        const hunterWindow10Reference = hunterMultiWindow.ref10;
+        const hunterWindow15Reference = hunterMultiWindow.ref15;
+        const hunterConsensusReference = hunterMultiWindow.consensusReference;
+        const hunterShortAgreementPct = hunterMultiWindow.shortAgreementPct;
+        const hunterWindow10DispersionPct = hunterMultiWindow.window10DispersionPct;
+        const hunterShortCoherent = hunterMultiWindow.shortCoherent;
 
         const trimEachSide = recentMarketTrimEachSide(clean.length);
 
@@ -5843,6 +5956,13 @@
             regimeDispersionConfidence,
             regimeConfidence,
             recentRegimeDispersionPct,
+            hunterWindow5Reference,
+            hunterWindow10Reference,
+            hunterWindow15Reference,
+            hunterConsensusReference,
+            hunterShortAgreementPct,
+            hunterWindow10DispersionPct,
+            hunterShortCoherent,
             marketReference
         };
     }
@@ -6380,10 +6500,43 @@
             Math.min(1, 1 - uptrendChasePenalty - participantsPenalty)
         );
 
+        // v3.5.1 — le Flip conserve la Trend complète. Le Hunter applique en plus
+        // le consensus 5/10/15 comme plafond : le contexte 25 ventes peut faire baisser
+        // l'achat, mais ne peut plus le gonfler au-dessus du marché récent confirmé.
+        const hunterConsensusReference = Number(calc?.hunterConsensusReference);
+        const hunterBaseMarketReference =
+            calc.eligible && Number.isFinite(Number(calc.marketReference)) && Number(calc.marketReference) > 0
+                ? Number.isFinite(hunterConsensusReference) && hunterConsensusReference > 0
+                    ? Math.min(Number(calc.marketReference), hunterConsensusReference)
+                    : Number(calc.marketReference)
+                : null;
+
+        // Exception contrôlée : si 5 ET 10 ventes convergent (écart <=10 %, dispersion10 <=25 %)
+        // et que le contrôle marché n'émet aucun avertissement, un vrai nouveau régime haussier
+        // peut être accepté même si l'ancre 25 ventes est encore en retard.
+        const hunterShortCoherent = calc?.hunterShortCoherent === true;
+        const hunterIntegrityWarnings = Array.isArray(marketIntegrity?.warnings)
+            ? marketIntegrity.warnings.length
+            : 0;
+        const hunterUpwardConsensusConfirmed =
+            hunterShortCoherent &&
+            hunterIntegrityWarnings === 0 &&
+            Number.isFinite(hunterConsensusReference) && hunterConsensusReference > 0 &&
+            Number.isFinite(Number(calc.marketReference)) &&
+            hunterConsensusReference > Number(calc.marketReference);
+
+        const hunterMarketReference = hunterUpwardConsensusConfirmed
+            ? hunterConsensusReference
+            : hunterBaseMarketReference;
+        const hunterExpectedExitReference =
+            Number.isFinite(hunterMarketReference) && hunterMarketReference > 0
+                ? hunterMarketReference * (expectedExitPct / 100)
+                : null;
+
         const hunterReference =
             calc.eligible && liquidityEligible && marketIntegrity.allowed &&
-            Number.isFinite(expectedExitReference) && expectedExitReference > 0
-                ? expectedExitReference * hunterPurchaseSafetyFactor
+            Number.isFinite(hunterExpectedExitReference) && hunterExpectedExitReference > 0
+                ? hunterExpectedExitReference * hunterPurchaseSafetyFactor
                 : null;
 
         // Alias conservé pour les anciens diagnostics/extensions internes.
@@ -6409,6 +6562,9 @@
             liquidityEligible,
             hunterRiskFactor,
             hunterPurchaseSafetyFactor,
+            hunterUpwardConsensusConfirmed,
+            hunterMarketReference,
+            hunterExpectedExitReference,
             hunterReference,
             initialExitBasePct,
             expectedExitPct,
@@ -16020,6 +16176,14 @@
             derniereVente: prices[0] ?? null,
             moyenneVentesVisibles: recentAverage,
             moyenneRobusteRecente: robustRounded,
+            referenceHunter5: Number.isFinite(Number(recent.hunterWindow5Reference)) ? Math.round(Number(recent.hunterWindow5Reference) * 10) / 10 : null,
+            referenceHunter10: Number.isFinite(Number(recent.hunterWindow10Reference)) ? Math.round(Number(recent.hunterWindow10Reference) * 10) / 10 : null,
+            referenceHunter15: Number.isFinite(Number(recent.hunterWindow15Reference)) ? Math.round(Number(recent.hunterWindow15Reference) * 10) / 10 : null,
+            consensusHunter: Number.isFinite(Number(recent.hunterConsensusReference)) ? Math.round(Number(recent.hunterConsensusReference) * 10) / 10 : null,
+            ecart5vs10Pct: Number.isFinite(Number(recent.hunterShortAgreementPct)) ? Math.round(Number(recent.hunterShortAgreementPct) * 10) / 10 : null,
+            dispersion10Pct: Number.isFinite(Number(recent.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
+            consensusCourtCoherent: recent.hunterShortCoherent === true,
+            hausseConsensusAcceptee: recent.hunterUpwardConsensusConfirmed === true,
             moyennePondereeRecence: weightedRounded,
             borneBassePlafonnement: recent.lowerBound ?? null,
             borneHautePlafonnement: recent.upperBound ?? null,
@@ -23056,6 +23220,7 @@
                         ? `bascule <b style="color:#888;">inactive</b>`
                         : `confiance bascule <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b>`
                     } ·
+                    consensus H <b style="color:#67e8f9;">${r.consensusHunter ?? '—'}</b> ·
                     cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
                     seuil robuste <b>&gt;${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
