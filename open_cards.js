@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.19';
+    const WM_VERSION = '3.5.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -23052,7 +23052,10 @@
                     robuste <b>${r.moyenneRobusteRecente ?? '—'}</b> ·
                     ${recentMarketIntegrityAllowed(r) ? 'Trend' : 'Trend indicative'} <b style="color:${recentMarketIntegrityAllowed(r) ? '#4ade80' : '#888'};">${r.valeurTrendAware ?? '—'}</b> ·
                     tendance <b style="color:${Number(r.tendancePct) < -RECENT_TREND_START_PCT ? '#f59e0b' : Number(r.tendancePct) > RECENT_TREND_START_PCT ? '#67e8f9' : '#aaa'};">${r.tendancePct != null ? `${r.tendancePct >= 0 ? '+' : ''}${r.tendancePct}%` : '—'}</b> ·
-                    confiance bascule <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b> ·
+                    ${Math.abs(Number(r.tendancePct)) < RECENT_TREND_START_PCT
+                        ? `bascule <b style="color:#888;">inactive</b>`
+                        : `confiance bascule <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b>`
+                    } ·
                     cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
                     seuil robuste <b>&gt;${HUNTER_RECENT_MIN_ROBUST_AVERAGE}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
