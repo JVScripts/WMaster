@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.15';
+    const WM_VERSION = '3.4.16';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -8859,6 +8859,108 @@
     /* ── Hot lane : poller rapide dédié aux enchères trackées ── */
     // Mutex per-auction partagé entre main scan et hot lane (anti-doublons)
     const bidLockSet = new Set();
+
+    // v3.4.16 — verrou anti-doublon Hunter par carte + rareté.
+    // Le cache collection peut mettre quelques secondes à refléter une victoire : pendant cette
+    // fenêtre, `isOwnedDuplicate()` seul permettait au Hunter d'acheter un 2e exemplaire identique.
+    // On prend donc aussi en compte les mises WMaster encore en attente et le Flip Seller.
+    const hunterCardRarityBidLockSet = new Set();
+
+    function hunterCardRarityKey(cardId, rarity) {
+        const id = String(cardId || '').trim();
+        const rr = String(rarity || '').trim().toUpperCase();
+        return id && rr ? `${id}::${rr}` : null;
+    }
+
+    function hunterCardRarityKeyFromAuction(a) {
+        if (!a) return null;
+        return hunterCardRarityKey(
+            a.card?.id ?? a.card_id,
+            globalAuctionRarity(a)
+        );
+    }
+
+    function hunterCardRarityKeyFromCandidate(c) {
+        if (!c) return null;
+        return hunterCardRarityKey(c.cardId, c.rarity);
+    }
+
+    function hunterCardRarityKeyFromFlip(rec) {
+        if (!rec) return null;
+        return hunterCardRarityKey(
+            rec.purchaseCardId || rec.cardId,
+            rec.purchaseRarity || rec.rarity
+        );
+    }
+
+    // Retourne un blocage PERSISTANT (mise déjà engagée / carte déjà dans le Flip).
+    // Si plusieurs candidats anciens existent déjà pour la même carte+rareté, la mise Hunter
+    // la plus ancienne garde la priorité afin de ne pas neutraliser les deux simultanément.
+    function hunterDuplicateExposureState(auction) {
+        const key = hunterCardRarityKeyFromAuction(auction);
+        if (!key) return { blocked: false, key: null, reason: null };
+
+        const auctionId = String(auction?.id || '');
+
+        const flip = flipLedger.find(rec =>
+            rec &&
+            rec.status !== 'sold' &&
+            hunterCardRarityKeyFromFlip(rec) === key
+        );
+        if (flip) {
+            return {
+                blocked: true,
+                key,
+                reason: `déjà suivi dans Flip Seller (${flip.status || 'actif'})`
+            };
+        }
+
+        const candidates = [...autoFlipCandidates.values()]
+            .filter(c => c && hunterCardRarityKeyFromCandidate(c) === key)
+            .sort((a, b) => {
+                const ta = Number(a.firstBidAt || a.updatedAt || Number.MAX_SAFE_INTEGER);
+                const tb = Number(b.firstBidAt || b.updatedAt || Number.MAX_SAFE_INTEGER);
+                if (ta !== tb) return ta - tb;
+                return String(a.auctionId || '').localeCompare(String(b.auctionId || ''));
+            });
+
+        if (candidates.length > 0) {
+            const current = candidates.find(c => String(c.auctionId || '') === auctionId);
+            const owner = candidates[0];
+
+            if (!current || String(owner?.auctionId || '') !== auctionId) {
+                return {
+                    blocked: true,
+                    key,
+                    reason: `une autre mise WMaster est déjà engagée sur cette carte/rareté`
+                };
+            }
+        }
+
+        return { blocked: false, key, reason: null };
+    }
+
+    // Mutex très court autour du POST de mise : couvre le cas où deux enchères identiques
+    // arrivent dans deux passes asynchrones avant que la première réponse ait eu le temps
+    // d'alimenter autoFlipCandidates.
+    function acquireHunterCardRarityBidLock(auction) {
+        const state = hunterDuplicateExposureState(auction);
+        if (state.blocked || !state.key) return null;
+        if (hunterCardRarityBidLockSet.has(state.key)) return null;
+        hunterCardRarityBidLockSet.add(state.key);
+        return state.key;
+    }
+
+    function releaseHunterCardRarityBidLock(key) {
+        if (key) hunterCardRarityBidLockSet.delete(key);
+    }
+
+    function isStandardHunterTrackedAuction(auction) {
+        if (!auction?.id) return false;
+        if (hunterFourbeMap.has(auction.id)) return true;
+        const source = String(autoFlipCandidates.get(auction.id)?.source || '');
+        return source === 'hunter_dynamic' || source === 'hunter_fixed';
+    }
     // Timer du tick courant (setTimeout récursif, pas setInterval car intervalle adaptatif)
     let hotLaneTimeout = null;
     let hotLaneActive = false;
@@ -9249,6 +9351,7 @@
 
             const listingRarity = globalAuctionRarity(fresh);
             if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) return null;
+            if (hunterDuplicateExposureState(fresh).blocked) return null;
 
             if (getSetting('autoSnipeMode') === 'adaptive' || isDynamicHunterAuction(fresh)) {
                 const freshRef = await ensureFreshHunterReference(
@@ -9314,12 +9417,14 @@
             if (iAmLeading(seed) || autoBidBlockedByUncertainSelfState(seed)) continue;
             const seedRarity = globalAuctionRarity(seed);
             if (isOwnedDuplicate(seed.card?.id ?? seed.card_id, seedRarity)) continue;
+            if (hunterDuplicateExposureState(seed).blocked) continue;
             const seedDecision = shouldAutoSnipe(seed);
             if (!seedDecision.snipe) continue;
             if (wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) continue;
             if (bidLockSet.has(seed.id)) continue;
 
             bidLockSet.add(seed.id);
+            let hunterCardLockKey = null;
 
             try {
                 await new Promise(r => setTimeout(r, bidDelayMs(seed)));
@@ -9329,6 +9434,12 @@
                 if (!prepared) continue;
 
                 let { auction, decision, amount, isDynamic } = prepared;
+
+                // Verrou carte+rareté pris au dernier moment : une autre passe Hunter ne peut
+                // pas acheter le même exemplaire logique pendant que ce POST est en vol.
+                hunterCardLockKey = acquireHunterCardRarityBidLock(auction);
+                if (!hunterCardLockKey) continue;
+
                 let attempt = await postHunterBid(auction.id, amount);
 
                 // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
@@ -9391,6 +9502,7 @@
             } catch (e) {
                 // Aucun auto-bid n'est armé si la mise initiale n'a pas abouti.
             } finally {
+                releaseHunterCardRarityBidLock(hunterCardLockKey);
                 bidLockSet.delete(seed.id);
             }
 
@@ -9411,6 +9523,7 @@
             if (snipeSet.has(a.id) || autoBidSet.has(a.id)) continue;
             if (iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) continue;
             if (isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a))) continue; // déjà possédée DANS cette rareté
+            if (hunterDuplicateExposureState(a).blocked) continue;
 
             if (getSetting('autoSnipeMode') === 'adaptive' || isDynamicHunterAuction(a)) {
                 const freshRef = await ensureFreshHunterReference(
@@ -11821,6 +11934,14 @@
             // rallonge le timer d'1 min). Si je mène déjà, rien à faire. Si l'adversaire
             // re-surenchérit sous 10s, le timer se rallonge → nouvelle fenêtre → nouveau snipe.
             if (snipeSet.has(a.id) && endTs > 0 && !bidLockSet.has(a.id)) {
+                const hunterManagedSnipe = hunterFourbeMap.has(a.id);
+                if (hunterManagedSnipe && hunterDuplicateExposureState(a).blocked) {
+                    disarmHunterFourbe(a.id);
+                    saveSnipeSet();
+                    saveHunterFourbe();
+                    continue;
+                }
+
                 // Si ce Fourbe a été armé par le Hunter dynamique, son seuil WM
                 // doit être revérifié au moment réel du snipe.
                 if (
@@ -11847,6 +11968,14 @@
                     && wikibidousBalance > 0) {
                     const bidAmount = minNextBid(a);
                     if (autoBidWithinCap(a, bidAmount)) {
+                        let hunterCardLockKey = null;
+                        if (hunterManagedSnipe) {
+                            hunterCardLockKey = acquireHunterCardRarityBidLock(a);
+                            // Une autre enchère identique est en train de miser dans une autre passe :
+                            // on garde le Fourbe armé et on retentera au prochain tick.
+                            if (!hunterCardLockKey) continue;
+                        }
+
                         bidLockSet.add(a.id);
                         const titleSn = a.card?.wikipedia_title || '?';
                         const rarSn = (a.card?.rarity || '').toUpperCase();
@@ -11873,6 +12002,7 @@
                         } catch (e) {
                             wmLog(`⚠️ Fourbe exception : <b>${titleSn}</b> · ${e.message}`);
                         } finally {
+                            releaseHunterCardRarityBidLock(hunterCardLockKey);
                             bidLockSet.delete(a.id);
                         }
                         continue; // ce tick a servi au snipe pour cette enchère
@@ -11935,7 +12065,22 @@
                     }
                 }
 
+                const standardHunterTracked = isStandardHunterTrackedAuction(a);
+                const duplicateExposure = standardHunterTracked
+                    ? hunterDuplicateExposureState(a)
+                    : { blocked: false };
+
+                // Si cette enchère Hunter est la plus récente de deux expositions identiques,
+                // on coupe sa riposte. L'ancienne garde la priorité ; les modes manuels / ciblés
+                // ne sont pas modifiés par ce verrou.
+                if (duplicateExposure.blocked && autoBidSet.has(a.id)) {
+                    autoBidSet.delete(a.id);
+                    saveAutoBidSet();
+                    setAutoBidMax(a.id, null);
+                }
+
                 if (autoBidSet.has(a.id)
+                    && !duplicateExposure.blocked
                     && hunterHotFresh
                     && dynamicHunterContinuationAllowed(a)
                     && automaticBidTimeAllowed(a)
@@ -11943,6 +12088,16 @@
                     && !bidLockSet.has(a.id)) {
                     const bidAmount = bidIncrement(bidOb);
                     if (autoBidWithinCap(a, bidAmount)) { // ne riposte que sous le plafond
+                        let hunterCardLockKey = null;
+                        let hunterCardLockReady = true;
+                        if (standardHunterTracked) {
+                            hunterCardLockKey = acquireHunterCardRarityBidLock(a);
+                            // Mutex transitoire occupé : on ne coupe pas l'auto-bid et surtout on
+                            // ne fait pas `continue`, afin de laisser la synchro du lead s'exécuter.
+                            hunterCardLockReady = !!hunterCardLockKey;
+                        }
+
+                        if (hunterCardLockReady) {
                         bidLockSet.add(a.id);
                         try {
                             // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane).
@@ -12036,7 +12191,9 @@
                         } catch (e) {
                             wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
                         } finally {
+                            releaseHunterCardRarityBidLock(hunterCardLockKey);
                             bidLockSet.delete(a.id);
+                        }
                         }
                     }
                     // plafond atteint → autoBidWithinCap a déjà coupé l'auto-bid ; on tombe sur
