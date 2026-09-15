@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.4.18';
+    const WM_VERSION = '3.4.19';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4394,7 +4394,7 @@
             recentMinVentesHunter: HUNTER_RECENT_MIN_SALES,
             trendDetection: `${RECENT_TREND_BLOCK_SIZE} dernières plafonnées vs ${RECENT_TREND_BLOCK_SIZE} précédentes · ${RECENT_TREND_START_PCT}%→${RECENT_TREND_FULL_PCT}%`,
             regimeShift: `baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}% · hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}% · bascule pondérée par confiance des 5 dernières`,
-            filtreExtremes: `${RECENT_MARKET_LIMIT} ventes strictes · robuste sur 11 centrales · extrêmes plafonnés dans la série temporelle`,
+            filtreExtremes: `15 ventes minimum · jusqu’à ${RECENT_MARKET_LIMIT} analysées · trim adaptatif 2/3 extrêmes par côté · extrêmes plafonnés dans la série temporelle`,
             recencyDecay: RECENT_RECENCY_DECAY,
             recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
             hunterPurchaseSafetyFloorPct: Math.round(HUNTER_PURCHASE_SAFETY_FLOOR * 100),
@@ -4402,7 +4402,7 @@
             hunterLiquidity: `dernière vente <= 48h · rythme global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · rythme 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
             recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} ET dernière vente <=48h ET rythme global >=${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/j ET rythme récent >=${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/j · achat lié à la sortie Flip`,
             hunterFallbackAchat: 'aucun',
-            recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}% · remise urgence 0-${FLIP_MAX_URGENCY_DISCOUNT_PCT}pt`,
+            recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}% · urgence liquidité/fraîcheur 0-${FLIP_MAX_URGENCY_DISCOUNT_PCT}pt`,
             flipMinimum: `${RECENT_MARKET_MIN_SALES} ventes strictes`,
             flipFallback: 'aucun',
             refreshForceAvantChaqueListing: true,
@@ -5293,17 +5293,17 @@
     }
 
     /* ═══════ v3.4.2 — RECENT MARKET / TREND-AWARE v3 · PURCHASE ↔ EXIT ═══════
-       Source : les 15 dernières ventes `settled_sold` visibles dans `auctions`.
+       Source : jusqu’aux 25 dernières ventes `settled_sold` visibles dans `auctions` (15 minimum).
 
        Règle stricte :
-         - 15 ventes valides obligatoires pour acheter ET pour vendre
+         - 15 ventes valides minimum pour acheter ET pour vendre ; jusqu’à 25 utilisées si disponibles
          - aucun fallback WM
 
        Prix juste v3 :
-         - moyenne robuste = moyenne des 11 valeurs centrales (2 basses + 2 hautes écartées)
-         - pour préserver la chronologie, les 15 prix restent présents dans la série Trend,
-           mais les 2 extrêmes de chaque côté sont plafonnés aux bornes centrales
-         - récence adoucie (0.80) sur l'ensemble des 15 ventes
+         - moyenne robuste adaptative : 2 extrêmes/côté retirés avec 15-19 ventes, 3 avec 20-25
+         - pour préserver la chronologie, toutes les ventes restent présentes dans la série Trend,
+           avec plafonnement aux bornes robustes
+         - récence adoucie (0.80) sur l’ensemble des ventes disponibles (15 à 25)
          - tendance = 5 dernières ventes plafonnées vs 5 précédentes
          - détection de changement de régime : en forte hausse/baisse, la référence bascule
            progressivement vers les 5 ventes les plus récentes, elles-mêmes robustifiées
@@ -5312,22 +5312,26 @@
 
        Anti-cartes mortes / achat :
          - dernière vente <= 48 h
-         - rythme >= 0.75 vente / jour sur les 15 dernières
+         - rythme >= 0.75 vente / jour sur l’historique disponible (15 à 25)
          - rythme des 5 ventes les plus récentes >= 0.75 vente / jour
-         - la référence d'achat est encore réduite selon volatilité, liquidité,
-           baisse récente et concentration des participants (facteur 75%..100%)
+         - la référence d'achat reçoit ensuite uniquement la sécurité achat-only
+           (anti-pump + concentration des participants, plancher 90%)
          - le réglage Hunter (70% par défaut) s'applique ENSUITE à cette référence d'achat
 
        Revente :
-         - 15 ventes obligatoires
+         - 15 ventes minimum ; jusqu’à 25 pour stabiliser la valeur de fond
          - base 100% / 95% / 90% de la valeur juste régime-aware
-         - jusqu'à 12 points de remise d'urgence si le marché ralentit / baisse / devient volatil
+         - jusqu'à 6 points d'urgence uniquement si la vente devient réellement difficile (fraîcheur / liquidité)
          - plancher de marge existant toujours prioritaire
     */
-    const RECENT_MARKET_LIMIT = 15;
+    // v3.4.18 — 15 ventes restent le minimum d'éligibilité, mais on exploite
+    // jusqu'à 25 ventes lorsqu'elles existent pour stabiliser la valeur de fond.
+    const RECENT_MARKET_LIMIT = 25;
     const RECENT_MARKET_MIN_SALES = 15;
     const HUNTER_RECENT_MIN_SALES = 15;
-    const RECENT_MARKET_TRIM_EACH_SIDE = 2;
+    // Le contrôle anti-manipulation reste volontairement centré sur les 15 plus récentes :
+    // une fraude récente ne doit pas être diluée par 10 ventes plus anciennes.
+    const RECENT_MARKET_INTEGRITY_LIMIT = 15;
     const RECENT_MARKET_CACHE_TTL_MS = 60 * 1000;
     const RECENT_MARKET_PRE_ACTION_MAX_AGE_MS = 5 * 1000;
     const RECENT_MARKET_FLIP_MAX_STALE_MS = 5 * 60 * 1000;
@@ -5360,12 +5364,12 @@
     const RECENT_REGIME_AGREEMENT_WEIGHTS = [1.00, 0.85, 0.70, 0.55, 0.40];
 
     // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
-    // une carte déjà acquise dès lors que ses 15 ventes existent, avec prix d'urgence.
+    // une carte déjà acquise dès lors que ses 15 ventes minimum existent, avec prix d’urgence.
     const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
     const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.75;
     const HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY = 0.75;
     const HUNTER_PURCHASE_SAFETY_FLOOR = 0.90;
-    const FLIP_MAX_URGENCY_DISCOUNT_PCT = 12;
+    const FLIP_MAX_URGENCY_DISCOUNT_PCT = 6;
 
     const recentMarketCache = new Map();
     const recentMarketInflight = new Map();
@@ -5385,6 +5389,14 @@
             .map(Number)
             .filter(Number.isFinite);
         return arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : null;
+    }
+
+    // Trim proportionnel à la profondeur réellement disponible :
+    // 15-19 ventes => 2 extrêmes de chaque côté ; 20-25 => 3.
+    // On garde ainsi environ 70-75 % du centre sans imposer 25 ventes.
+    function recentMarketTrimEachSide(count) {
+        const n = Math.max(0, Number(count) || 0);
+        return n >= 20 ? 3 : 2;
     }
 
     // v3.4.8 — défense en profondeur contre un petit cluster de ventes artificiellement hautes.
@@ -5502,7 +5514,7 @@
             };
         }
 
-        const trimEachSide = RECENT_MARKET_TRIM_EACH_SIDE;
+        const trimEachSide = recentMarketTrimEachSide(clean.length);
 
         // v3.4.8 : si >=3 ventes forment un îlot de prix très au-dessus du marché,
         // on les plafonne au sommet du groupe bas AVANT le trim classique.
@@ -5522,12 +5534,13 @@
         const removedHighs = sorted.slice(-trimEachSide).sort((a, b) => b - a);
         const trimmedSorted = sorted.slice(trimEachSide, sorted.length - trimEachSide);
 
-        // Moyenne robuste : 11 valeurs centrales sur 15, après neutralisation éventuelle
-        // du cluster extrême.
+        // Moyenne robuste adaptative : centre de la distribution après retrait de 2
+        // extrêmes de chaque côté avec 15-19 ventes, ou 3 avec 20-25 ventes.
+        // La profondeur supplémentaire stabilise l'ancre sans ralentir le signal des 5 dernières.
         const robustAverage = meanOf(trimmedSorted);
 
         // Plafonnement des extrêmes plutôt que suppression pour les calculs temporels.
-        // Les 15 positions restent donc présentes pour le 5v5 et la récence.
+        // Toutes les positions disponibles restent présentes pour le 5v5 et la récence.
         const lowerBound = sorted[trimEachSide];
         const upperBound = sorted[sorted.length - trimEachSide - 1];
         const boundedPrices = safetyClean.map(price =>
@@ -5903,7 +5916,7 @@
 
     function assessRecentMarketIntegrity(rows, nowTs = Date.now()) {
         const policy = MARKET_INTEGRITY_POLICY;
-        const sales = (Array.isArray(rows) ? rows : []).slice(0, RECENT_MARKET_LIMIT);
+        const sales = (Array.isArray(rows) ? rows : []).slice(0, RECENT_MARKET_INTEGRITY_LIMIT);
         const reasons = [];
         const warnings = [];
         const metrics = {};
@@ -6199,7 +6212,12 @@
         const nowTs = typeof serverNow === 'function' ? serverNow() : Date.now();
         const marketIntegrity = assessRecentMarketIntegrity(rows, nowTs);
 
-        const saleTimes = rows
+        // v3.4.18 : les 10 ventes supplémentaires stabilisent la VALEUR, mais ne doivent pas
+        // rendre artificiellement un marché actuel moins liquide. Fraîcheur, rythme, diversité
+        // et urgence restent donc mesurés sur les 15 ventes les plus récentes comme avant.
+        const decisionRows = rows.slice(0, RECENT_MARKET_INTEGRITY_LIMIT);
+
+        const saleTimes = decisionRows
             .map(recentSaleTimestamp)
             .filter(Number.isFinite);
         const newestTs = saleTimes.length ? saleTimes[0] : null;
@@ -6212,17 +6230,17 @@
                 ? Math.max(0, newestTs - oldestTs)
                 : null;
         const saleRatePerDay =
-            rows.length >= 2 && Number.isFinite(salesSpanMs)
+            decisionRows.length >= 2 && Number.isFinite(salesSpanMs)
                 ? salesSpanMs > 0
-                    ? (rows.length - 1) / (salesSpanMs / 86400000)
+                    ? (decisionRows.length - 1) / (salesSpanMs / 86400000)
                     : 99
                 : 0;
         const averageGapHours =
-            rows.length >= 2 && Number.isFinite(salesSpanMs)
-                ? salesSpanMs / (rows.length - 1) / 3600000
+            decisionRows.length >= 2 && Number.isFinite(salesSpanMs)
+                ? salesSpanMs / (decisionRows.length - 1) / 3600000
                 : null;
 
-        const recentSaleTimes = rows
+        const recentSaleTimes = decisionRows
             .slice(0, RECENT_TREND_BLOCK_SIZE)
             .map(recentSaleTimestamp)
             .filter(Number.isFinite);
@@ -6236,7 +6254,7 @@
                     : 99
                 : 0;
 
-        const participants = computeParticipantSummary(rows);
+        const participants = computeParticipantSummary(decisionRows);
 
         // Score liquidité : une vente très récente et un rythme élevé donnent 100.
         const newestAgeHours = Number.isFinite(newestSaleAgeMs)
@@ -6287,7 +6305,7 @@
         );
 
         const liquidityEligible =
-            rows.length >= HUNTER_RECENT_MIN_SALES &&
+            decisionRows.length >= HUNTER_RECENT_MIN_SALES &&
             Number.isFinite(newestSaleAgeMs) &&
             newestSaleAgeMs <= HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS &&
             Number.isFinite(saleRatePerDay) &&
@@ -6295,43 +6313,42 @@
             Number.isFinite(recentSaleRatePerDay) &&
             recentSaleRatePerDay >= HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY;
 
-        // v3.4.2 — Purchase ↔ Exit unifiés.
-        // On calcule D'ABORD le vrai prix de sortie du Flip. Les mêmes signaux
-        // (baisse, lenteur, volatilité) ne doivent ensuite pas être pénalisés une 2e fois
-        // côté Hunter : ils sont déjà inclus dans la remise d'urgence du prix de sortie.
+        // v3.4.18 — l'« urgence » mesure uniquement la DIFFICULTÉ À VENDRE.
+        // La valeur de marché (hausse/baisse/dispersion/régime) est déjà absorbée par Trend v3.4.17 :
+        // la repénaliser ici ferait payer deux fois le même risque. Marché actif normal => 0 pt.
         const trendPct = Number(calc?.trendPct);
         let sellUrgencyDiscountPct = 0;
 
-        if (newestAgeHours > 48) sellUrgencyDiscountPct += 4;
+        // Fraîcheur : une vente dans les 12 h ne crée aucune urgence.
+        if (newestAgeHours > 48) sellUrgencyDiscountPct += 3;
         else if (newestAgeHours > 24) sellUrgencyDiscountPct += 2;
         else if (newestAgeHours > 12) sellUrgencyDiscountPct += 1;
 
-        if (saleRatePerDay < 0.75) sellUrgencyDiscountPct += 4;
-        else if (saleRatePerDay < 1.5) sellUrgencyDiscountPct += 2;
-        else if (saleRatePerDay < 3) sellUrgencyDiscountPct += 1;
+        // Rythme de fond : aucune décote à partir de 0,75 vente/j.
+        // Seuls les marchés réellement lents déclenchent une remise.
+        if (saleRatePerDay < 0.25) sellUrgencyDiscountPct += 3;
+        else if (saleRatePerDay < 0.50) sellUrgencyDiscountPct += 2;
+        else if (saleRatePerDay < 0.75) sellUrgencyDiscountPct += 1;
 
-        // Le rythme des 5 dernières ventes permet de détecter un marché qui vient
-        // de se figer même si le rythme moyen des 15 ventes paraît encore correct.
-        if (recentSaleRatePerDay < 0.75) sellUrgencyDiscountPct += 3;
-        else if (recentSaleRatePerDay < 1.5) sellUrgencyDiscountPct += 2;
-        else if (recentSaleRatePerDay < 3) sellUrgencyDiscountPct += 1;
+        // Décélération récente : on pénalise seulement un vrai gel des 5 dernières ventes,
+        // ou un effondrement du rythme récent par rapport au rythme de fond.
+        if (recentSaleRatePerDay < 0.25) sellUrgencyDiscountPct += 2;
+        else if (recentSaleRatePerDay < 0.50) sellUrgencyDiscountPct += 1;
 
-        if (Number.isFinite(trendPct) && trendPct <= -50) sellUrgencyDiscountPct += 6;
-        else if (Number.isFinite(trendPct) && trendPct <= -30) sellUrgencyDiscountPct += 4;
-        else if (Number.isFinite(trendPct) && trendPct <= -15) sellUrgencyDiscountPct += 2;
-        if (Number.isFinite(dispersionPct) && dispersionPct >= 30) sellUrgencyDiscountPct += 1;
         if (
-            calc?.regimeShiftMode === 'down' &&
-            Number(calc?.regimeShiftStrength) >= 0.75
+            Number.isFinite(saleRatePerDay) && saleRatePerDay >= 1 &&
+            Number.isFinite(recentSaleRatePerDay) &&
+            recentSaleRatePerDay < saleRatePerDay * 0.35
         ) sellUrgencyDiscountPct += 1;
+
         sellUrgencyDiscountPct = Math.max(
             0,
             Math.min(FLIP_MAX_URGENCY_DISCOUNT_PCT, sellUrgencyDiscountPct)
         );
 
         // Sorties réellement planifiées par le Flip aux différents stades.
-        // La référence d'achat Hunter part du 1er listing : ainsi une urgence -8pt
-        // réduit mécaniquement l'achat de 8 points avant même le ratio Hunter.
+        // La référence d'achat Hunter part du 1er listing : une urgence éventuelle
+        // réduit donc mécaniquement l'achat avant même le ratio Hunter.
         const initialExitBasePct = getFlipInitialRecentPct();
         const relist1ExitBasePct = getFlipRelist1RecentPct();
         const relist2ExitBasePct = getFlipRelist2RecentPct();
@@ -6502,7 +6519,7 @@
 
     // v3.4.2 — Hunter RECENT MARKET + TREND-AWARE v3 · Purchase ↔ Exit.
     // Conditions obligatoires :
-    // - 15 ventes valides obligatoires
+    // - 15 ventes valides minimum ; jusqu'à 25 exploitées
     // - moyenne robuste STRICTEMENT supérieure à 790
     // - liquidité minimale obligatoire (vente récente + rythme suffisant)
     // - la valeur d'achat part de la sortie Flip réelle (1er listing - urgence), puis sécurité achat-only
@@ -6791,7 +6808,7 @@
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.4.2 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec 15 ventes, liquidité suffisante et moyenne robuste STRICTEMENT > 790.
+    //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et moyenne robuste STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
@@ -16092,7 +16109,7 @@
             concentrationMaxPct: Number.isFinite(Number(recent.participantConcentration))
                 ? Math.round(Number(recent.participantConcentration) * 100)
                 : null,
-            seuilHunterRecent: `15 ventes vérifiables + robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} + liquidité + contrôle manipulation`,
+            seuilHunterRecent: `15 ventes vérifiables minimum (jusqu’à ${RECENT_MARKET_LIMIT}) + robuste > ${HUNTER_RECENT_MIN_ROBUST_AVERAGE} + liquidité + contrôle manipulation`,
             moyenneWM: Number.isFinite(wm) && wm > 0 ? wm : null,
             marcheRecentSurWM_Pct: ratioToWm,
             erreur: probe?.ok ? null : (probe?.error || 'échec inconnu'),
@@ -18626,7 +18643,7 @@
                                 <option value="">Toutes</option><option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option><option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
                             </select>
                             <button id="wm-price-btn" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(6,182,212,.45);background:rgba(6,182,212,.10);color:#67e8f9;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">Prix WM</button>
-                            <button id="wm-last-sales-btn" title="Teste les 15 dernières ventes visibles dans la table auctions avec ta RLS normale" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);color:#fbbf24;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">🧪 15 ventes</button>
+                            <button id="wm-last-sales-btn" title="Teste jusqu’aux 25 dernières ventes visibles dans la table auctions avec ta RLS normale" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);color:#fbbf24;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">🧪 25 ventes</button>
                         </div>
                         <div id="wm-price-result" style="margin-top:5px;min-height:13px;font-size:10px;color:#777;line-height:1.45;">Tape une carte puis Entrée.</div>
                         <div id="wm-last-sales-result" style="margin-top:5px;min-height:13px;font-size:9px;color:#777;line-height:1.45;"></div>
@@ -18721,7 +18738,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.3 Trend-Aware v3 : <b>15 ventes obligatoires</b>. Le prix juste détecte les <b>changements de régime</b>. Hunter et Flip sont maintenant liés : le Hunter part du <b>prix de sortie réel du 1er listing</b> (100% - urgence), ajoute seulement une sécurité achat-only, puis applique le ratio Hunter. Ainsi une urgence -8pt baisse aussi le plafond d’achat. Flip : base <b>100% → 95% → 90%</b>, jusqu’à -12pt d’urgence selon baisse, fraîcheur, rythme global <b>et rythme des 5 dernières</b>. <b>Aucun fallback WM</b>. Marge mini toujours protégée. <b>Flip en roulement FIFO</b> : tout invendu repart au fond de la file au lieu de reprendre immédiatement un slot.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.18 Trend-Aware v3 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. Le prix juste détecte les <b>changements de régime</b>. Hunter et Flip restent liés : le Hunter part du <b>prix de sortie réel du 1er listing</b>, ajoute seulement une sécurité achat-only, puis applique le ratio Hunter. L’urgence ne mesure plus la baisse de prix : elle reflète uniquement <b>fraîcheur + difficulté réelle à vendre</b>, plafonnée à -6pt. Flip : base <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Marge mini toujours protégée. <b>Flip en roulement FIFO</b> : tout invendu repart au fond de la file au lieu de reprendre immédiatement un slot.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -18872,10 +18889,10 @@
                     <div class="wm-set-title">Comportement</div>
                     <div class="wm-set-sub">Hunter : mode de décision</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="fixed"><span>Seuil fixe (mise si prix ≤ valeur définie)</span></label>
-                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v3 (15 dernières ventes)</span></label>
+                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v3 (15 min · jusqu’à 25 ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v3 : <b>15 ventes strictes</b>. Robuste = 11 valeurs centrales ; les 15 restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v3 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -19328,7 +19345,7 @@
             } finally {
                 if (lastSalesLookupBtn) {
                     lastSalesLookupBtn.disabled = false;
-                    lastSalesLookupBtn.textContent = '🧪 15 ventes';
+                    lastSalesLookupBtn.textContent = '🧪 25 ventes';
                 }
             }
         }
@@ -23076,7 +23093,7 @@
 
     wmLog(
         `⚡ v${WM_VERSION} · protection anti-manipulation renforcée : comptes liés + clusters de prix extrêmes dès 3 ventes · ` +
-        `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes strictes · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ` +
+        `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes min / ${RECENT_MARKET_LIMIT} max · robuste >${HUNTER_RECENT_MIN_ROBUST_AVERAGE} · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
