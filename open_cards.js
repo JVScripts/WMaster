@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.0';
+    const WM_VERSION = '3.6.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4106,6 +4106,9 @@
             dispersion10Pct: Number.isFinite(Number(recent?.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
             spreadFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowSpreadPct)) ? Math.round(Number(recent.hunterWindowSpreadPct) * 10) / 10 : null,
             coherenceFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowCoherenceScore)) ? Math.round(Number(recent.hunterWindowCoherenceScore) * 100) : null,
+            coherenceSpreadHPct: Number.isFinite(Number(recent?.hunterWindowSpreadCoherence)) ? Math.round(Number(recent.hunterWindowSpreadCoherence) * 100) : null,
+            coherenceAccordHPct: Number.isFinite(Number(recent?.hunterWindowAgreementCoherence)) ? Math.round(Number(recent.hunterWindowAgreementCoherence) * 100) : null,
+            coherenceDispersionHPct: Number.isFinite(Number(recent?.hunterWindowDispersionCoherence)) ? Math.round(Number(recent.hunterWindowDispersionCoherence) * 100) : null,
             directionFenêtresH: recent?.hunterWindowOrderedDirection ?? 'none',
             chaosFenêtresH: recent?.hunterWindowChaos === true,
             ruptureOrdonnee: recent?.orderedRegimeBreak?.detected === true ? recent.orderedRegimeBreak.direction : null,
@@ -4247,6 +4250,9 @@
             dispersion10Pct: Number.isFinite(Number(recent?.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
             spreadFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowSpreadPct)) ? Math.round(Number(recent.hunterWindowSpreadPct) * 10) / 10 : null,
             coherenceFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowCoherenceScore)) ? Math.round(Number(recent.hunterWindowCoherenceScore) * 100) : null,
+            coherenceSpreadHPct: Number.isFinite(Number(recent?.hunterWindowSpreadCoherence)) ? Math.round(Number(recent.hunterWindowSpreadCoherence) * 100) : null,
+            coherenceAccordHPct: Number.isFinite(Number(recent?.hunterWindowAgreementCoherence)) ? Math.round(Number(recent.hunterWindowAgreementCoherence) * 100) : null,
+            coherenceDispersionHPct: Number.isFinite(Number(recent?.hunterWindowDispersionCoherence)) ? Math.round(Number(recent.hunterWindowDispersionCoherence) * 100) : null,
             directionFenêtresH: recent?.hunterWindowOrderedDirection ?? 'none',
             chaosFenêtresH: recent?.hunterWindowChaos === true,
             ruptureOrdonnee: recent?.orderedRegimeBreak?.detected === true ? recent.orderedRegimeBreak.direction : null,
@@ -5443,6 +5449,16 @@
     // 500·2000·500·2000·500 est du chaos et doit bloquer l'achat.
     const HUNTER_WINDOW_COHERENCE_FULL_PCT = 20;
     const HUNTER_WINDOW_COHERENCE_ZERO_PCT = 80;
+    // v3.6.1 — la cohérence Hunter ne dépend plus du seul écart H5/H10/H15.
+    // Un consensus peut sembler stable alors que les 10 dernières ventes sont très bruitées
+    // (ex. João Neves). On combine donc structure des fenêtres, accord H5/H10 et dispersion10.
+    const HUNTER_WINDOW_AGREEMENT_FULL_PCT = 10;
+    const HUNTER_WINDOW_AGREEMENT_ZERO_PCT = 50;
+    const HUNTER_WINDOW_DISPERSION_FULL_PCT = 25;
+    const HUNTER_WINDOW_DISPERSION_ZERO_PCT = 70;
+    const HUNTER_WINDOW_COHERENCE_SPREAD_WEIGHT = 0.45;
+    const HUNTER_WINDOW_COHERENCE_AGREEMENT_WEIGHT = 0.25;
+    const HUNTER_WINDOW_COHERENCE_DISPERSION_WEIGHT = 0.30;
     const HUNTER_WINDOW_CHAOS_SPREAD_PCT = 75;
     const ORDERED_BREAK_RECENT_MAX = 6;
     const ORDERED_BREAK_OLDER_MAX = 10;
@@ -5568,12 +5584,32 @@
             if (ref5 >= ref10 && ref10 >= ref15) windowOrderedDirection = 'up';
             else if (ref5 <= ref10 && ref10 <= ref15) windowOrderedDirection = 'down';
         }
-        const baseWindowCoherence = Number.isFinite(windowSpreadPct)
+        const spreadCoherence = Number.isFinite(windowSpreadPct)
             ? 1 - clamp01(
                 (windowSpreadPct - HUNTER_WINDOW_COHERENCE_FULL_PCT) /
                 (HUNTER_WINDOW_COHERENCE_ZERO_PCT - HUNTER_WINDOW_COHERENCE_FULL_PCT)
             )
             : 0;
+        const agreementCoherence = Number.isFinite(shortAgreementPct)
+            ? 1 - clamp01(
+                (shortAgreementPct - HUNTER_WINDOW_AGREEMENT_FULL_PCT) /
+                (HUNTER_WINDOW_AGREEMENT_ZERO_PCT - HUNTER_WINDOW_AGREEMENT_FULL_PCT)
+            )
+            : 0;
+        const dispersionCoherence = Number.isFinite(window10DispersionPct)
+            ? 1 - clamp01(
+                (window10DispersionPct - HUNTER_WINDOW_DISPERSION_FULL_PCT) /
+                (HUNTER_WINDOW_DISPERSION_ZERO_PCT - HUNTER_WINDOW_DISPERSION_FULL_PCT)
+            )
+            : 0;
+
+        // Score composite : le spread garde le poids principal, mais un H5 qui diverge de H10
+        // ou 10 ventes intrinsèquement chaotiques ne peuvent plus afficher artificiellement 80-100 %.
+        const baseWindowCoherence = clamp01(
+            spreadCoherence * HUNTER_WINDOW_COHERENCE_SPREAD_WEIGHT +
+            agreementCoherence * HUNTER_WINDOW_COHERENCE_AGREEMENT_WEIGHT +
+            dispersionCoherence * HUNTER_WINDOW_COHERENCE_DISPERSION_WEIGHT
+        );
 
         return {
             ref5,
@@ -5585,6 +5621,9 @@
             shortCoherent,
             windowSpreadPct,
             windowOrderedDirection,
+            spreadCoherence,
+            agreementCoherence,
+            dispersionCoherence,
             baseWindowCoherence
         };
     }
@@ -5821,6 +5860,9 @@
                 hunterShortCoherent: false,
                 hunterWindowSpreadPct: null,
                 hunterWindowOrderedDirection: 'none',
+                hunterWindowSpreadCoherence: 0,
+                hunterWindowAgreementCoherence: 0,
+                hunterWindowDispersionCoherence: 0,
                 hunterWindowCoherenceScore: 0,
                 hunterWindowChaos: false,
                 orderedRegimeBreak: null,
@@ -5839,6 +5881,9 @@
         const hunterShortCoherent = hunterMultiWindow.shortCoherent;
         const hunterWindowSpreadPct = hunterMultiWindow.windowSpreadPct;
         const hunterWindowOrderedDirection = hunterMultiWindow.windowOrderedDirection;
+        const hunterWindowSpreadCoherence = hunterMultiWindow.spreadCoherence;
+        const hunterWindowAgreementCoherence = hunterMultiWindow.agreementCoherence;
+        const hunterWindowDispersionCoherence = hunterMultiWindow.dispersionCoherence;
         let hunterWindowCoherenceScore = hunterMultiWindow.baseWindowCoherence;
 
         const trimEachSide = recentMarketTrimEachSide(clean.length);
@@ -6218,6 +6263,9 @@
             hunterShortCoherent,
             hunterWindowSpreadPct,
             hunterWindowOrderedDirection,
+            hunterWindowSpreadCoherence,
+            hunterWindowAgreementCoherence,
+            hunterWindowDispersionCoherence,
             hunterWindowCoherenceScore,
             hunterWindowChaos,
             orderedRegimeBreak,
@@ -7122,6 +7170,9 @@
             participantConcentration: Number(recent.participantConcentration || 0),
             hunterWindowSpreadPct: Number.isFinite(Number(recent.hunterWindowSpreadPct)) ? Number(recent.hunterWindowSpreadPct) : null,
             hunterWindowCoherenceScore: Number(recent.hunterWindowCoherenceScore || 0),
+            hunterWindowSpreadCoherence: Number(recent.hunterWindowSpreadCoherence || 0),
+            hunterWindowAgreementCoherence: Number(recent.hunterWindowAgreementCoherence || 0),
+            hunterWindowDispersionCoherence: Number(recent.hunterWindowDispersionCoherence || 0),
             hunterWindowChaos: recent.hunterWindowChaos === true,
             orderedRegimeBreak: recent.orderedRegimeBreak || null,
             effectiveSaleRatePerDay: Number.isFinite(Number(recent.effectiveSaleRatePerDay)) ? Number(recent.effectiveSaleRatePerDay) : null,
@@ -16537,6 +16588,9 @@
             dispersion10Pct: Number.isFinite(Number(recent.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
             spreadFenêtresHPct: Number.isFinite(Number(recent.hunterWindowSpreadPct)) ? Math.round(Number(recent.hunterWindowSpreadPct) * 10) / 10 : null,
             coherenceFenêtresHPct: Number.isFinite(Number(recent.hunterWindowCoherenceScore)) ? Math.round(Number(recent.hunterWindowCoherenceScore) * 100) : null,
+            coherenceSpreadHPct: Number.isFinite(Number(recent.hunterWindowSpreadCoherence)) ? Math.round(Number(recent.hunterWindowSpreadCoherence) * 100) : null,
+            coherenceAccordHPct: Number.isFinite(Number(recent.hunterWindowAgreementCoherence)) ? Math.round(Number(recent.hunterWindowAgreementCoherence) * 100) : null,
+            coherenceDispersionHPct: Number.isFinite(Number(recent.hunterWindowDispersionCoherence)) ? Math.round(Number(recent.hunterWindowDispersionCoherence) * 100) : null,
             chaosFenêtresH: recent.hunterWindowChaos === true,
             ruptureOrdonnee: recent.orderedRegimeBreak?.detected === true ? recent.orderedRegimeBreak.direction : null,
             forceRupturePct: Number.isFinite(Number(recent.orderedRegimeBreak?.strength)) ? Math.round(Number(recent.orderedRegimeBreak.strength) * 100) : null,
