@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.5.2';
+    const WM_VERSION = '3.6.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2793,7 +2793,7 @@
         const regimeStrengthPct = Math.round(Number(recent?.regimeShiftStrength || 0) * 100);
         const regimeRef = Number(recent?.recentRegimeReference);
         let basis =
-            `Trend-Aware v3 ${Math.round(reference)} · ` +
+            `Trend-Aware v4 ${Math.round(reference)} · ` +
             `robuste ${Math.round(recent.robustAverage)} · ` +
             `régime récent ${Number.isFinite(regimeRef) ? Math.round(regimeRef) : '—'} · ` +
             `bascule ${regimeStrengthPct}% ${recent?.regimeShiftMode || 'none'} · ` +
@@ -2825,16 +2825,30 @@
 
         let undercut = null;
         if (getFlipUndercut()) {
-            const lowest = await fetchLowestActiveListing(rec.cardId).catch(() => null);
+            const activeStats = await fetchActiveListingStats(rec.cardId).catch(() => null);
+            const lowest = Number(activeStats?.lowest);
             if (Number.isFinite(lowest) && lowest > 1) {
                 const under = Math.max(1, Math.round(lowest - 1));
-                if (under >= floor && under < price) {
+                const clusterConfirmed = activeStats?.lowClusterConfirmed === true;
+                const minTargetRatio = clusterConfirmed
+                    ? FLIP_UNDERCUT_CLUSTER_MIN_TARGET_RATIO
+                    : FLIP_UNDERCUT_ISOLATED_MIN_TARGET_RATIO;
+                const undercutGuard = Math.max(floor, Math.floor(target * minTargetRatio));
+                if (under >= undercutGuard && under < price) {
                     const before = price;
                     price = under;
-                    undercut = { from: before, market: lowest };
+                    undercut = {
+                        from: before,
+                        market: lowest,
+                        listings: activeStats?.count ?? 0,
+                        clusterConfirmed,
+                        guard: undercutGuard
+                    };
                     basis =
                         `${basis} · undercut ${lowest} → ${under}` +
-                        ` (plancher ${floor})`;
+                        ` (${clusterConfirmed ? 'cluster actif confirmé' : 'annonce isolée'}, garde ${undercutGuard}, plancher ${floor})`;
+                } else if (under < price && under < undercutGuard) {
+                    basis += ` · undercut ${lowest} ignoré (garde ${undercutGuard})`;
                 }
             }
         }
@@ -4072,6 +4086,7 @@
 
         const robust = Number(recent?.robustAverage);
         const consensus = Number(recent?.hunterConsensusReference);
+        const marketRef = Number(recent?.hunterMarketReference);
         const fair = Number(recent?.marketReference);
         const buyRef = Number(recent?.hunterReference);
         const ageMs = Number(recent?.ageMs);
@@ -4089,6 +4104,13 @@
             consensusHunter: Number.isFinite(Number(recent?.hunterConsensusReference)) ? Math.round(Number(recent.hunterConsensusReference) * 10) / 10 : null,
             ecart5vs10Pct: Number.isFinite(Number(recent?.hunterShortAgreementPct)) ? Math.round(Number(recent.hunterShortAgreementPct) * 10) / 10 : null,
             dispersion10Pct: Number.isFinite(Number(recent?.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
+            spreadFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowSpreadPct)) ? Math.round(Number(recent.hunterWindowSpreadPct) * 10) / 10 : null,
+            coherenceFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowCoherenceScore)) ? Math.round(Number(recent.hunterWindowCoherenceScore) * 100) : null,
+            directionFenêtresH: recent?.hunterWindowOrderedDirection ?? 'none',
+            chaosFenêtresH: recent?.hunterWindowChaos === true,
+            ruptureOrdonnee: recent?.orderedRegimeBreak?.detected === true ? recent.orderedRegimeBreak.direction : null,
+            forceRupturePct: Number.isFinite(Number(recent?.orderedRegimeBreak?.strength)) ? Math.round(Number(recent.orderedRegimeBreak.strength) * 100) : null,
+            referenceRupture: Number.isFinite(Number(recent?.orderedRegimeBreak?.recentCenter)) ? Math.round(Number(recent.orderedRegimeBreak.recentCenter) * 10) / 10 : null,
             consensusCourtCoherent: recent?.hunterShortCoherent === true,
             hausseConsensusAcceptee: recent?.hunterUpwardConsensusConfirmed === true,
             referenceMarcheHunter: Number.isFinite(Number(recent?.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
@@ -4117,6 +4139,12 @@
                 : null,
             ventesParJour5Recentes: Number.isFinite(Number(recent?.recentSaleRatePerDay))
                 ? Math.round(Number(recent.recentSaleRatePerDay) * 100) / 100
+                : null,
+            ventesParJourEffectives: Number.isFinite(Number(recent?.effectiveSaleRatePerDay))
+                ? Math.round(Number(recent.effectiveSaleRatePerDay) * 100) / 100
+                : null,
+            ventesParJour5Effectives: Number.isFinite(Number(recent?.effectiveRecentSaleRatePerDay))
+                ? Math.round(Number(recent.effectiveRecentSaleRatePerDay) * 100) / 100
                 : null,
             referenceRegimeRecent: Number.isFinite(Number(recent?.recentRegimeReference))
                 ? Math.round(Number(recent.recentRegimeReference) * 10) / 10
@@ -4148,7 +4176,7 @@
             detailsControleMarche: recent?.marketIntegrity ?? null,
             liquiditeHunterOK: !!recent?.liquidityEligible,
             seuilVentesHunter: HUNTER_RECENT_MIN_SALES,
-            seuilStrictConsensusHunter: `> ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}`,
+            seuilStrictReferenceMarcheHunter: `> ${HUNTER_RECENT_MIN_MARKET_REFERENCE}`,
             ageCacheSec: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : null,
             cacheAssezFrais: Number.isFinite(ageMs)
                 ? ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
@@ -4157,7 +4185,7 @@
                 recent?.ok &&
                 recent?.hunterEligible &&
                 hunterRecentSalesAllowed(recent) &&
-                hunterRecentReferenceAllowed(consensus) &&
+                hunterRecentReferenceAllowed(marketRef) &&
                 Number.isFinite(buyRef) && buyRef > 0 &&
                 Number.isFinite(ageMs) &&
                 ageMs <= HUNTER_RECENT_REFERENCE_MAX_AGE_MS
@@ -4174,6 +4202,7 @@
         const ref = getHunterPricingReference(cardId, rr);
         const robust = Number(recent?.robustAverage);
         const consensus = Number(recent?.hunterConsensusReference);
+        const marketRef = Number(recent?.hunterMarketReference);
         const fair = Number(recent?.marketReference);
         const buyRef = Number(recent?.hunterReference);
 
@@ -4184,15 +4213,17 @@
             blocage = `seulement ${recent?.count ?? 0}/${HUNTER_RECENT_MIN_SALES} ventes Hunter`;
         } else if (!recentMarketIntegrityAllowed(recent)) {
             blocage = recentMarketIntegrityReason(recent);
-        } else if (!hunterRecentReferenceAllowed(consensus)) {
-            blocage = `consensus Hunter ${Number.isFinite(consensus) ? Math.round(consensus) : '—'} ≤ ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}`;
+        } else if (recent?.hunterWindowChaos === true) {
+            blocage = `structure Hunter incohérente · spread H ${Number.isFinite(Number(recent?.hunterWindowSpreadPct)) ? Number(recent.hunterWindowSpreadPct).toFixed(1) : '—'}%`;
+        } else if (!hunterRecentReferenceAllowed(marketRef)) {
+            blocage = `référence marché Hunter ${Number.isFinite(marketRef) ? Math.round(marketRef) : '—'} ≤ ${HUNTER_RECENT_MIN_MARKET_REFERENCE}`;
         } else if (!recent?.liquidityEligible) {
             const rate = Number(recent?.saleRatePerDay);
             const recentRate = Number(recent?.recentSaleRatePerDay);
             const ageH = Number(recent?.newestSaleAgeMs) / 3600000;
             blocage = `liquidité insuffisante · ${Number.isFinite(rate) ? rate.toFixed(2) : '—'} vente/j global · ${Number.isFinite(recentRate) ? recentRate.toFixed(2) : '—'} vente/j sur les 5 dernières · dernière ${Number.isFinite(ageH) ? ageH.toFixed(1) : '—'} h`;
         } else if (!Number.isFinite(buyRef) || buyRef <= 0) {
-            blocage = 'référence achat Trend-Aware v3 invalide';
+            blocage = 'référence achat Trend-Aware v4 invalide';
         }
 
         const ratio = ref ? hunterRatioForReferenceKind(ref.kind) : null;
@@ -4214,6 +4245,13 @@
             consensusHunter: Number.isFinite(Number(recent?.hunterConsensusReference)) ? Math.round(Number(recent.hunterConsensusReference) * 10) / 10 : null,
             ecart5vs10Pct: Number.isFinite(Number(recent?.hunterShortAgreementPct)) ? Math.round(Number(recent.hunterShortAgreementPct) * 10) / 10 : null,
             dispersion10Pct: Number.isFinite(Number(recent?.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
+            spreadFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowSpreadPct)) ? Math.round(Number(recent.hunterWindowSpreadPct) * 10) / 10 : null,
+            coherenceFenêtresHPct: Number.isFinite(Number(recent?.hunterWindowCoherenceScore)) ? Math.round(Number(recent.hunterWindowCoherenceScore) * 100) : null,
+            directionFenêtresH: recent?.hunterWindowOrderedDirection ?? 'none',
+            chaosFenêtresH: recent?.hunterWindowChaos === true,
+            ruptureOrdonnee: recent?.orderedRegimeBreak?.detected === true ? recent.orderedRegimeBreak.direction : null,
+            forceRupturePct: Number.isFinite(Number(recent?.orderedRegimeBreak?.strength)) ? Math.round(Number(recent.orderedRegimeBreak.strength) * 100) : null,
+            referenceRupture: Number.isFinite(Number(recent?.orderedRegimeBreak?.recentCenter)) ? Math.round(Number(recent.orderedRegimeBreak.recentCenter) * 10) / 10 : null,
             consensusCourtCoherent: recent?.hunterShortCoherent === true,
             hausseConsensusAcceptee: recent?.hunterUpwardConsensusConfirmed === true,
             referenceMarcheHunter: Number.isFinite(Number(recent?.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
@@ -4260,6 +4298,12 @@
                 : null,
             ventesParJour5Recentes: Number.isFinite(Number(recent?.recentSaleRatePerDay))
                 ? Math.round(Number(recent.recentSaleRatePerDay) * 100) / 100
+                : null,
+            ventesParJourEffectives: Number.isFinite(Number(recent?.effectiveSaleRatePerDay))
+                ? Math.round(Number(recent.effectiveSaleRatePerDay) * 100) / 100
+                : null,
+            ventesParJour5Effectives: Number.isFinite(Number(recent?.effectiveRecentSaleRatePerDay))
+                ? Math.round(Number(recent.effectiveRecentSaleRatePerDay) * 100) / 100
                 : null,
             referenceRegimeRecent: Number.isFinite(Number(recent?.recentRegimeReference))
                 ? Math.round(Number(recent.recentRegimeReference) * 10) / 10
@@ -4410,7 +4454,7 @@
     window.wmFlipPricingMode = function () {
         const result = {
             version: WM_VERSION,
-            sourceMiseEnVente: `Trend-Aware v3 uniquement · minimum strict ${RECENT_MARKET_MIN_SALES} ventes`,
+            sourceMiseEnVente: `Trend-Aware v4 · rupture temporelle ordonnée · minimum strict ${RECENT_MARKET_MIN_SALES} ventes`,
             recentMinVentesFlip: RECENT_MARKET_MIN_SALES,
             recentMinVentesHunter: HUNTER_RECENT_MIN_SALES,
             trendDetection: `${RECENT_TREND_BLOCK_SIZE} dernières plafonnées vs ${RECENT_TREND_BLOCK_SIZE} précédentes · ${RECENT_TREND_START_PCT}%→${RECENT_TREND_FULL_PCT}%`,
@@ -4419,9 +4463,9 @@
             recencyDecay: RECENT_RECENCY_DECAY,
             recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
             hunterPurchaseSafetyFloorPct: Math.round(HUNTER_PURCHASE_SAFETY_FLOOR * 100),
-            hunterPurchaseExitModel: `achat = (${getFlipInitialRecentPct()}% - urgence) de la Trend × sécurité achat-only × ratio Hunter`,
-            hunterLiquidity: `dernière vente <= 48h · rythme global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · rythme 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
-            recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET consensus H > ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} ET dernière vente <=48h ET rythme global >=${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/j ET rythme récent >=${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/j · achat lié à la sortie Flip`,
+            hunterPurchaseExitModel: `achat = réf H (Trend/consensus/rupture) × sortie prévue × sécurité structurelle adaptative × ratio Hunter`,
+            hunterLiquidity: `dernière vente <= 48h · rythme effectif (silence actuel inclus) global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
+            recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} ET structure H non chaotique ET liquidité effective · rupture baissière = garde H5`,
             hunterFallbackAchat: 'aucun',
             recentFlip: `${getFlipInitialRecentPct()}% → ${getFlipRelist1RecentPct()}% → ${getFlipRelist2RecentPct()}% · urgence liquidité/fraîcheur 0-${FLIP_MAX_URGENCY_DISCOUNT_PCT}pt`,
             flipMinimum: `${RECENT_MARKET_MIN_SALES} ventes strictes`,
@@ -4430,7 +4474,11 @@
             margeMiniPct: getFlipMarkupPct(),
             dureeMin: getFlipDurationMin(),
             sousMinimum: 'carte conservée/taguée vente, aucune mise en vente automatique',
-            undercut: getFlipUndercut()
+            undercut: getFlipUndercut(),
+            undercutGardeAnnonceIsoleePct: Math.round(FLIP_UNDERCUT_ISOLATED_MIN_TARGET_RATIO * 100),
+            undercutGardeClusterConfirmePct: Math.round(FLIP_UNDERCUT_CLUSTER_MIN_TARGET_RATIO * 100),
+            ruptureHunterMinForcePct: Math.round(ORDERED_BREAK_HUNTER_MIN_STRENGTH * 100),
+            chaosHunterSpreadPct: HUNTER_WINDOW_CHAOS_SPREAD_PCT
         };
         console.table(result);
         return result;
@@ -5389,12 +5437,36 @@
     const HUNTER_MULTIWINDOW_MAX_5_10_GAP_PCT = 10;
     const HUNTER_MULTIWINDOW_MAX_10_DISPERSION_PCT = 25;
 
+    // v3.6.0 — cohérence multi-fenêtres + rupture temporelle ordonnée.
+    // Une forte dispersion n'est plus assimilée automatiquement à du bruit :
+    // 500·500·500·2000·2000 est une rupture baissière ordonnée ;
+    // 500·2000·500·2000·500 est du chaos et doit bloquer l'achat.
+    const HUNTER_WINDOW_COHERENCE_FULL_PCT = 20;
+    const HUNTER_WINDOW_COHERENCE_ZERO_PCT = 80;
+    const HUNTER_WINDOW_CHAOS_SPREAD_PCT = 75;
+    const ORDERED_BREAK_RECENT_MAX = 6;
+    const ORDERED_BREAK_OLDER_MAX = 10;
+    const ORDERED_BREAK_DOWN_START_RATIO = 0.78; // -22 % : début de rupture baissière
+    const ORDERED_BREAK_DOWN_FULL_RATIO = 0.50;  // -50 % : séparation maximale
+    const ORDERED_BREAK_UP_START_RATIO = 1.40;   // +40 % : hausse volontairement plus exigeante
+    const ORDERED_BREAK_UP_FULL_RATIO = 1.80;    // +80 %
+    const ORDERED_BREAK_DOWN_MAX_DISP_PCT = 32;
+    const ORDERED_BREAK_UP_MAX_DISP_PCT = 24;
+    const ORDERED_BREAK_HUNTER_MIN_STRENGTH = 0.45;
+    const ORDERED_BREAK_UP_SELL_WEIGHT = 0.65;
+
+    // Undercut Flip : une seule annonce anormalement basse ne doit plus aspirer notre prix.
+    // Trois annonces basses proches peuvent confirmer un niveau de marché actif plus bas.
+    const FLIP_UNDERCUT_ISOLATED_MIN_TARGET_RATIO = 0.90;
+    const FLIP_UNDERCUT_CLUSTER_MIN_TARGET_RATIO = 0.80;
+    const FLIP_UNDERCUT_CLUSTER_MAX_SPREAD_RATIO = 1.20;
+
     // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
     // une carte déjà acquise dès lors que ses 15 ventes minimum existent, avec prix d’urgence.
     const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
     const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.75;
     const HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY = 0.75;
-    const HUNTER_PURCHASE_SAFETY_FLOOR = 0.90;
+    const HUNTER_PURCHASE_SAFETY_FLOOR = 0.82;
     const FLIP_MAX_URGENCY_DISCOUNT_PCT = 6;
 
     const recentMarketCache = new Map();
@@ -5487,6 +5559,22 @@
             Number.isFinite(window10DispersionPct) &&
             window10DispersionPct <= HUNTER_MULTIWINDOW_MAX_10_DISPERSION_PCT;
 
+        const windowSpreadPct =
+            refs.length === 3 && Number.isFinite(consensusReference) && consensusReference > 0
+                ? (Math.max(...refs) - Math.min(...refs)) / consensusReference * 100
+                : null;
+        let windowOrderedDirection = 'none';
+        if (refs.length === 3) {
+            if (ref5 >= ref10 && ref10 >= ref15) windowOrderedDirection = 'up';
+            else if (ref5 <= ref10 && ref10 <= ref15) windowOrderedDirection = 'down';
+        }
+        const baseWindowCoherence = Number.isFinite(windowSpreadPct)
+            ? 1 - clamp01(
+                (windowSpreadPct - HUNTER_WINDOW_COHERENCE_FULL_PCT) /
+                (HUNTER_WINDOW_COHERENCE_ZERO_PCT - HUNTER_WINDOW_COHERENCE_FULL_PCT)
+            )
+            : 0;
+
         return {
             ref5,
             ref10,
@@ -5494,8 +5582,123 @@
             consensusReference,
             shortAgreementPct,
             window10DispersionPct,
-            shortCoherent
+            shortCoherent,
+            windowSpreadPct,
+            windowOrderedDirection,
+            baseWindowCoherence
         };
+    }
+
+    function relativeMedianDispersionPct(values) {
+        const safe = (Array.isArray(values) ? values : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0);
+        const center = medianOf(safe);
+        return safe.length && Number.isFinite(center) && center > 0
+            ? meanOf(safe.map(v => Math.abs(v - center))) / center * 100
+            : null;
+    }
+
+    // Cherche une vraie rupture TEMPORELLE parmi les 3 à 6 dernières ventes.
+    // Le bloc récent doit être compact et situé d'un seul côté du régime précédent.
+    // La baisse est reconnue plus vite (3 ventes suffisent) ; une hausse exige >=4 ventes
+    // et une séparation plus forte, car courir après un pump coûte plus cher qu'attendre.
+    function detectOrderedRegimeBreak(prices) {
+        const raw = (Array.isArray(prices) ? prices : [])
+            .map(Number)
+            .filter(v => Number.isFinite(v) && v > 0)
+            .slice(0, RECENT_MARKET_LIMIT);
+        if (raw.length < 8) return null;
+
+        let best = null;
+        const maxK = Math.min(ORDERED_BREAK_RECENT_MAX, raw.length - 5);
+        for (let k = 3; k <= maxK; k++) {
+            const recent = raw.slice(0, k);
+            const older = raw.slice(k, Math.min(raw.length, k + ORDERED_BREAK_OLDER_MAX));
+            if (older.length < 5) continue;
+
+            const recentCenter = medianOf(recent);
+            const olderCenter = medianOf(older);
+            if (!(recentCenter > 0) || !(olderCenter > 0)) continue;
+
+            const ratio = recentCenter / olderCenter;
+            const direction = ratio < 1 ? 'down' : 'up';
+            if (direction === 'up' && k < 4) continue;
+
+            const recentDispersionPct = relativeMedianDispersionPct(recent);
+            const olderDispersionPct = relativeMedianDispersionPct(older);
+            if (!Number.isFinite(recentDispersionPct)) continue;
+
+            let separationStrength = 0;
+            let coherenceStrength = 0;
+            let sideShare = 0;
+            let countStrength = 0;
+            if (direction === 'down') {
+                if (ratio >= ORDERED_BREAK_DOWN_START_RATIO || recentDispersionPct > ORDERED_BREAK_DOWN_MAX_DISP_PCT) continue;
+                separationStrength = clamp01(
+                    (ORDERED_BREAK_DOWN_START_RATIO - ratio) /
+                    (ORDERED_BREAK_DOWN_START_RATIO - ORDERED_BREAK_DOWN_FULL_RATIO)
+                );
+                coherenceStrength = 1 - clamp01(
+                    (recentDispersionPct - 10) / (ORDERED_BREAK_DOWN_MAX_DISP_PCT - 10)
+                );
+                sideShare = recent.filter(v => v <= olderCenter * 0.90).length / recent.length;
+                const minSideShare = k <= 3 ? 1 : 0.75;
+                if (sideShare < minSideShare) continue;
+                countStrength = k === 3 ? 0.90 : k === 4 ? 0.97 : 1;
+            } else {
+                if (ratio <= ORDERED_BREAK_UP_START_RATIO || recentDispersionPct > ORDERED_BREAK_UP_MAX_DISP_PCT) continue;
+                separationStrength = clamp01(
+                    (ratio - ORDERED_BREAK_UP_START_RATIO) /
+                    (ORDERED_BREAK_UP_FULL_RATIO - ORDERED_BREAK_UP_START_RATIO)
+                );
+                coherenceStrength = 1 - clamp01(
+                    (recentDispersionPct - 8) / (ORDERED_BREAK_UP_MAX_DISP_PCT - 8)
+                );
+                sideShare = recent.filter(v => v >= olderCenter * 1.10).length / recent.length;
+                // Une hausse n'est jamais validée avec seulement 3 vraies ventes hautes + 1 ancienne.
+                if (sideShare < 1) continue;
+                countStrength = k === 4 ? 0.80 : k === 5 ? 0.95 : 1;
+            }
+
+            const olderCoherence = Number.isFinite(olderDispersionPct)
+                ? 1 - clamp01((olderDispersionPct - 25) / 75)
+                : 0;
+            const olderFactor = 0.85 + 0.15 * olderCoherence;
+            let strength = clamp01(
+                separationStrength *
+                (0.55 + 0.45 * coherenceStrength) *
+                countStrength * sideShare * olderFactor
+            );
+
+            // Une chute extrêmement nette de 3 ventes consécutives doit être vue immédiatement.
+            if (
+                direction === 'down' && ratio <= ORDERED_BREAK_DOWN_FULL_RATIO &&
+                recentDispersionPct <= 20 && sideShare === 1
+            ) strength = Math.max(strength, k === 3 ? 0.90 : 0.95);
+
+            // Une hausse extrême reste moins agressive : au minimum 4 ventes toutes au-dessus.
+            if (
+                direction === 'up' && ratio >= ORDERED_BREAK_UP_FULL_RATIO &&
+                recentDispersionPct <= 15 && sideShare === 1
+            ) strength = Math.max(strength, k === 4 ? 0.80 : 0.90);
+
+            const candidate = {
+                detected: true,
+                direction,
+                recentCount: k,
+                recentCenter,
+                olderCenter,
+                ratio,
+                movePct: (ratio - 1) * 100,
+                recentDispersionPct,
+                olderDispersionPct,
+                sideShare,
+                strength
+            };
+            if (!best || candidate.strength > best.strength) best = candidate;
+        }
+        return best;
     }
 
     // v3.4.8 — défense en profondeur contre un petit cluster de ventes artificiellement hautes.
@@ -5616,6 +5819,12 @@
                 hunterShortAgreementPct: null,
                 hunterWindow10DispersionPct: null,
                 hunterShortCoherent: false,
+                hunterWindowSpreadPct: null,
+                hunterWindowOrderedDirection: 'none',
+                hunterWindowCoherenceScore: 0,
+                hunterWindowChaos: false,
+                orderedRegimeBreak: null,
+                marketReferenceBeforeBreak: null,
                 marketReference: null
             };
         }
@@ -5628,6 +5837,9 @@
         const hunterShortAgreementPct = hunterMultiWindow.shortAgreementPct;
         const hunterWindow10DispersionPct = hunterMultiWindow.window10DispersionPct;
         const hunterShortCoherent = hunterMultiWindow.shortCoherent;
+        const hunterWindowSpreadPct = hunterMultiWindow.windowSpreadPct;
+        const hunterWindowOrderedDirection = hunterMultiWindow.windowOrderedDirection;
+        let hunterWindowCoherenceScore = hunterMultiWindow.baseWindowCoherence;
 
         const trimEachSide = recentMarketTrimEachSide(clean.length);
 
@@ -5643,6 +5855,23 @@
         const safetyCappedHighCount = extremeHighCluster
             ? clean.filter(price => price > safetyCap).length
             : 0;
+
+        const orderedRegimeBreak = detectOrderedRegimeBreak(safetyClean);
+        const orderedBreakMatchesWindows = !!(
+            orderedRegimeBreak?.detected &&
+            Number(orderedRegimeBreak.strength) >= ORDERED_BREAK_HUNTER_MIN_STRENGTH &&
+            hunterWindowOrderedDirection !== 'none' &&
+            hunterWindowOrderedDirection === orderedRegimeBreak.direction
+        );
+        if (orderedBreakMatchesWindows) {
+            // Une dispersion élevée mais parfaitement ordonnée dans le temps n'est pas du chaos.
+            hunterWindowCoherenceScore = Math.max(hunterWindowCoherenceScore, 0.75);
+        }
+        const hunterWindowChaos = !!(
+            Number.isFinite(hunterWindowSpreadPct) &&
+            hunterWindowSpreadPct >= HUNTER_WINDOW_CHAOS_SPREAD_PCT &&
+            !orderedBreakMatchesWindows
+        );
 
         const sorted = safetyClean.slice().sort((a, b) => a - b);
         const removedLows = sorted.slice(0, trimEachSide);
@@ -5896,13 +6125,35 @@
 
         const regimeShiftStrength = regimeMagnitudeStrength * regimeConfidence;
 
-        const marketReference =
+        const marketReferenceBeforeBreak =
             Number.isFinite(baseTrendReference) && baseTrendReference > 0 &&
             Number.isFinite(recentRegimeReference) && recentRegimeReference > 0 &&
             regimeShiftStrength > 0
                 ? baseTrendReference * (1 - regimeShiftStrength) +
                   recentRegimeReference * regimeShiftStrength
                 : baseTrendReference;
+
+        // v3.6.0 — correctif de rupture ordonnée. La dispersion des 5 dernières ne doit plus
+        // annuler un crash propre simplement parce que l'ancien et le nouveau régime cohabitent.
+        let marketReference = marketReferenceBeforeBreak;
+        if (
+            orderedRegimeBreak?.detected &&
+            Number.isFinite(Number(orderedRegimeBreak.recentCenter)) &&
+            Number.isFinite(Number(orderedRegimeBreak.strength)) &&
+            Number.isFinite(marketReferenceBeforeBreak) && marketReferenceBeforeBreak > 0
+        ) {
+            const center = Number(orderedRegimeBreak.recentCenter);
+            const strength = clamp01(Number(orderedRegimeBreak.strength));
+            if (orderedRegimeBreak.direction === 'down') {
+                const adjusted = marketReferenceBeforeBreak * (1 - strength) + center * strength;
+                marketReference = Math.min(marketReferenceBeforeBreak, adjusted);
+            } else if (orderedRegimeBreak.direction === 'up') {
+                // La vente suit une vraie hausse, mais plus lentement qu'une baisse.
+                const upWeight = strength * ORDERED_BREAK_UP_SELL_WEIGHT;
+                const adjusted = marketReferenceBeforeBreak * (1 - upWeight) + center * upWeight;
+                marketReference = Math.max(marketReferenceBeforeBreak, adjusted);
+            }
+        }
 
         // Dispersion moyenne autour de la robuste, après plafonnement des extrêmes.
         const dispersionPct =
@@ -5965,6 +6216,12 @@
             hunterShortAgreementPct,
             hunterWindow10DispersionPct,
             hunterShortCoherent,
+            hunterWindowSpreadPct,
+            hunterWindowOrderedDirection,
+            hunterWindowCoherenceScore,
+            hunterWindowChaos,
+            orderedRegimeBreak,
+            marketReferenceBeforeBreak,
             marketReference
         };
     }
@@ -6376,6 +6633,26 @@
                     : 99
                 : 0;
 
+        // v3.6.0 — rythme EFFECTIF : inclut le silence depuis la dernière vente.
+        // Un burst de 5 ventes en 10 min datant de 40 h ne doit pas être lu comme 576 ventes/j.
+        const effectiveSaleSpanMs = Number.isFinite(oldestTs)
+            ? Math.max(1, nowTs - oldestTs)
+            : null;
+        const effectiveSaleRatePerDay =
+            decisionRows.length >= 2 && Number.isFinite(effectiveSaleSpanMs)
+                ? decisionRows.length / (effectiveSaleSpanMs / 86400000)
+                : 0;
+        const recentOldestTs = recentSaleTimes.length ? recentSaleTimes[recentSaleTimes.length - 1] : null;
+        const effectiveRecentSpanMs = Number.isFinite(recentOldestTs)
+            ? Math.max(1, nowTs - recentOldestTs)
+            : null;
+        const effectiveRecentSaleRatePerDay =
+            recentSaleTimes.length >= RECENT_TREND_BLOCK_SIZE && Number.isFinite(effectiveRecentSpanMs)
+                ? recentSaleTimes.length / (effectiveRecentSpanMs / 86400000)
+                : 0;
+        const hunterSaleRatePerDay = Math.min(saleRatePerDay, effectiveSaleRatePerDay);
+        const hunterRecentSaleRatePerDay = Math.min(recentSaleRatePerDay, effectiveRecentSaleRatePerDay);
+
         const participants = computeParticipantSummary(decisionRows);
 
         // Score liquidité : une vente très récente et un rythme élevé donnent 100.
@@ -6385,9 +6662,18 @@
         const freshnessScore = Number.isFinite(newestAgeHours)
             ? 100 - scoreLinear(newestAgeHours, 6, 48)
             : 0;
-        const paceScore = scoreLinear(saleRatePerDay, 0.75, 3);
+        const silenceVsAverageGap =
+            Number.isFinite(averageGapHours) && averageGapHours > 0 && Number.isFinite(newestAgeHours)
+                ? newestAgeHours / averageGapHours
+                : null;
+        const liquiditySilenceShock = !!(
+            newestAgeHours > 12 &&
+            Number.isFinite(silenceVsAverageGap) &&
+            silenceVsAverageGap >= 4
+        );
+        const paceScore = scoreLinear(hunterSaleRatePerDay, 0.75, 3);
         const recentPaceScore = scoreLinear(
-            recentSaleRatePerDay,
+            hunterRecentSaleRatePerDay,
             HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY,
             3
         );
@@ -6430,10 +6716,11 @@
             decisionRows.length >= HUNTER_RECENT_MIN_SALES &&
             Number.isFinite(newestSaleAgeMs) &&
             newestSaleAgeMs <= HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS &&
-            Number.isFinite(saleRatePerDay) &&
-            saleRatePerDay >= HUNTER_LIQUIDITY_MIN_SALES_PER_DAY &&
-            Number.isFinite(recentSaleRatePerDay) &&
-            recentSaleRatePerDay >= HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY;
+            Number.isFinite(hunterSaleRatePerDay) &&
+            hunterSaleRatePerDay >= HUNTER_LIQUIDITY_MIN_SALES_PER_DAY &&
+            Number.isFinite(hunterRecentSaleRatePerDay) &&
+            hunterRecentSaleRatePerDay >= HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY &&
+            !liquiditySilenceShock;
 
         // v3.4.18 — l'« urgence » mesure uniquement la DIFFICULTÉ À VENDRE.
         // La valeur de marché (hausse/baisse/dispersion/régime) est déjà absorbée par Trend v3.4.17 :
@@ -6448,20 +6735,21 @@
 
         // Rythme de fond : aucune décote à partir de 0,75 vente/j.
         // Seuls les marchés réellement lents déclenchent une remise.
-        if (saleRatePerDay < 0.25) sellUrgencyDiscountPct += 3;
-        else if (saleRatePerDay < 0.50) sellUrgencyDiscountPct += 2;
-        else if (saleRatePerDay < 0.75) sellUrgencyDiscountPct += 1;
+        if (hunterSaleRatePerDay < 0.25) sellUrgencyDiscountPct += 3;
+        else if (hunterSaleRatePerDay < 0.50) sellUrgencyDiscountPct += 2;
+        else if (hunterSaleRatePerDay < 0.75) sellUrgencyDiscountPct += 1;
 
         // Décélération récente : on pénalise seulement un vrai gel des 5 dernières ventes,
         // ou un effondrement du rythme récent par rapport au rythme de fond.
-        if (recentSaleRatePerDay < 0.25) sellUrgencyDiscountPct += 2;
-        else if (recentSaleRatePerDay < 0.50) sellUrgencyDiscountPct += 1;
+        if (hunterRecentSaleRatePerDay < 0.25) sellUrgencyDiscountPct += 2;
+        else if (hunterRecentSaleRatePerDay < 0.50) sellUrgencyDiscountPct += 1;
 
         if (
-            Number.isFinite(saleRatePerDay) && saleRatePerDay >= 1 &&
-            Number.isFinite(recentSaleRatePerDay) &&
-            recentSaleRatePerDay < saleRatePerDay * 0.35
+            Number.isFinite(hunterSaleRatePerDay) && hunterSaleRatePerDay >= 1 &&
+            Number.isFinite(hunterRecentSaleRatePerDay) &&
+            hunterRecentSaleRatePerDay < hunterSaleRatePerDay * 0.35
         ) sellUrgencyDiscountPct += 1;
+        if (liquiditySilenceShock) sellUrgencyDiscountPct += 2;
 
         sellUrgencyDiscountPct = Math.max(
             0,
@@ -6491,15 +6779,28 @@
                 ? calc.marketReference * (relist2ExitPct / 100)
                 : null;
 
-        // Risques achat-only : ils ne sont PAS déjà présents dans la remise de sortie.
-        // 1) ne pas courir après un pump ; 2) prudence si quelques comptes dominent le marché.
+        // Risques achat-only : le prix d'achat devient adaptatif à la QUALITÉ du marché.
+        // Les pénalités ne changent jamais la valeur de vente ; elles exigent seulement
+        // une meilleure décote à l'achat quand structure, comptes ou rythme inspirent moins confiance.
+        const hunterIntegrityWarnings = Array.isArray(marketIntegrity?.warnings)
+            ? marketIntegrity.warnings.length
+            : 0;
         const uptrendChasePenalty = Number.isFinite(trendPct) && trendPct > 30
             ? 0.05 * clamp01((trendPct - 30) / 50)
             : 0;
         const participantsPenalty = 0.04 * concentrationPenalty;
+        const windowStructurePenalty = 0.08 * (1 - clamp01(Number(calc?.hunterWindowCoherenceScore)));
+        const warningPenalty = Math.min(0.06, hunterIntegrityWarnings * 0.03);
+        const silencePenalty = Number.isFinite(silenceVsAverageGap)
+            ? 0.04 * clamp01((silenceVsAverageGap - 2) / 6)
+            : 0;
         const hunterPurchaseSafetyFactor = Math.max(
             HUNTER_PURCHASE_SAFETY_FLOOR,
-            Math.min(1, 1 - uptrendChasePenalty - participantsPenalty)
+            Math.min(
+                1,
+                1 - uptrendChasePenalty - participantsPenalty -
+                    windowStructurePenalty - warningPenalty - silencePenalty
+            )
         );
 
         // v3.5.1 — le Flip conserve la Trend complète. Le Hunter applique en plus
@@ -6513,14 +6814,28 @@
                     : Number(calc.marketReference)
                 : null;
 
-        // Exception contrôlée : si 5 ET 10 ventes convergent (écart <=10 %, dispersion10 <=25 %)
-        // et que le contrôle marché n'émet aucun avertissement, un vrai nouveau régime haussier
-        // peut être accepté même si l'ancre 25 ventes est encore en retard.
+        // Rupture baissière : pour ACHETER, on est encore plus rapide que le Flip.
+        // Dès qu'au moins 3 ventes récentes forment un vrai nouveau régime bas, H5 devient
+        // un plafond supplémentaire. Ainsi 500·500·500·2000·2000 ne peut plus produire un cap >1000.
+        const orderedBreak = calc?.orderedRegimeBreak;
+        const hunterDownBreakConfirmed = !!(
+            orderedBreak?.detected && orderedBreak.direction === 'down' &&
+            Number(orderedBreak.strength) >= ORDERED_BREAK_HUNTER_MIN_STRENGTH
+        );
+        const hunterWindow5Reference = Number(calc?.hunterWindow5Reference);
+        const hunterDownBreakGuardReference =
+            hunterDownBreakConfirmed && Number.isFinite(hunterWindow5Reference) && hunterWindow5Reference > 0 &&
+            Number.isFinite(hunterBaseMarketReference) && hunterBaseMarketReference > 0
+                ? Math.min(hunterBaseMarketReference, hunterWindow5Reference)
+                : hunterBaseMarketReference;
+
+        // Exception contrôlée : si 5 ET 10 ventes convergent (écart <=10 %, dispersion10 <=25 %),
+        // aucun warning n'existe et la structure n'est pas chaotique, un vrai régime haussier
+        // peut dépasser l'ancre 25 ventes. On reste volontairement plus lent à la hausse qu'à la baisse.
         const hunterShortCoherent = calc?.hunterShortCoherent === true;
-        const hunterIntegrityWarnings = Array.isArray(marketIntegrity?.warnings)
-            ? marketIntegrity.warnings.length
-            : 0;
         const hunterUpwardConsensusConfirmed =
+            !hunterDownBreakConfirmed &&
+            calc?.hunterWindowChaos !== true &&
             hunterShortCoherent &&
             hunterIntegrityWarnings === 0 &&
             Number.isFinite(hunterConsensusReference) && hunterConsensusReference > 0 &&
@@ -6529,7 +6844,7 @@
 
         const hunterMarketReference = hunterUpwardConsensusConfirmed
             ? hunterConsensusReference
-            : hunterBaseMarketReference;
+            : hunterDownBreakGuardReference;
         const hunterExpectedExitReference =
             Number.isFinite(hunterMarketReference) && hunterMarketReference > 0
                 ? hunterMarketReference * (expectedExitPct / 100)
@@ -6556,7 +6871,13 @@
             saleRatePerDay,
             recentSalesSpanMs,
             recentSaleRatePerDay,
+            effectiveSaleRatePerDay,
+            effectiveRecentSaleRatePerDay,
+            hunterSaleRatePerDay,
+            hunterRecentSaleRatePerDay,
             averageGapHours,
+            silenceVsAverageGap,
+            liquiditySilenceShock,
             liquidityScore,
             volatilityScore,
             diversityScore,
@@ -6564,6 +6885,8 @@
             liquidityEligible,
             hunterRiskFactor,
             hunterPurchaseSafetyFactor,
+            hunterDownBreakConfirmed,
+            hunterDownBreakGuardReference,
             hunterUpwardConsensusConfirmed,
             hunterMarketReference,
             hunterExpectedExitReference,
@@ -6583,7 +6906,8 @@
                 calc.eligible &&
                 marketIntegrity.allowed &&
                 liquidityEligible &&
-                hunterRecentReferenceAllowed(calc.hunterConsensusReference) &&
+                calc.hunterWindowChaos !== true &&
+                hunterRecentReferenceAllowed(hunterMarketReference) &&
                 Number.isFinite(hunterReference) && hunterReference > 0
         };
     }
@@ -6679,14 +7003,14 @@
     // v3.4.2 — Hunter RECENT MARKET + TREND-AWARE v3 · Purchase ↔ Exit.
     // Conditions obligatoires :
     // - 15 ventes valides minimum ; jusqu'à 25 exploitées
-    // - consensus Hunter 5/10/15 STRICTEMENT supérieur à 790
+    // - référence marché Hunter réellement utilisée STRICTEMENT supérieure à 790
     // - liquidité minimale obligatoire (vente récente + rythme suffisant)
     // - la valeur d'achat part de la sortie Flip réelle (1er listing - urgence), puis sécurité achat-only
     // - référence récente <= 60 s pour décider
     // - référence récente <= 5 s juste avant une mise
     //
     // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
-    const HUNTER_RECENT_MIN_CONSENSUS_REFERENCE = 790;
+    const HUNTER_RECENT_MIN_MARKET_REFERENCE = 790;
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
@@ -6699,7 +7023,7 @@
 
     function hunterRecentReferenceAllowed(value) {
         const v = Number(value);
-        return Number.isFinite(v) && v > HUNTER_RECENT_MIN_CONSENSUS_REFERENCE;
+        return Number.isFinite(v) && v > HUNTER_RECENT_MIN_MARKET_REFERENCE;
     }
 
     function hunterRatioForReferenceKind(kind) {
@@ -6711,9 +7035,9 @@
     function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
         const ref = Number(reference);
 
-        // v3.5.2 — le seuil >790 porte sur le CONSENSUS H 5/10/15, pas sur
-        // la robuste longue 25 ventes. La référence d'achat peut ensuite tomber sous 790
-        // après sortie/risque ; le seuil sert à valider la valeur récente avant achat.
+        // v3.5.3 — le seuil >790 porte sur la RÉFÉRENCE MARCHÉ HUNTER réellement utilisée
+        // (min(Trend, consensus H), sauf hausse récente confirmée). La référence d'achat
+        // peut ensuite tomber sous 790 après sortie/risque ; le seuil valide d'abord le marché.
         if (
             kind !== 'recent_market' ||
             !Number.isFinite(ref) ||
@@ -6739,7 +7063,8 @@
             !recent?.ok ||
             !recent.eligible ||
             !hunterRecentSalesAllowed(recent) ||
-            !hunterRecentReferenceAllowed(recent.hunterConsensusReference) ||
+            recent.hunterWindowChaos === true ||
+            !hunterRecentReferenceAllowed(recent.hunterMarketReference) ||
             !hunterRecentLiquidityAllowed(recent) ||
             !Number.isFinite(Number(recent.hunterReference)) ||
             Number(recent.hunterReference) <= 0
@@ -6749,7 +7074,7 @@
             value: Number(recent.hunterReference),
             fairValue: Number(recent.marketReference),
             kind: 'recent_market',
-            label: 'Trend-Aware v3',
+            label: 'Trend-Aware v4',
             reasonLabel: 'référence achat basée sur la sortie Flip prévue',
             cardId,
             rarity,
@@ -6795,6 +7120,12 @@
             uniqueWinners: Number(recent.uniqueWinners || 0),
             uniqueSellers: Number(recent.uniqueSellers || 0),
             participantConcentration: Number(recent.participantConcentration || 0),
+            hunterWindowSpreadPct: Number.isFinite(Number(recent.hunterWindowSpreadPct)) ? Number(recent.hunterWindowSpreadPct) : null,
+            hunterWindowCoherenceScore: Number(recent.hunterWindowCoherenceScore || 0),
+            hunterWindowChaos: recent.hunterWindowChaos === true,
+            orderedRegimeBreak: recent.orderedRegimeBreak || null,
+            effectiveSaleRatePerDay: Number.isFinite(Number(recent.effectiveSaleRatePerDay)) ? Number(recent.effectiveSaleRatePerDay) : null,
+            effectiveRecentSaleRatePerDay: Number.isFinite(Number(recent.effectiveRecentSaleRatePerDay)) ? Number(recent.effectiveRecentSaleRatePerDay) : null,
             marketIntegrity: recent.marketIntegrity
         };
     }
@@ -6966,7 +7297,7 @@
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.4.2 :
     //   prix actuel <= ratio × valeur Trend-Aware,
-    //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et consensus H STRICTEMENT > 790.
+    //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et référence marché Hunter STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
         const currentBid = auction.current_bid ?? auction.base_amount ?? 0;
@@ -6992,10 +7323,10 @@
                     } else if (!recentMarketIntegrityAllowed(recent)) {
                         stopHunterForMarketIntegrity(auction, recent);
                         reason = `historique en attente · ${recentMarketIntegrityReason(recent)}`;
-                    } else if (!hunterRecentReferenceAllowed(recent.hunterConsensusReference)) {
-                        const consensus = Number(recent.hunterConsensusReference);
+                    } else if (!hunterRecentReferenceAllowed(recent.hunterMarketReference)) {
+                        const marketRef = Number(recent.hunterMarketReference);
                         reason =
-                            `consensus Hunter ${Number.isFinite(consensus) ? Math.round(consensus) : '—'} ≤ ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}`;
+                            `référence marché Hunter ${Number.isFinite(marketRef) ? Math.round(marketRef) : '—'} ≤ ${HUNTER_RECENT_MIN_MARKET_REFERENCE}`;
                     } else if (!recent.liquidityEligible) {
                         const rate = Number(recent.saleRatePerDay);
                         const ageH = Number(recent.newestSaleAgeMs) / 3600000;
@@ -9651,7 +9982,7 @@
                 (!marketWatcherActive && enabled)
                     ? ' · autonome'
                     : '';
-            return `⚡ Hunter Trend ${recentPct}% · consensus H >${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
+            return `⚡ Hunter Trend ${recentPct}% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -13637,29 +13968,49 @@
         return result;
     }
 
-    // Cherche la plus basse annonce ACTIVE (non terminée) d'une carte sur le marché.
-    // Sert à l'undercut : se placer juste en dessous pour vendre plus vite. null si aucune.
-    async function fetchLowestActiveListing(cardId) {
+    // Statistiques des annonces ACTIVES de la carte. On garde plusieurs prix afin qu'une
+    // annonce isolée anormalement basse ne puisse plus, seule, aspirer le prix du Flip.
+    async function fetchActiveListingStats(cardId) {
         if (!cardId) return null;
         try {
             const res = await fetch(`${MARKET_API_BASE}?card_id=${encodeURIComponent(cardId)}&limit=50`, { credentials: 'include' });
             if (!res.ok) return null;
             const data = await res.json();
             const now = Date.now();
-            let min = Infinity, matched = 0;
+            const prices = [];
             for (const a of (data.auctions || [])) {
-                // ⚠️ NE PAS faire confiance au filtre ?card_id de l'API : elle peut renvoyer des
-                // annonces d'AUTRES cartes → sinon on undercutait le minimum de tout le marché
-                // (souvent 1 wkb) alors qu'aucune annonce de CETTE carte n'existe. On re-filtre ici.
+                // ⚠️ le filtre API card_id peut contenir d'autres cartes : re-filtrage obligatoire.
                 const aCardId = a.card?.id ?? a.card_id;
                 if (aCardId !== cardId) continue;
                 const end = new Date(a.end_at).getTime();
-                if (Number.isFinite(end) && end <= now) continue; // terminée → ignorée
-                const p = a.current_bid ?? a.base_amount;
-                if (Number.isFinite(p)) { matched++; if (p < min) min = p; }
+                if (Number.isFinite(end) && end <= now) continue;
+                const price = Number(a.current_bid ?? a.base_amount);
+                if (Number.isFinite(price) && price > 0) prices.push(price);
             }
-            return (matched > 0 && Number.isFinite(min)) ? min : null;
+            prices.sort((a, b) => a - b);
+            if (!prices.length) return null;
+            const low3 = prices.slice(0, 3);
+            const lowClusterSpreadRatio = low3.length >= 3 && low3[0] > 0
+                ? low3[2] / low3[0]
+                : null;
+            return {
+                count: prices.length,
+                prices,
+                lowest: prices[0],
+                second: prices[1] ?? null,
+                third: prices[2] ?? null,
+                lowClusterMedian: low3.length ? medianOf(low3) : null,
+                lowClusterSpreadRatio,
+                lowClusterConfirmed: low3.length >= 3 &&
+                    Number.isFinite(lowClusterSpreadRatio) &&
+                    lowClusterSpreadRatio <= FLIP_UNDERCUT_CLUSTER_MAX_SPREAD_RATIO
+            };
         } catch (e) { return null; }
+    }
+
+    async function fetchLowestActiveListing(cardId) {
+        const stats = await fetchActiveListingStats(cardId);
+        return Number.isFinite(Number(stats?.lowest)) ? Number(stats.lowest) : null;
     }
 
     /* ══════════ MISE EN VENTE VIA L'INTERFACE (clic simulé) ══════════
@@ -16161,7 +16512,7 @@
 
         const hunterRecentCap =
             recent.hunterEligible &&
-            hunterRecentReferenceAllowed(recent.hunterConsensusReference) &&
+            hunterRecentReferenceAllowed(recent.hunterMarketReference) &&
             Number.isFinite(Number(recent.hunterReference)) &&
             Number(recent.hunterReference) > 0
                 ? dynamicHunterCapFromReference(recent.hunterReference, 'recent_market')
@@ -16184,8 +16535,15 @@
             consensusHunter: Number.isFinite(Number(recent.hunterConsensusReference)) ? Math.round(Number(recent.hunterConsensusReference) * 10) / 10 : null,
             ecart5vs10Pct: Number.isFinite(Number(recent.hunterShortAgreementPct)) ? Math.round(Number(recent.hunterShortAgreementPct) * 10) / 10 : null,
             dispersion10Pct: Number.isFinite(Number(recent.hunterWindow10DispersionPct)) ? Math.round(Number(recent.hunterWindow10DispersionPct) * 10) / 10 : null,
+            spreadFenêtresHPct: Number.isFinite(Number(recent.hunterWindowSpreadPct)) ? Math.round(Number(recent.hunterWindowSpreadPct) * 10) / 10 : null,
+            coherenceFenêtresHPct: Number.isFinite(Number(recent.hunterWindowCoherenceScore)) ? Math.round(Number(recent.hunterWindowCoherenceScore) * 100) : null,
+            chaosFenêtresH: recent.hunterWindowChaos === true,
+            ruptureOrdonnee: recent.orderedRegimeBreak?.detected === true ? recent.orderedRegimeBreak.direction : null,
+            forceRupturePct: Number.isFinite(Number(recent.orderedRegimeBreak?.strength)) ? Math.round(Number(recent.orderedRegimeBreak.strength) * 100) : null,
+            referenceRupture: Number.isFinite(Number(recent.orderedRegimeBreak?.recentCenter)) ? Math.round(Number(recent.orderedRegimeBreak.recentCenter) * 10) / 10 : null,
             consensusCourtCoherent: recent.hunterShortCoherent === true,
             hausseConsensusAcceptee: recent.hunterUpwardConsensusConfirmed === true,
+            referenceMarcheHunter: Number.isFinite(Number(recent.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
             moyennePondereeRecence: weightedRounded,
             borneBassePlafonnement: recent.lowerBound ?? null,
             borneHautePlafonnement: recent.upperBound ?? null,
@@ -16237,6 +16595,12 @@
             ventesParJour: Number.isFinite(Number(recent.saleRatePerDay))
                 ? Math.round(Number(recent.saleRatePerDay) * 100) / 100
                 : null,
+            ventesParJourEffectives: Number.isFinite(Number(recent.effectiveSaleRatePerDay))
+                ? Math.round(Number(recent.effectiveSaleRatePerDay) * 100) / 100
+                : null,
+            ventesParJour5Effectives: Number.isFinite(Number(recent.effectiveRecentSaleRatePerDay))
+                ? Math.round(Number(recent.effectiveRecentSaleRatePerDay) * 100) / 100
+                : null,
             ageDerniereVenteHeures: Number.isFinite(Number(recent.newestSaleAgeMs))
                 ? Math.round(Number(recent.newestSaleAgeMs) / 360000) / 10
                 : null,
@@ -16266,7 +16630,8 @@
             hunterLiquiditeOK: !!recent.liquidityEligible,
             hunterAchatAutorise: !!(
                 recent.hunterEligible &&
-                hunterRecentReferenceAllowed(recent.hunterConsensusReference)
+                recent.hunterWindowChaos !== true &&
+                hunterRecentReferenceAllowed(recent.hunterMarketReference)
             ),
             hunterRecentCap,
             remiseUrgenceFlipPct: recent.sellUrgencyDiscountPct ?? null,
@@ -16275,7 +16640,7 @@
             concentrationMaxPct: Number.isFinite(Number(recent.participantConcentration))
                 ? Math.round(Number(recent.participantConcentration) * 100)
                 : null,
-            seuilHunterRecent: `15 ventes vérifiables minimum (jusqu’à ${RECENT_MARKET_LIMIT}) + consensus H > ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} + liquidité + contrôle manipulation`,
+            seuilHunterRecent: `15 ventes vérifiables minimum (jusqu’à ${RECENT_MARKET_LIMIT}) + réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} + liquidité + contrôle manipulation`,
             moyenneWM: Number.isFinite(wm) && wm > 0 ? wm : null,
             marcheRecentSurWM_Pct: ratioToWm,
             erreur: probe?.ok ? null : (probe?.error || 'échec inconnu'),
@@ -18904,7 +19269,7 @@
                         <input id="wm-flip-undercut" type="checkbox" style="width:12px;height:12px;accent-color:#4ade80;margin:0;">
                         <span>Undercut la plus basse annonce (-1), sans descendre sous la marge mini</span>
                     </label>
-                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.4.18 Trend-Aware v3 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. Le prix juste détecte les <b>changements de régime</b>. Hunter et Flip restent liés : le Hunter part du <b>prix de sortie réel du 1er listing</b>, ajoute seulement une sécurité achat-only, puis applique le ratio Hunter. L’urgence ne mesure plus la baisse de prix : elle reflète uniquement <b>fraîcheur + difficulté réelle à vendre</b>, plafonnée à -6pt. Flip : base <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Marge mini toujours protégée. <b>Flip en roulement FIFO</b> : tout invendu repart au fond de la file au lieu de reprendre immédiatement un slot.</div>
+                    <div style="font-size:8px;color:#555;line-height:1.35;margin-bottom:5px;">v3.6.0 Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. Le prix juste détecte aussi les <b>ruptures temporelles ordonnées</b>. Hunter et Flip restent liés : le Hunter part du <b>prix de sortie réel du 1er listing</b>, ajoute seulement une sécurité achat-only, puis applique le ratio Hunter. L’urgence ne mesure plus la baisse de prix : elle reflète uniquement <b>fraîcheur + difficulté réelle à vendre</b>, plafonnée à -6pt. Flip : base <b>100% → 95% → 90%</b>. <b>Aucun fallback WM</b>. Marge mini toujours protégée. <b>Flip en roulement FIFO</b> : tout invendu repart au fond de la file au lieu de reprendre immédiatement un slot.</div>
                     <div id="wm-flip-history" style="margin-bottom:7px;"></div>
                     <div class="wm-sep"></div>
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
@@ -19055,10 +19420,10 @@
                     <div class="wm-set-title">Comportement</div>
                     <div class="wm-set-sub">Hunter : mode de décision</div>
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="fixed"><span>Seuil fixe (mise si prix ≤ valeur définie)</span></label>
-                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v3 (15 min · jusqu’à 25 ventes)</span></label>
+                    <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v4 (15 min · jusqu’à 25 ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v3 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
@@ -19847,7 +20212,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? `🎯 Hunter en mode <b>Trend-Aware v3</b> (consensus H > ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
+                        ? `🎯 Hunter en mode <b>Trend-Aware v4</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
 
                     if (autoSnipeEnabled) {
@@ -19874,7 +20239,7 @@
                 setSetting('autoSnipeRecentRatio', pct / 100);
                 wmLog(
                     `🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la référence achat ` +
-                    `si le consensus H est <b>&gt; ${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}</b>`
+                    `si la référence marché Hunter est <b>&gt; ${HUNTER_RECENT_MIN_MARKET_REFERENCE}</b>`
                 );
             };
         }
@@ -23223,8 +23588,11 @@
                         : `confiance bascule <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b>`
                     } ·
                     consensus H <b style="color:#67e8f9;">${r.consensusHunter ?? '—'}</b> ·
+                    réf H <b style="color:#a7f3d0;">${r.referenceMarcheHunter ?? '—'}</b> ·
+                    coh H <b style="color:${r.chaosFenêtresH ? '#ef4444' : Number(r.coherenceFenêtresHPct) >= 70 ? '#4ade80' : '#fbbf24'};">${r.coherenceFenêtresHPct ?? '—'}%</b> ·
+                    ${r.ruptureOrdonnee ? `rupture <b style="color:${r.ruptureOrdonnee === 'down' ? '#f59e0b' : '#67e8f9'};">${r.ruptureOrdonnee === 'down' ? '↓' : '↑'} ${r.referenceRupture ?? '—'} (${r.forceRupturePct ?? '—'}%)</b> ·` : ''}
                     cap Hunter <b style="color:#fbbf24;">${r.hunterRecentCap ?? 'BLOQUÉ'}</b> ·
-                    seuil consensus H <b>&gt;${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE}</b> ·
+                    seuil réf H <b>&gt;${HUNTER_RECENT_MIN_MARKET_REFERENCE}</b> ·
                     moy. WM <b>${r.moyenneWM ?? '—'}</b>${comparison}
                 </div>
             </div>`;
@@ -23263,7 +23631,7 @@
 
     wmLog(
         `⚡ v${WM_VERSION} · protection anti-manipulation renforcée : comptes liés + clusters de prix extrêmes dès 3 ventes · ` +
-        `Hunter et prix Flip automatiques en attente si le contrôle échoue · 15 ventes min / ${RECENT_MARKET_LIMIT} max · consensus H >${HUNTER_RECENT_MIN_CONSENSUS_REFERENCE} · ` +
+        `Hunter v4 : rupture ordonnée + cohérence multi-fenêtres + liquidité effective · 15 ventes min / ${RECENT_MARKET_LIMIT} max · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ` +
         `Hunter autonome quand le Market Watcher est OFF · Hot Lane/end_at serveur inchangés · ` +
         `extensions tardives relues jusqu'à 250 ms dans la zone chaude.`
     );
