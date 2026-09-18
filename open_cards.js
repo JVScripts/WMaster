@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.1';
+    const WM_VERSION = '3.6.2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5480,7 +5480,7 @@
     // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
     // une carte déjà acquise dès lors que ses 15 ventes minimum existent, avec prix d’urgence.
     const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
-    const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.75;
+    const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.50;
     const HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY = 0.75;
     const HUNTER_PURCHASE_SAFETY_FLOOR = 0.82;
     const FLIP_MAX_URGENCY_DISCOUNT_PCT = 6;
