@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.10';
+    const WM_VERSION = '3.6.11';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -998,6 +998,134 @@
         if (Array.isArray(raw)) flipLedger = raw;
     } catch (e) { flipLedger = []; }
 
+    // v3.6.11 — le ledger Flip est partagé par localStorage entre onglets / instances.
+    // Une ancienne instance ne doit jamais pouvoir réécrire un état périmé par-dessus une
+    // vente déjà confirmée. On fusionne donc le store avant chaque écriture et on considère
+    // `soldPrice + saleAuctionId` comme une preuve terminale de vente si un ancien bug a
+    // laissé le statut sur `tagged`/`listed`.
+    const flipLedgerDeletedKeys = new Set();
+
+    function flipLedgerRecordKey(rec) {
+        if (!rec || typeof rec !== 'object') return '';
+        if (rec.auctionId) return `a:${rec.auctionId}`;
+        if (rec.userCardId) return `u:${rec.userCardId}`;
+        return `f:${String(rec.title || '?')}|${Number(rec.boughtAt || 0)}`;
+    }
+
+    function normalizeFlipLedgerRecord(rec) {
+        if (!rec || typeof rec !== 'object') return false;
+        let changed = false;
+        const soldPrice = Number(rec.soldPrice);
+        const hasSoldEvidence = !!rec.saleAuctionId && Number.isFinite(soldPrice) && soldPrice > 0;
+
+        if (hasSoldEvidence && rec.status !== 'sold') {
+            rec.status = 'sold';
+            rec.userCardId = null;
+            rec.lastError = null;
+            if (!Number.isFinite(Number(rec.soldAt)) || Number(rec.soldAt) <= 0) {
+                rec.soldAt = Date.now();
+            }
+            rec.profit = soldPrice - Number(rec.buyPrice || 0);
+            changed = true;
+        }
+        return changed;
+    }
+
+    function flipLedgerFreshness(rec) {
+        if (!rec || typeof rec !== 'object') return 0;
+        return Math.max(
+            Number(rec.soldAt || 0),
+            Number(rec.listedAt || 0),
+            Number(rec.queueMovedAt || 0),
+            Number(rec.tagAppliedAt || 0),
+            Number(rec.lastTagAttemptAt || 0),
+            Number(rec.boughtAt || 0)
+        );
+    }
+
+    function mergeFlipLedgerRecord(localRec, storedRec) {
+        if (!localRec) return storedRec;
+        if (!storedRec) return localRec;
+
+        normalizeFlipLedgerRecord(localRec);
+        normalizeFlipLedgerRecord(storedRec);
+
+        // `sold` est terminal pour un achat Flip donné : aucune ancienne instance ne doit
+        // pouvoir le remettre en tagged/listed ensuite.
+        if (localRec.status === 'sold' || storedRec.status === 'sold') {
+            const winner = localRec.status === 'sold' && storedRec.status !== 'sold'
+                ? localRec
+                : storedRec.status === 'sold' && localRec.status !== 'sold'
+                    ? storedRec
+                    : (flipLedgerFreshness(localRec) >= flipLedgerFreshness(storedRec) ? localRec : storedRec);
+            return { ...localRec, ...storedRec, ...winner, status: 'sold', userCardId: null, lastError: null };
+        }
+
+        // Pour les états non terminaux, un relist plus avancé est nécessairement plus récent.
+        const lr = Number(localRec.relists || 0);
+        const sr = Number(storedRec.relists || 0);
+        const winner = lr !== sr
+            ? (lr > sr ? localRec : storedRec)
+            : (flipLedgerFreshness(localRec) >= flipLedgerFreshness(storedRec) ? localRec : storedRec);
+        return { ...localRec, ...storedRec, ...winner };
+    }
+
+    function syncFlipLedgerFromStorage(render = false) {
+        let stored;
+        try {
+            stored = JSON.parse(localStorage.getItem(FLIP_LEDGER_KEY) || '[]');
+        } catch (e) {
+            return 0;
+        }
+        if (!Array.isArray(stored)) return 0;
+
+        const localByKey = new Map();
+        for (const rec of flipLedger) {
+            const key = flipLedgerRecordKey(rec);
+            if (key) localByKey.set(key, rec);
+        }
+
+        let changes = 0;
+        for (const ext of stored) {
+            const key = flipLedgerRecordKey(ext);
+            if (!key || flipLedgerDeletedKeys.has(key)) continue;
+            const local = localByKey.get(key);
+            if (!local) {
+                normalizeFlipLedgerRecord(ext);
+                flipLedger.push(ext);
+                localByKey.set(key, ext);
+                changes++;
+                continue;
+            }
+            const merged = mergeFlipLedgerRecord(local, ext);
+            const before = JSON.stringify(local);
+            Object.assign(local, merged);
+            if (JSON.stringify(local) !== before) changes++;
+        }
+
+        for (const rec of flipLedger) {
+            if (normalizeFlipLedgerRecord(rec)) changes++;
+        }
+
+        if (render && changes) renderFlipHistory();
+        return changes;
+    }
+
+    // Répare immédiatement les états incohérents hérités (ex. soldPrice présent mais statut tagged).
+    let flipLedgerNormalizedOnLoad = false;
+    for (const rec of flipLedger) {
+        if (normalizeFlipLedgerRecord(rec)) flipLedgerNormalizedOnLoad = true;
+    }
+    if (flipLedgerNormalizedOnLoad) {
+        try { localStorage.setItem(FLIP_LEDGER_KEY, JSON.stringify(flipLedger)); } catch (e) { }
+    }
+
+    window.addEventListener('storage', e => {
+        if (e.key !== FLIP_LEDGER_KEY) return;
+        const changed = syncFlipLedgerFromStorage(true);
+        if (changed) wakeFlipSeller();
+    });
+
     // v2.3.5 : complète sans casser les anciens enregistrements. Ces champs servent à
     // répartir équitablement les retries de tag et à conserver l'id/rareté d'achat si le
     // catalogue remplace ensuite la carte (revalorisation/changement de rareté).
@@ -1254,9 +1382,15 @@
 
     function saveFlipLedger() {
         try {
+            // v3.6.11 : absorbe d'abord les changements venant d'une autre instance/onglet.
+            // En particulier, un état `sold` externe est terminal et gagne toujours.
+            syncFlipLedgerFromStorage(false);
+            for (const rec of flipLedger) normalizeFlipLedgerRecord(rec);
+            flipLedger = flipLedger.filter(rec => !flipLedgerDeletedKeys.has(flipLedgerRecordKey(rec)));
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
             flipLedger = flipLedger.slice(-1500);
             localStorage.setItem(FLIP_LEDGER_KEY, JSON.stringify(flipLedger));
+            flipLedgerDeletedKeys.clear();
         } catch (e) { }
         renderFlipHistory();
     }
@@ -2448,6 +2582,7 @@
     }, 15_000);
 
     async function retryPendingFlipTags() {
+        syncFlipLedgerFromStorage(false);
         await deepResolvePendingFlipRecords(false).catch(() => 0);
 
         const now = Date.now();
@@ -2564,6 +2699,7 @@
     // auto-achats. Avant v2.3.4, le seller exigeait status='tagged' dans le ledger et ignorait
     // donc un tag manuel pourtant bien présent en base.
     async function syncManualFlipTags() {
+        syncFlipLedgerFromStorage(false);
         // v3.6.7 — cette synchro lourde ne sert qu'à rattacher un tag `vente` manuel à
         // une ligne encore pending. Si toutes les lignes sont déjà `tagged`, ne scanne pas
         // inutilement jusqu'à 40 pages de collection toutes les 15 secondes.
@@ -2683,6 +2819,7 @@
             }
         }
 
+        flipLedgerDeletedKeys.add(flipLedgerRecordKey(rec));
         flipLedger = flipLedger.filter(r => r !== rec);
         autoFlipCandidates.delete(auctionId);
         saveAutoFlipCandidates();
@@ -3592,6 +3729,7 @@
 
 
     async function syncFlipSaleResults() {
+        syncFlipLedgerFromStorage(false);
         // v3.6.10 — priorité absolue aux ventes ayant un auction_id exact. Avant, les ventes
         // orphelines étaient réconciliées EN PREMIER et pouvaient bloquer cette fonction ; de
         // même, le retour d'un invendu était `await` malgré le commentaire disant l'inverse.
@@ -3797,6 +3935,11 @@
 
         try {
             while (isCurrent()) {
+                // v3.6.11 — recharge les changements persistés par une autre instance avant
+                // de sélectionner les flips prêts. Empêche une copie mémoire périmée de revendre
+                // ou réécrire une carte déjà vendue.
+                syncFlipLedgerFromStorage(false);
+
                 // v3.6.8 — chemin critique minimal : aucune maintenance secondaire ne doit
                 // retarder une carte déjà `tagged`. Les retries de tag et la synchro des ventes
                 // terminées tournent déjà toutes les 15 s dans le timer dédié.
@@ -4735,6 +4878,7 @@
     };
 
     window.wmFlipReconcileStates = async function () {
+        syncFlipLedgerFromStorage(false);
         const out = [];
         for (const rec of flipLedger.filter(r => r && !['sold'].includes(r.status))) {
             const owned = await resolveAuthoritativeFlipUserCardId(rec, rec.userCardId || null).catch(() => null);
@@ -4837,7 +4981,35 @@
         return result;
     };
 
+    window.wmFlipLedgerDiag = function () {
+        let stored = [];
+        try {
+            const raw = JSON.parse(localStorage.getItem(FLIP_LEDGER_KEY) || '[]');
+            if (Array.isArray(raw)) stored = raw;
+        } catch (e) { }
+
+        const summarize = rows => ({
+            total: rows.length,
+            pending: rows.filter(r => r?.status === 'pending_tag').length,
+            tagged: rows.filter(r => r?.status === 'tagged').length,
+            listed: rows.filter(r => r?.status === 'listed').length,
+            sold: rows.filter(r => r?.status === 'sold').length,
+            incoherentsVendus: rows.filter(r =>
+                r?.status !== 'sold' && r?.saleAuctionId && Number(r?.soldPrice) > 0
+            ).map(r => r?.title || '?')
+        });
+
+        const result = {
+            version: WM_VERSION,
+            memoire: summarize(flipLedger),
+            stockage: summarize(stored)
+        };
+        console.log('[WikiMasters][Flip] ledger mémoire vs stockage', result);
+        return result;
+    };
+
     window.wmFlipInfo = function () {
+        syncFlipLedgerFromStorage(false);
         const info = {
             candidatsAuto: autoFlipCandidates.size,
             achatsFlip: flipLedger.length,
@@ -20307,6 +20479,7 @@
         // Retente régulièrement les tags vente même si le Flip Seller n'est pas lancé : le but
         // est que la carte soit marquée dès la victoire, pas seulement au prochain START.
         setInterval(() => {
+            syncFlipLedgerFromStorage(false);
             // Victoires auto d'abord : une nouvelle ligne Flip doit exister avant les retries/tag/list.
             if (autoFlipCandidates.size > 0) {
                 reconcileAutoFlipCandidatesById()
