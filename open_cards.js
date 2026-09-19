@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.8';
+    const WM_VERSION = '3.6.9';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3821,8 +3821,23 @@
                     }
                     if (!isCurrent()) break;
 
-                    if (r?.ok) ok++;
-                    else {
+                    if (r?.ok) {
+                        ok++;
+
+                        // v3.6.9 — lissage du débit Flip Seller : après une mise en vente
+                        // réellement créée, attend au minimum 60 s avant la suivante, avec
+                        // un jitter de charge de 0 à 30 s pour éviter des rafales périodiques.
+                        // Les échecs sans création gardent le petit délai historique ci-dessous.
+                        if (ok < slots && isCurrent()) {
+                            const gapMs = 60_000 + Math.floor(Math.random() * 30_001);
+                            setStatus(
+                                `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>` +
+                                `<span style="color:#888;"> · prochaine mise en vente dans ~${Math.ceil(gapMs / 1000)} s</span>`
+                            );
+                            await flipSellerSleep(gapMs);
+                            if (!isCurrent()) break;
+                        }
+                    } else {
                         fail++;
                         if (r?.blockedMarket) blockedMarket++;
                         rec.lastError = r?.reason || 'échec mise en vente';
@@ -3832,8 +3847,8 @@
                                 ? `⏳ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)} · suivant de la file essayé`
                                 : `⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                         );
+                        await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
                     }
-                    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
                 }
 
                 if (!isCurrent()) break;
