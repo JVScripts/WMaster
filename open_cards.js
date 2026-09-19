@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.7';
+    const WM_VERSION = '3.6.8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -511,6 +511,8 @@
     } catch (e) { }
     let flipSellerRunning = false;
     let flipSellerBusy = false;
+    // v3.6.8 — la réparation de tags manquants ne doit jamais bloquer les flips déjà prêts.
+    let flipMissingTagRepairBusy = false;
     // v3.6.6 — génération de boucle : une réinjection SPA du dashboard peut recréer le bouton
     // alors que l'ancienne boucle Flip est encore marquée busy. Chaque nouveau démarrage invalide
     // proprement l'ancienne génération au lieu de rester sur STOP avec un statut vide.
@@ -3744,17 +3746,12 @@
 
         try {
             while (isCurrent()) {
-                // v3.6.7 — priorité au chemin de vente. Les anciennes versions lançaient
-                // deux syncManualFlipTags() avant même de calculer les slots ; chacune pouvait
-                // scanner jusqu'à 40 pages de collection. Les tags manuels restent synchronisés
-                // par le timer périodique dédié plus bas.
-                setStatus('<span style="color:#888;">💸 Préparation rapide de la file Flip…</span>');
-                await retryPendingFlipTags();
-                if (!isCurrent()) break;
-                await syncFlipSaleResults();
-                if (!isCurrent()) break;
+                // v3.6.8 — chemin critique minimal : aucune maintenance secondaire ne doit
+                // retarder une carte déjà `tagged`. Les retries de tag et la synchro des ventes
+                // terminées tournent déjà toutes les 15 s dans le timer dédié.
+                setStatus('<span style="color:#888;">💸 Lecture des tags vente…</span>');
 
-                let taggedIds = await fetchFlipTaggedUserCardIds();
+                const taggedIds = await fetchFlipTaggedUserCardIds();
                 if (!isCurrent()) break;
                 if (taggedIds == null) {
                     setStatus('<span style="color:#fbbf24;">⚠ Tag vente illisible — réessai dans 15s…</span>');
@@ -3762,17 +3759,17 @@
                     continue;
                 }
 
-                // v2.4.6 : AVANT de filtrer `ready`, répare les lignes dont le ledger dit
-                // `vente prêt` mais dont le tag a disparu. Sinon elles sont exclues à vie.
-                const repairedMissing = await repairAllMissingFlipSaleTags(taggedIds).catch(() => 0);
-                if (!isCurrent()) break;
-                if (repairedMissing > 0) {
-                    taggedIds = await fetchFlipTaggedUserCardIds();
-                    if (!isCurrent()) break;
-                    if (taggedIds == null) {
-                        await flipSellerSleep(5000);
-                        continue;
-                    }
+                // Réparer les éventuels tags disparus EN ARRIÈRE-PLAN. Les cartes dont le tag
+                // est encore valide continuent vers le listing sans attendre cette réparation.
+                const hasMissingTag = flipLedger.some(r =>
+                    r && r.status === 'tagged' && r.userCardId && !taggedIds.has(r.userCardId)
+                );
+                if (hasMissingTag && !flipMissingTagRepairBusy) {
+                    flipMissingTagRepairBusy = true;
+                    repairAllMissingFlipSaleTags(taggedIds)
+                        .then(n => { if (n > 0) wakeFlipSeller(); })
+                        .catch(() => { })
+                        .finally(() => { flipMissingTagRepairBusy = false; });
                 }
 
                 const ready = flipLedger
@@ -3784,7 +3781,8 @@
                         Number(a.boughtAt || 0) - Number(b.boughtAt || 0)
                     );
 
-                const state = await fetchSellingState();
+                setStatus(`<span style="color:#888;">💸 ${ready.length} flip(s) prêt(s) · vérification des slots…</span>`);
+                const state = await fetchSellingSlotStateFast();
                 if (!isCurrent()) break;
                 if (!state) {
                     setStatus('<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>');
@@ -3793,7 +3791,7 @@
                 }
                 const maxActive = effectiveMaxActive(state.max);
                 const slots = Math.max(0, maxActive - state.count);
-                const slotSource = state.countSource === 'db' ? 'base' : '/mine';
+                const slotSource = state.countSource === 'db' || state.countSource === 'db-cache' ? 'base' : '/mine';
                 if (ready.length === 0) {
                     setStatus(`<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(15000);
@@ -13844,6 +13842,33 @@
     }
 
     let _sellingCountMismatchLoggedAt = 0;
+
+    // v3.6.8 — état MINIMAL des slots pour le Flip Seller.
+    // Le chemin complet fetchSellingState() enrichit aussi les pseudos des enchérisseurs et peut
+    // reconstruire le détail des ventes ; rien de cela n'est nécessaire pour savoir s'il reste
+    // une place. On utilise donc /mine immédiatement, avec le cache DB déjà disponible s'il est
+    // frais, mais SANS lancer de résolution de pseudo ni de requête DB supplémentaire.
+    async function fetchSellingSlotStateFast() {
+        const data = await fetchMine();
+        if (!data) return null;
+
+        const st = mineSellingState(data);
+        st.rawCount = st.count;
+        st.countSource = 'mine';
+
+        if (
+            Array.isArray(_detailCache) &&
+            _detailCacheSource === 'db' &&
+            Date.now() - _detailCacheAt < DETAIL_CACHE_MS
+        ) {
+            st.list = _detailCache;
+            st.detailed = true;
+            st.count = _detailCache.length;
+            st.countSource = 'db-cache';
+        }
+
+        return st;
+    }
 
     async function fetchSellingState() {
         const data = await fetchMine();
