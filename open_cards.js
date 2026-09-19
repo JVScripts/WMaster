@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.11';
+    const WM_VERSION = '3.6.12';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -525,6 +525,45 @@
     let flipSellerRunEpoch = 0;
     let flipSellerBusyEpoch = 0;
     const flipListingInFlight = new Set();
+
+    // v3.6.12 — délai de mise en vente lié à la disponibilité d'un slot, et non à un
+    // simple sleep interruptible. `wakeFlipSeller()` peut réveiller la boucle pour un tag
+    // ou une synchro, mais ne doit JAMAIS raccourcir ce délai minimal. Le timestamp est
+    // persisté pour résister aux réinjections SPA / reloads et coordonner les onglets.
+    const FLIP_SLOT_LISTING_DELAY_MIN_MS = 60_000;
+    const FLIP_SLOT_LISTING_DELAY_MAX_MS = 90_000;
+    const FLIP_NEXT_LISTING_AT_KEY = 'wm_flip_next_listing_at_v1';
+
+    function readFlipNextListingAt() {
+        try {
+            const v = Number(localStorage.getItem(FLIP_NEXT_LISTING_AT_KEY) || 0);
+            return Number.isFinite(v) && v > 0 ? v : 0;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function writeFlipNextListingAt(ts) {
+        try {
+            if (Number.isFinite(ts) && ts > 0) localStorage.setItem(FLIP_NEXT_LISTING_AT_KEY, String(Math.round(ts)));
+            else localStorage.removeItem(FLIP_NEXT_LISTING_AT_KEY);
+        } catch (e) { }
+    }
+
+    function clearFlipNextListingAt() {
+        writeFlipNextListingAt(0);
+    }
+
+    function scheduleFlipNextListingAt() {
+        const now = Date.now();
+        const existing = readFlipNextListingAt();
+        if (existing > now) return existing;
+        const span = FLIP_SLOT_LISTING_DELAY_MAX_MS - FLIP_SLOT_LISTING_DELAY_MIN_MS;
+        const delay = FLIP_SLOT_LISTING_DELAY_MIN_MS + Math.floor(Math.random() * (span + 1));
+        const due = now + delay;
+        writeFlipNextListingAt(due);
+        return due;
+    }
 
     // v2.6.5 : une nouvelle victoire Flip ne doit pas attendre la fin d'un sleep de
     // 10/15 secondes du seller. Une seule boucle seller existe, donc un wake resolver suffit.
@@ -3987,20 +4026,41 @@
                 const slots = Math.max(0, maxActive - state.count);
                 const slotSource = state.countSource === 'db' || state.countSource === 'db-cache' ? 'base' : '/mine';
                 if (ready.length === 0) {
+                    // Pas de candidat prêt : le prochain slot disponible devra repartir avec
+                    // un délai complet 60–90 s lorsqu'un candidat redeviendra vendable.
+                    clearFlipNextListingAt();
                     setStatus(`<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(15000);
                     continue;
                 }
                 if (slots === 0) {
+                    // Tant que tous les slots sont occupés il n'y a rien à minuter. Lorsque
+                    // le prochain slot se libérera, on démarrera alors un NOUVEAU délai 60–90 s.
+                    clearFlipNextListingAt();
                     setStatus(`<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(4000);
                     continue;
                 }
 
-                setStatus(`<span style="color:#06b6d4;">💸 Roulement Flip · jusqu'à ${slots} slot(s) à remplir…</span>`);
+                // v3.6.12 — un slot vient d'être observé libre. On programme UNE seule mise
+                // en vente dans 60–90 s. Le sleep peut être réveillé par d'autres événements,
+                // mais le timestamp absolu reste la source de vérité et empêche tout départ
+                // anticipé (c'était la cause des écarts observés autour de 25 s en v3.6.9/11).
+                const nextListingAt = scheduleFlipNextListingAt();
+                const remainingMs = nextListingAt - Date.now();
+                if (remainingMs > 0) {
+                    setStatus(
+                        `<span style="color:#06b6d4;">💸 ${slots} slot(s) libre(s)</span>` +
+                        `<span style="color:#888;"> · prochaine mise en vente dans ~${Math.max(1, Math.ceil(remainingMs / 1000))} s</span>`
+                    );
+                    await flipSellerSleep(Math.min(4000, remainingMs));
+                    continue;
+                }
+
+                setStatus(`<span style="color:#06b6d4;">💸 Slot libre · tentative d'une mise en vente…</span>`);
                 let ok = 0, fail = 0, blockedMarket = 0, attempted = 0;
                 for (const rec of ready) {
-                    if (!isCurrent() || ok >= slots) break;
+                    if (!isCurrent() || ok >= 1) break;
 
                     const lockKey = String(rec.userCardId || rec.auctionId || '');
                     if (lockKey && flipListingInFlight.has(lockKey)) continue;
@@ -4017,20 +4077,12 @@
 
                     if (r?.ok) {
                         ok++;
-
-                        // v3.6.9 — lissage du débit Flip Seller : après une mise en vente
-                        // réellement créée, attend au minimum 60 s avant la suivante, avec
-                        // un jitter de charge de 0 à 30 s pour éviter des rafales périodiques.
-                        // Les échecs sans création gardent le petit délai historique ci-dessous.
-                        if (ok < slots && isCurrent()) {
-                            const gapMs = 60_000 + Math.floor(Math.random() * 30_001);
-                            setStatus(
-                                `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>` +
-                                `<span style="color:#888;"> · prochaine mise en vente dans ~${Math.ceil(gapMs / 1000)} s</span>`
-                            );
-                            await flipSellerSleep(gapMs);
-                            if (!isCurrent()) break;
-                        }
+                        // Une seule vente réussie par passage. On efface l'échéance : la boucle
+                        // relira ensuite le vrai nombre de slots. S'il en reste un libre, elle
+                        // créera un nouveau délai 60–90 s ; si tout est plein, aucun chrono ne
+                        // tourne et le délai ne commencera qu'au prochain slot réellement libre.
+                        clearFlipNextListingAt();
+                        break;
                     } else {
                         fail++;
                         if (r?.blockedMarket) blockedMarket++;
@@ -4044,6 +4096,10 @@
                         await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
                     }
                 }
+
+                // Si aucune carte n'a pu être créée malgré le slot libre, évite de marteler
+                // immédiatement le site : on repart sur un nouveau délai complet avant un retry.
+                if (ok === 0) clearFlipNextListingAt();
 
                 if (!isCurrent()) break;
                 setStatus(
