@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.2';
+    const WM_VERSION = '3.6.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -766,7 +766,7 @@
                         saveFlipLedger();
                         renderFlipHistory();
                     }
-                }).catch(() => {});
+                }).catch(() => { });
             }, delay);
         }
     }
@@ -2426,11 +2426,11 @@
         reconcileAutoFlipCandidatesById()
             .then(result => {
                 if (result?.wins > 0) {
-                    retryPendingFlipTags().catch(() => {});
+                    retryPendingFlipTags().catch(() => { });
                     wakeFlipSeller();
                 }
             })
-            .catch(() => {});
+            .catch(() => { });
     }, 15_000);
 
     async function retryPendingFlipTags() {
@@ -3215,13 +3215,18 @@
         return repaired;
     }
 
-    async function listFlipRecord(rec) {
+    async function listFlipRecord(rec, knownTaggedIds = null) {
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
         if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') {
             return { ok: false, reason: 'record_invalide' };
         }
 
-        let tagged = await fetchFlipTaggedUserCardIds();
+        // v3.6.2 — le cycle Flip a déjà chargé les IDs tagués `vente` pour construire
+        // la file `ready`. Réutilise ce snapshot au lieu de refaire la même requête réseau
+        // avant CHAQUE listing. Sans snapshot, conserve l'ancien chemin de sécurité.
+        let tagged = knownTaggedIds instanceof Set
+            ? knownTaggedIds
+            : await fetchFlipTaggedUserCardIds();
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
 
         if (tagged && !tagged.has(rec.userCardId)) {
@@ -3745,7 +3750,9 @@
                 }
                 if (slots === 0) {
                     if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
-                    await flipSellerSleep(15000);
+                    // v3.6.2 — quand la file attend uniquement qu'un slot se libère,
+                    // revérifie rapidement au lieu de laisser un trou jusqu'à 15 s.
+                    await flipSellerSleep(4000);
                     continue;
                 }
 
@@ -3758,7 +3765,7 @@
                 for (const rec of ready) {
                     if (!flipSellerRunning || ok >= slots) break;
                     attempted++;
-                    const r = await listFlipRecord(rec);
+                    const r = await listFlipRecord(rec, taggedIds);
                     if (r.ok) ok++;
                     else {
                         fail++;
@@ -3771,7 +3778,7 @@
                                 : `⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                         );
                     }
-                    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
+                    await new Promise(r => setTimeout(r, 300 + Math.random() * 200));
                 }
                 if (statusEl) {
                     statusEl.innerHTML = attempted > 0 && blockedMarket === attempted && ok === 0
@@ -4730,8 +4737,8 @@
 
     window.wmFlipDeepResolve = async function () {
         const n = await deepResolvePendingFlipRecords(true);
-        await retryPendingFlipTags().catch(() => {});
-        await syncManualFlipTags().catch(() => {});
+        await retryPendingFlipTags().catch(() => { });
+        await syncManualFlipTags().catch(() => { });
         renderFlipHistory();
         console.log(`[WikiMasters][Flip] résolution profonde forcée : ${n} exemplaire(s) retrouvé(s).`);
         return n;
@@ -5301,7 +5308,7 @@
         if (!cardId || getCachedWmOfficialSummary(cardId) || wmOfficialSummaryQueued.has(cardId)) return;
         wmOfficialSummaryQueued.add(cardId);
         wmOfficialSummaryQueue.push(cardId);
-        processWmOfficialSummaryQueue().catch(() => {});
+        processWmOfficialSummaryQueue().catch(() => { });
     }
 
     async function processWmOfficialSummaryQueue() {
@@ -5361,10 +5368,10 @@
         const ratio = Number(currentPrice) / avg;
         const formatted = avg.toLocaleString('fr-FR');
         const tip = `Moyenne officielle WikiMasters : ${formatted} 💰`;
-        const common = { count:1, wmAverage:avg, reference:avg, referenceKind:'wm_average', tip };
-        if (ratio < 0.75) return { ...common, status:'under', label:`sous-coté · moy. WM ${formatted}`, color:'#4ade80' };
-        if (ratio > 1.25) return { ...common, status:'over', label:`surcoté · moy. WM ${formatted}`, color:'#ef4444' };
-        return { ...common, status:'fair', label:`dans la zone · moy. WM ${formatted}`, color:'#888' };
+        const common = { count: 1, wmAverage: avg, reference: avg, referenceKind: 'wm_average', tip };
+        if (ratio < 0.75) return { ...common, status: 'under', label: `sous-coté · moy. WM ${formatted}`, color: '#4ade80' };
+        if (ratio > 1.25) return { ...common, status: 'over', label: `surcoté · moy. WM ${formatted}`, color: '#ef4444' };
+        return { ...common, status: 'fair', label: `dans la zone · moy. WM ${formatted}`, color: '#888' };
     }
 
     /* ═══════ v3.4.2 — RECENT MARKET / TREND-AWARE v3 · PURCHASE ↔ EXIT ═══════
@@ -5480,7 +5487,7 @@
     // Liquidité minimum pour que le Hunter ACHÈTE. Le Flip peut toujours revendre
     // une carte déjà acquise dès lors que ses 15 ventes minimum existent, avec prix d’urgence.
     const HUNTER_LIQUIDITY_MAX_NEWEST_AGE_MS = 48 * 60 * 60 * 1000;
-    const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.50;
+    const HUNTER_LIQUIDITY_MIN_SALES_PER_DAY = 0.75;
     const HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY = 0.75;
     const HUNTER_PURCHASE_SAFETY_FLOOR = 0.82;
     const FLIP_MAX_URGENCY_DISCOUNT_PCT = 6;
@@ -5963,8 +5970,8 @@
         const previousBlockAverage = meanOf(previousBlock);
         const trendPct =
             trendAvailable &&
-            Number.isFinite(recentBlockAverage) && recentBlockAverage > 0 &&
-            Number.isFinite(previousBlockAverage) && previousBlockAverage > 0
+                Number.isFinite(recentBlockAverage) && recentBlockAverage > 0 &&
+                Number.isFinite(previousBlockAverage) && previousBlockAverage > 0
                 ? ((recentBlockAverage / previousBlockAverage) - 1) * 100
                 : null;
 
@@ -6147,9 +6154,9 @@
         const effectiveTrendBlend = trendMagnitudeBlend * regimeConfidence;
         const baseTrendReference =
             Number.isFinite(robustAverage) && robustAverage > 0 &&
-            Number.isFinite(recencyWeightedAverage) && recencyWeightedAverage > 0
+                Number.isFinite(recencyWeightedAverage) && recencyWeightedAverage > 0
                 ? robustAverage * (1 - effectiveTrendBlend) +
-                  recencyWeightedAverage * effectiveTrendBlend
+                recencyWeightedAverage * effectiveTrendBlend
                 : robustAverage;
 
         let regimeMagnitudeStrength = 0;
@@ -6172,10 +6179,10 @@
 
         const marketReferenceBeforeBreak =
             Number.isFinite(baseTrendReference) && baseTrendReference > 0 &&
-            Number.isFinite(recentRegimeReference) && recentRegimeReference > 0 &&
-            regimeShiftStrength > 0
+                Number.isFinite(recentRegimeReference) && recentRegimeReference > 0 &&
+                regimeShiftStrength > 0
                 ? baseTrendReference * (1 - regimeShiftStrength) +
-                  recentRegimeReference * regimeShiftStrength
+                recentRegimeReference * regimeShiftStrength
                 : baseTrendReference;
 
         // v3.6.0 — correctif de rupture ordonnée. La dispersion des 5 dernières ne doit plus
@@ -6204,7 +6211,7 @@
         const dispersionPct =
             Number.isFinite(robustAverage) && robustAverage > 0
                 ? meanOf(boundedPrices.map(v => Math.abs(v - robustAverage))) /
-                  robustAverage * 100
+                robustAverage * 100
                 : null;
 
         return {
@@ -6847,7 +6854,7 @@
             Math.min(
                 1,
                 1 - uptrendChasePenalty - participantsPenalty -
-                    windowStructurePenalty - warningPenalty - silencePenalty
+                windowStructurePenalty - warningPenalty - silencePenalty
             )
         );
 
@@ -6873,7 +6880,7 @@
         const hunterWindow5Reference = Number(calc?.hunterWindow5Reference);
         const hunterDownBreakGuardReference =
             hunterDownBreakConfirmed && Number.isFinite(hunterWindow5Reference) && hunterWindow5Reference > 0 &&
-            Number.isFinite(hunterBaseMarketReference) && hunterBaseMarketReference > 0
+                Number.isFinite(hunterBaseMarketReference) && hunterBaseMarketReference > 0
                 ? Math.min(hunterBaseMarketReference, hunterWindow5Reference)
                 : hunterBaseMarketReference;
 
@@ -6900,7 +6907,7 @@
 
         const hunterReference =
             calc.eligible && liquidityEligible && marketIntegrity.allowed &&
-            Number.isFinite(hunterExpectedExitReference) && hunterExpectedExitReference > 0
+                Number.isFinite(hunterExpectedExitReference) && hunterExpectedExitReference > 0
                 ? hunterExpectedExitReference * hunterPurchaseSafetyFactor
                 : null;
 
@@ -10046,7 +10053,7 @@
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
-            await preloadRecentMarketForHunter(list).catch(() => {});
+            await preloadRecentMarketForHunter(list).catch(() => { });
         }
 
         if (hunterAggressive) return runHunterFourbePass(list);
@@ -12822,102 +12829,102 @@
                         }
 
                         if (hunterCardLockReady) {
-                        bidLockSet.add(a.id);
-                        try {
-                            // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane).
-                            // L'état `a` vient d'être relu côté serveur dans CE tick ; on revalide
-                            // malgré tout la fenêtre de temps au dernier moment.
-                            if (!automaticBidTimeAllowed(a)) {
-                                continue;
-                            }
-                            const res = await fetch(
-                                `${MARKET_API_BASE}/${a.id}/bid`,
-                                {
-                                    method: "POST", credentials: "include",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ amount: bidAmount })
+                            bidLockSet.add(a.id);
+                            try {
+                                // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane).
+                                // L'état `a` vient d'être relu côté serveur dans CE tick ; on revalide
+                                // malgré tout la fenêtre de temps au dernier moment.
+                                if (!automaticBidTimeAllowed(a)) {
+                                    continue;
                                 }
-                            );
-                            if (res.ok) {
-                                markAuctionAsMine(a.id, bidAmount, a);
-                                markAutoFlipCandidate(a, 'autobid_hotlane', bidAmount);
-                                wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
-                                // Refresh balance en arrière-plan, sans bloquer le tick
-                                fetchBalance().catch(() => { });
-                                sendToDiscord(
-                                    "⚡ Hot-lane bid : **" + titleOb + "** → **" + bidAmount + " 💰**",
-                                    5763719,
-                                    'market'
+                                const res = await fetch(
+                                    `${MARKET_API_BASE}/${a.id}/bid`,
+                                    {
+                                        method: "POST", credentials: "include",
+                                        headers: { "Content-Type": "application/json" },
+                                        body: JSON.stringify({ amount: bidAmount })
+                                    }
                                 );
-                            } else {
-                                const errData = await res.json().catch(() => ({}));
-                                const errText = String(errData?.error || errData?.message || '');
-                                const mm = errText.match(/minimum\s+(\d+)/i);
-                                const serverMin = mm ? Number(mm[1]) : null;
+                                if (res.ok) {
+                                    markAuctionAsMine(a.id, bidAmount, a);
+                                    markAutoFlipCandidate(a, 'autobid_hotlane', bidAmount);
+                                    wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                                    // Refresh balance en arrière-plan, sans bloquer le tick
+                                    fetchBalance().catch(() => { });
+                                    sendToDiscord(
+                                        "⚡ Hot-lane bid : **" + titleOb + "** → **" + bidAmount + " 💰**",
+                                        5763719,
+                                        'market'
+                                    );
+                                } else {
+                                    const errData = await res.json().catch(() => ({}));
+                                    const errText = String(errData?.error || errData?.message || '');
+                                    const mm = errText.match(/minimum\s+(\d+)/i);
+                                    const serverMin = mm ? Number(mm[1]) : null;
 
-                                // En bataille, quelqu'un peut encore passer entre notre lecture et le POST.
-                                // Un seul retry, après NOUVELLE lecture serveur, jamais à l'aveugle.
-                                if (/mise\s+trop\s+basse/i.test(errText) && Number.isFinite(serverMin)) {
-                                    try {
-                                        const retryFresh = await fetchSingleAuction(a.id);
-                                        if (retryFresh) {
-                                            applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
+                                    // En bataille, quelqu'un peut encore passer entre notre lecture et le POST.
+                                    // Un seul retry, après NOUVELLE lecture serveur, jamais à l'aveugle.
+                                    if (/mise\s+trop\s+basse/i.test(errText) && Number.isFinite(serverMin)) {
+                                        try {
+                                            const retryFresh = await fetchSingleAuction(a.id);
+                                            if (retryFresh) {
+                                                applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
 
-                                            let retryHunterFresh = true;
-                                            if (isDynamicHunterAuction(retryFresh)) {
-                                                retryHunterFresh = !!(await ensureFreshHunterReference(
-                                                    retryFresh,
-                                                    Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
-                                                ));
-                                            }
+                                                let retryHunterFresh = true;
+                                                if (isDynamicHunterAuction(retryFresh)) {
+                                                    retryHunterFresh = !!(await ensureFreshHunterReference(
+                                                        retryFresh,
+                                                        Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                                                    ));
+                                                }
 
-                                            if (retryHunterFresh
-                                                && dynamicHunterContinuationAllowed(retryFresh)
-                                                && automaticBidTimeAllowed(retryFresh)
-                                                && !iAmLeading(retryFresh)
-                                                && !autoBidBlockedByUncertainSelfState(retryFresh)) {
+                                                if (retryHunterFresh
+                                                    && dynamicHunterContinuationAllowed(retryFresh)
+                                                    && automaticBidTimeAllowed(retryFresh)
+                                                    && !iAmLeading(retryFresh)
+                                                    && !autoBidBlockedByUncertainSelfState(retryFresh)) {
 
-                                                const retryAmount = Math.max(
-                                                    minNextBid(retryFresh),
-                                                    Math.ceil(serverMin)
-                                                );
-
-                                                if (autoBidWithinCap(retryFresh, retryAmount)) {
-                                                    const retryRes = await fetch(
-                                                        `${MARKET_API_BASE}/${a.id}/bid`,
-                                                        {
-                                                            method: "POST",
-                                                            credentials: "include",
-                                                            headers: { "Content-Type": "application/json" },
-                                                            body: JSON.stringify({ amount: retryAmount })
-                                                        }
+                                                    const retryAmount = Math.max(
+                                                        minNextBid(retryFresh),
+                                                        Math.ceil(serverMin)
                                                     );
 
-                                                    if (retryRes.ok) {
-                                                        markAuctionAsMine(a.id, retryAmount, retryFresh);
-                                                        markAutoFlipCandidate(retryFresh, 'autobid_hotlane_retry', retryAmount);
-                                                        wmLog(`⚡ Hot-lane retry : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${retryAmount} 💰</span>`);
-                                                        fetchBalance().catch(() => { });
-                                                    } else {
-                                                        const retryErr = await retryRes.json().catch(() => ({}));
-                                                        wmLog(`⚠️ Hot-lane retry échoué : <b>${titleOb}</b> [${rarOb}] · ${retryErr?.error || 'erreur'}`);
+                                                    if (autoBidWithinCap(retryFresh, retryAmount)) {
+                                                        const retryRes = await fetch(
+                                                            `${MARKET_API_BASE}/${a.id}/bid`,
+                                                            {
+                                                                method: "POST",
+                                                                credentials: "include",
+                                                                headers: { "Content-Type": "application/json" },
+                                                                body: JSON.stringify({ amount: retryAmount })
+                                                            }
+                                                        );
+
+                                                        if (retryRes.ok) {
+                                                            markAuctionAsMine(a.id, retryAmount, retryFresh);
+                                                            markAutoFlipCandidate(retryFresh, 'autobid_hotlane_retry', retryAmount);
+                                                            wmLog(`⚡ Hot-lane retry : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${retryAmount} 💰</span>`);
+                                                            fetchBalance().catch(() => { });
+                                                        } else {
+                                                            const retryErr = await retryRes.json().catch(() => ({}));
+                                                            wmLog(`⚠️ Hot-lane retry échoué : <b>${titleOb}</b> [${rarOb}] · ${retryErr?.error || 'erreur'}`);
+                                                        }
                                                     }
                                                 }
                                             }
+                                        } catch (e) {
+                                            wmLog(`⚠️ Hot-lane retry exception : <b>${titleOb}</b> · ${e.message}`);
                                         }
-                                    } catch (e) {
-                                        wmLog(`⚠️ Hot-lane retry exception : <b>${titleOb}</b> · ${e.message}`);
+                                    } else {
+                                        wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errText || 'erreur'}`);
                                     }
-                                } else {
-                                    wmLog(`⚠️ Hot-lane bid échoué : <b>${titleOb}</b> [${rarOb}] · ${errText || 'erreur'}`);
                                 }
+                            } catch (e) {
+                                wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
+                            } finally {
+                                releaseHunterCardRarityBidLock(hunterCardLockKey);
+                                bidLockSet.delete(a.id);
                             }
-                        } catch (e) {
-                            wmLog(`⚠️ Hot-lane bid exception : <b>${titleOb}</b> · ${e.message}`);
-                        } finally {
-                            releaseHunterCardRarityBidLock(hunterCardLockKey);
-                            bidLockSet.delete(a.id);
-                        }
                         }
                     }
                     // plafond atteint → autoBidWithinCap a déjà coupé l'auto-bid ; on tombe sur
@@ -16557,15 +16564,15 @@
         const wm = Number(wmAverage);
         const ratioToWm =
             Number.isFinite(trendAwareRounded) && trendAwareRounded > 0 &&
-            Number.isFinite(wm) && wm > 0
+                Number.isFinite(wm) && wm > 0
                 ? Math.round((trendAwareRounded / wm) * 1000) / 10
                 : null;
 
         const hunterRecentCap =
             recent.hunterEligible &&
-            hunterRecentReferenceAllowed(recent.hunterMarketReference) &&
-            Number.isFinite(Number(recent.hunterReference)) &&
-            Number(recent.hunterReference) > 0
+                hunterRecentReferenceAllowed(recent.hunterMarketReference) &&
+                Number.isFinite(Number(recent.hunterReference)) &&
+                Number(recent.hunterReference) > 0
                 ? dynamicHunterCapFromReference(recent.hunterReference, 'recent_market')
                 : null;
 
@@ -20134,7 +20141,7 @@
                     .then(result => {
                         if (result?.wins > 0) wakeFlipSeller();
                     })
-                    .catch(() => {});
+                    .catch(() => { });
             }
             syncManualFlipTags().catch(() => { });
             retryPendingFlipTags().catch(() => { });
@@ -20147,7 +20154,7 @@
             renderFlipHistory();
         }, 15000);
         // Au chargement, les Flips sans snapshot Recent frais sont actualisés rapidement.
-        setTimeout(() => refreshTrackedFlipRecentMarkets(false).catch(() => {}), 3000);
+        setTimeout(() => refreshTrackedFlipRecentMarkets(false).catch(() => { }), 3000);
 
         // L'affichage seul est très léger : entre deux cycles réseau, l'âge se rafraîchit sans requête.
         setInterval(() => renderFlipHistory(), 5000);
@@ -21907,7 +21914,7 @@
                 // Même si fetchSellingState() échoue, un achat auto doit entrer dans Flip Seller.
                 if (Date.now() - lastWonSync > 60000) {
                     lastWonSync = Date.now();
-                    syncWonAuctions().catch(() => {});
+                    syncWonAuctions().catch(() => { });
                 }
 
                 const st = await fetchSellingState();
@@ -23530,7 +23537,7 @@
                 if (!cardId || !t) continue;
                 if (t.toLocaleLowerCase('fr-FR').includes(q.toLocaleLowerCase('fr-FR'))) {
                     const rarity = String(a?.snapshot_rarity || c?.rarity || '').toUpperCase();
-                    found.set(`${cardId}|${rarity}`, { cardId, title:t, rarity });
+                    found.set(`${cardId}|${rarity}`, { cardId, title: t, rarity });
                 }
             }
         } catch (e) { }
@@ -23540,15 +23547,15 @@
             if (Array.isArray(rows)) for (const c of rows) {
                 if (!c?.id) continue;
                 const rarity = String(c?.rarity || '').toUpperCase();
-                found.set(`${c.id}|${rarity}`, { cardId:c.id, title:c.wikipedia_title || q, rarity });
+                found.set(`${c.id}|${rarity}`, { cardId: c.id, title: c.wikipedia_title || q, rarity });
             }
         } catch (e) { }
-        const arr=[...found.values()], ql=q.toLocaleLowerCase('fr-FR');
-        return arr.sort((a,b)=>{
-            const ae=String(a.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
-            const be=String(b.title||'').toLocaleLowerCase('fr-FR')===ql?0:1;
-            if(ae!==be)return ae-be;
-            return String(a.title||'').localeCompare(String(b.title||''),'fr');
+        const arr = [...found.values()], ql = q.toLocaleLowerCase('fr-FR');
+        return arr.sort((a, b) => {
+            const ae = String(a.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
+            const be = String(b.title || '').toLocaleLowerCase('fr-FR') === ql ? 0 : 1;
+            if (ae !== be) return ae - be;
+            return String(a.title || '').localeCompare(String(b.title || ''), 'fr');
         });
     }
 
@@ -23638,9 +23645,9 @@
                     ${recentMarketIntegrityAllowed(r) ? 'Trend' : 'Trend indicative'} <b style="color:${recentMarketIntegrityAllowed(r) ? '#4ade80' : '#888'};">${r.valeurTrendAware ?? '—'}</b> ·
                     tendance <b style="color:${Number(r.tendancePct) < -RECENT_TREND_START_PCT ? '#f59e0b' : Number(r.tendancePct) > RECENT_TREND_START_PCT ? '#67e8f9' : '#aaa'};">${r.tendancePct != null ? `${r.tendancePct >= 0 ? '+' : ''}${r.tendancePct}%` : '—'}</b> ·
                     ${Math.abs(Number(r.tendancePct)) < RECENT_TREND_START_PCT
-                        ? `bascule <b style="color:#888;">inactive</b>`
-                        : `confiance bascule <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b>`
-                    } ·
+                    ? `bascule <b style="color:#888;">inactive</b>`
+                    : `confiance bascule <b style="color:${Number(r.confianceRegimePct) >= 70 ? '#4ade80' : Number(r.confianceRegimePct) >= 35 ? '#fbbf24' : '#f97316'};">${r.confianceRegimePct ?? '—'}%</b>`
+                } ·
                     consensus H <b style="color:#67e8f9;">${r.consensusHunter ?? '—'}</b> ·
                     réf H <b style="color:#a7f3d0;">${r.referenceMarcheHunter ?? '—'}</b> ·
                     coh H <b style="color:${r.chaosFenêtresH ? '#ef4444' : Number(r.coherenceFenêtresHPct) >= 70 ? '#4ade80' : '#fbbf24'};">${r.coherenceFenêtresHPct ?? '—'}%</b> ·
@@ -23653,27 +23660,27 @@
         }).join('');
     }
 
-    window.wmPrice = async function(title, rarity='', silent=false) {
-        const q=String(title||'').trim(), wantedRarity=String(rarity||'').trim().toUpperCase();
-        if(!q){console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")');return[];}
-        const cards=await findCardsByTitleForOfficialPrice(q);
-        if(cards.length===0){if(!silent)console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`);return[];}
-        await Promise.all([...new Set(cards.map(c=>c.cardId).filter(Boolean))].map(id=>fetchWmOfficialSummary(id,true).catch(()=>null)));
-        const results=[],dedup=new Set();
-        for(const c of cards){
-            const official=getCachedWmOfficialSummary(c.cardId), officialRarities=Object.keys(official?.summary||{});
-            const rarities=wantedRarity?[wantedRarity]:[...new Set([c.rarity,...officialRarities].filter(Boolean).map(r=>String(r).toUpperCase()))];
-            for(const rr of rarities){
-                const key=`${c.cardId}|${rr}`;if(dedup.has(key))continue;dedup.add(key);
-                const wmAvg=getWmOfficialAverage(c.cardId,rr), valid=Number.isFinite(wmAvg)&&wmAvg>0;
-                results.push({carte:official?.title||c.title,cardId:c.cardId,rarete:rr||'?',moyenneWM:valid?wmAvg:null});
+    window.wmPrice = async function (title, rarity = '', silent = false) {
+        const q = String(title || '').trim(), wantedRarity = String(rarity || '').trim().toUpperCase();
+        if (!q) { console.warn('Usage : await wmPrice("Jupiter") ou await wmPrice("Jupiter", "UR")'); return []; }
+        const cards = await findCardsByTitleForOfficialPrice(q);
+        if (cards.length === 0) { if (!silent) console.warn(`[WikiMasters] Aucune carte trouvée pour "${q}".`); return []; }
+        await Promise.all([...new Set(cards.map(c => c.cardId).filter(Boolean))].map(id => fetchWmOfficialSummary(id, true).catch(() => null)));
+        const results = [], dedup = new Set();
+        for (const c of cards) {
+            const official = getCachedWmOfficialSummary(c.cardId), officialRarities = Object.keys(official?.summary || {});
+            const rarities = wantedRarity ? [wantedRarity] : [...new Set([c.rarity, ...officialRarities].filter(Boolean).map(r => String(r).toUpperCase()))];
+            for (const rr of rarities) {
+                const key = `${c.cardId}|${rr}`; if (dedup.has(key)) continue; dedup.add(key);
+                const wmAvg = getWmOfficialAverage(c.cardId, rr), valid = Number.isFinite(wmAvg) && wmAvg > 0;
+                results.push({ carte: official?.title || c.title, cardId: c.cardId, rarete: rr || '?', moyenneWM: valid ? wmAvg : null });
             }
         }
-        const ql=q.toLocaleLowerCase('fr-FR'), exact=results.filter(r=>String(r.carte||'').toLocaleLowerCase('fr-FR')===ql), shown=exact.length?exact:results.slice(0,20);
-        if(!silent){
+        const ql = q.toLocaleLowerCase('fr-FR'), exact = results.filter(r => String(r.carte || '').toLocaleLowerCase('fr-FR') === ql), shown = exact.length ? exact : results.slice(0, 20);
+        if (!silent) {
             console.table(shown);
-            const lines=shown.filter(r=>Number.isFinite(Number(r.moyenneWM))&&Number(r.moyenneWM)>0).map(r=>`[${r.rarete}] moy.WM ${r.moyenneWM} (info vente uniquement)`);
-            wmLog(lines.length?`💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}`:`💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
+            const lines = shown.filter(r => Number.isFinite(Number(r.moyenneWM)) && Number(r.moyenneWM) > 0).map(r => `[${r.rarete}] moy.WM ${r.moyenneWM} (info vente uniquement)`);
+            wmLog(lines.length ? `💰 Prix WM : <b>${q}</b> → ${lines.join(' · ')}` : `💰 Prix WM : <b>${q}</b> → aucune moyenne officielle disponible`);
         }
         return shown;
     };
