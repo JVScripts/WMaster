@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.13';
+    const WM_VERSION = '3.6.14';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -530,8 +530,8 @@
     // simple sleep interruptible. `wakeFlipSeller()` peut réveiller la boucle pour un tag
     // ou une synchro, mais ne doit JAMAIS raccourcir ce délai minimal. Le timestamp est
     // persisté pour résister aux réinjections SPA / reloads et coordonner les onglets.
-    const FLIP_SLOT_LISTING_DELAY_MIN_MS = 60_000;
-    const FLIP_SLOT_LISTING_DELAY_MAX_MS = 90_000;
+    const FLIP_SLOT_LISTING_DELAY_MIN_MS = 18_000;
+    const FLIP_SLOT_LISTING_DELAY_MAX_MS = 33_000;
     const FLIP_NEXT_LISTING_AT_KEY = 'wm_flip_next_listing_at_v1';
 
     function readFlipNextListingAt() {
@@ -560,7 +560,7 @@
 
         // v3.6.13 — IMPORTANT : une échéance déjà créée reste la source de vérité,
         // même lorsqu'elle vient d'expirer. En 3.6.12, `existing <= now` recréait ici
-        // immédiatement un nouveau délai 60–90 s ; la boucle n'atteignait donc jamais
+        // immédiatement un nouveau délai 18–33 s ; la boucle n'atteignait donc jamais
         // la tentative de mise en vente.
         if (existing > 0) return existing;
 
@@ -4033,7 +4033,7 @@
                 const slotSource = state.countSource === 'db' || state.countSource === 'db-cache' ? 'base' : '/mine';
                 if (ready.length === 0) {
                     // Pas de candidat prêt : le prochain slot disponible devra repartir avec
-                    // un délai complet 60–90 s lorsqu'un candidat redeviendra vendable.
+                    // un délai complet 18–33 s lorsqu'un candidat redeviendra vendable.
                     clearFlipNextListingAt();
                     setStatus(`<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(15000);
@@ -4041,7 +4041,7 @@
                 }
                 if (slots === 0) {
                     // Tant que tous les slots sont occupés il n'y a rien à minuter. Lorsque
-                    // le prochain slot se libérera, on démarrera alors un NOUVEAU délai 60–90 s.
+                    // le prochain slot se libérera, on démarrera alors un NOUVEAU délai 18–33 s.
                     clearFlipNextListingAt();
                     setStatus(`<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(4000);
@@ -4049,7 +4049,7 @@
                 }
 
                 // v3.6.12 — un slot vient d'être observé libre. On programme UNE seule mise
-                // en vente dans 60–90 s. Le sleep peut être réveillé par d'autres événements,
+                // en vente dans 18–33 s. Le sleep peut être réveillé par d'autres événements,
                 // mais le timestamp absolu reste la source de vérité et empêche tout départ
                 // anticipé (c'était la cause des écarts observés autour de 25 s en v3.6.9/11).
                 const nextListingAt = scheduleFlipNextListingAt();
@@ -4085,7 +4085,7 @@
                         ok++;
                         // Une seule vente réussie par passage. On efface l'échéance : la boucle
                         // relira ensuite le vrai nombre de slots. S'il en reste un libre, elle
-                        // créera un nouveau délai 60–90 s ; si tout est plein, aucun chrono ne
+                        // créera un nouveau délai 18–33 s ; si tout est plein, aucun chrono ne
                         // tourne et le délai ne commencera qu'au prochain slot réellement libre.
                         clearFlipNextListingAt();
                         break;
