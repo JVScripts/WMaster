@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.3';
+    const WM_VERSION = '3.6.4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3215,18 +3215,13 @@
         return repaired;
     }
 
-    async function listFlipRecord(rec, knownTaggedIds = null) {
+    async function listFlipRecord(rec) {
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
         if (!rec?.userCardId || !rec.cardId || rec.status !== 'tagged') {
             return { ok: false, reason: 'record_invalide' };
         }
 
-        // v3.6.2 — le cycle Flip a déjà chargé les IDs tagués `vente` pour construire
-        // la file `ready`. Réutilise ce snapshot au lieu de refaire la même requête réseau
-        // avant CHAQUE listing. Sans snapshot, conserve l'ancien chemin de sécurité.
-        let tagged = knownTaggedIds instanceof Set
-            ? knownTaggedIds
-            : await fetchFlipTaggedUserCardIds();
+        let tagged = await fetchFlipTaggedUserCardIds();
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
 
         if (tagged && !tagged.has(rec.userCardId)) {
@@ -3750,7 +3745,7 @@
                 }
                 if (slots === 0) {
                     if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
-                    // v3.6.2 — quand la file attend uniquement qu'un slot se libère,
+                    // v3.6.3 — seul changement de cadence conservé : quand la file attend un slot,
                     // revérifie rapidement au lieu de laisser un trou jusqu'à 15 s.
                     await flipSellerSleep(4000);
                     continue;
@@ -3765,7 +3760,7 @@
                 for (const rec of ready) {
                     if (!flipSellerRunning || ok >= slots) break;
                     attempted++;
-                    const r = await listFlipRecord(rec, taggedIds);
+                    const r = await listFlipRecord(rec);
                     if (r.ok) ok++;
                     else {
                         fail++;
@@ -3778,7 +3773,7 @@
                                 : `⚠️ Flip Seller : <b>${rec.title}</b> non listé · ${htmlEsc(rec.lastError)}`
                         );
                     }
-                    await new Promise(r => setTimeout(r, 300 + Math.random() * 200));
+                    await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
                 }
                 if (statusEl) {
                     statusEl.innerHTML = attempted > 0 && blockedMarket === attempted && ok === 0
