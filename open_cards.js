@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.4';
+    const WM_VERSION = '3.6.5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -14160,13 +14160,37 @@
         }
     }
 
-    // S'assure qu'on est sur /collection avant de continuer. Après une vente, le site navigue
-    // vers /marketplace/{auction_id} — un état transitoire NORMAL provoqué par le bot lui-même,
-    // pas une "mauvaise page" au sens d'une navigation manuelle de l'utilisateur ailleurs. On
-    // retente donc le retour ici avant de conclure à un vrai blocage (réutilisé aussi en fin de
-    // sellCardViaUI, juste après avoir cliqué "Lancer l'enchère").
+    // v3.6.5 — l'URL /collection peut être active AVANT que React ait remonté la vraie page.
+    // Le Flip Seller ne considère donc plus la navigation terminée tant que la barre de recherche
+    // Collection n'existe pas réellement dans le DOM. Cela évite "barre de recherche collection
+    // introuvable" juste après un retour depuis /marketplace/<auction_id>.
+    function findCollectionSearchInput() {
+        return document.querySelector(
+            'input[placeholder="Rechercher par titre ou catégorie..."]'
+        ) || document.querySelector(
+            'input[placeholder*="Rechercher par titre"]'
+        );
+    }
+
+    async function waitForCollectionReady(timeoutMs = 8000) {
+        const started = Date.now();
+        while (Date.now() - started < timeoutMs) {
+            if (location.pathname.startsWith('/collection')) {
+                const input = findCollectionSearchInput();
+                if (input && input.isConnected && !input.disabled) return input;
+            }
+            await new Promise(r => setTimeout(r, 100));
+        }
+        return null;
+    }
+
+    // S'assure qu'on est sur /collection ET que l'interface Collection est réellement montée.
+    // Après une vente, le site navigue vers /marketplace/{auction_id} ; le retour SPA peut mettre
+    // quelques centaines de ms à remonter les contrôles React même si l'URL a déjà changé.
     async function ensureOnCollectionPage() {
-        if (location.pathname.startsWith('/collection')) return true;
+        if (location.pathname.startsWith('/collection')) {
+            if (await waitForCollectionReady(8000)) return true;
+        }
 
         // v2.4.4 : "Retour au marché" ne revient PAS à /collection.
         // Après une vente native, le site nous place sur /marketplace/<auction_id>.
@@ -14178,28 +14202,14 @@
 
         if (collectionLink) {
             collectionLink.click();
-            for (let i = 0; i < 30; i++) {
-                await new Promise(r => setTimeout(r, 150));
-                if (location.pathname.startsWith('/collection')) return true;
-            }
+            if (await waitForCollectionReady(8000)) return true;
         }
 
         // Repli SPA : React Router écoute normalement popstate.
         try {
             history.pushState({}, '', '/collection');
             window.dispatchEvent(new PopStateEvent('popstate'));
-            for (let i = 0; i < 20; i++) {
-                await new Promise(r => setTimeout(r, 150));
-                if (location.pathname.startsWith('/collection')) {
-                    // attend que la vraie page Collection ait remonté ses contrôles
-                    for (let j = 0; j < 20; j++) {
-                        if (document.querySelector('input[placeholder="Rechercher par titre ou catégorie..."]')) {
-                            return true;
-                        }
-                        await new Promise(r => setTimeout(r, 150));
-                    }
-                }
-            }
+            if (await waitForCollectionReady(8000)) return true;
         } catch (e) { }
 
         // Dernier recours : navigation réelle. Le Flip Seller est mémorisé en sessionStorage
@@ -14490,9 +14500,13 @@
         const requestedPrice = Math.max(1, Math.round(Number(price) || 0));
         const requestedDuration = Number(duration);
 
-        const searchInput = document.querySelector(
-            'input[placeholder="Rechercher par titre ou catégorie..."]'
-        );
+        // v3.6.5 — seconde sécurité : un rerender React peut remplacer la page entre
+        // ensureOnCollectionPage() et cette lecture. On attend alors brièvement le contrôle
+        // au lieu d'abandonner immédiatement le listing.
+        let searchInput = findCollectionSearchInput();
+        if (!searchInput) {
+            searchInput = await waitForCollectionReady(5000);
+        }
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
 
         setReactInputValue(searchInput, title);
