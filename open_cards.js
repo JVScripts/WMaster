@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.6';
+    const WM_VERSION = '3.6.7';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2521,16 +2521,46 @@
         });
     }
 
-    async function fetchFlipTaggedUserCardIds() {
-        const rows = await fetchFlipTaggedRows();
-        if (!Array.isArray(rows)) return null;
-        return new Set(rows.map(r => r?.user_card_id).filter(Boolean));
+    // v3.6.7 — chemin RAPIDE utilisé par la boucle de vente : pour savoir si un flip est
+    // encore tagué `vente`, on n'a besoin que des user_card_id de user_card_tags. L'ancien
+    // chemin appelait fetchFlipTaggedRows(), qui enrichit les tags via /api/my-collection et
+    // peut parcourir jusqu'à 40 pages si certains exemplaires tagués ne sont plus mappables.
+    // Avec beaucoup de tags, cela pouvait bloquer la boucle AVANT même l'affichage du statut.
+    async function fetchFlipTaggedUserCardIds(forceRediscover = false) {
+        let tagId = await ensureFlipTagId(forceRediscover);
+        if (!tagId) return null;
+
+        const readLinks = async id => await supabaseSelect(
+            `user_card_tags?tag_id=eq.${id}&select=user_card_id&limit=2000`
+        );
+
+        let links = await readLinks(tagId);
+        if (!Array.isArray(links)) return null;
+
+        // Même filet que fetchFlipTaggedRows() : si le tag a été supprimé/recréé,
+        // redécouvre son id une fois. Aucun scan Collection n'est nécessaire ici.
+        if (links.length === 0 && !forceRediscover &&
+            flipLedger.some(r => r && ['pending_tag', 'tagged'].includes(r.status))) {
+            const oldId = tagId;
+            tagId = await discoverFlipTagId(true);
+            if (tagId && tagId !== oldId) {
+                links = await readLinks(tagId);
+                if (!Array.isArray(links)) return null;
+            }
+        }
+
+        return new Set(links.map(r => r?.user_card_id).filter(Boolean));
     }
 
     // Fait le lien entre un tag vente posé MANUELLEMENT dans WikiMasters et le registre des
     // auto-achats. Avant v2.3.4, le seller exigeait status='tagged' dans le ledger et ignorait
     // donc un tag manuel pourtant bien présent en base.
     async function syncManualFlipTags() {
+        // v3.6.7 — cette synchro lourde ne sert qu'à rattacher un tag `vente` manuel à
+        // une ligne encore pending. Si toutes les lignes sont déjà `tagged`, ne scanne pas
+        // inutilement jusqu'à 40 pages de collection toutes les 15 secondes.
+        if (!flipLedger.some(r => r && r.status === 'pending_tag')) return 0;
+
         const rows = await fetchFlipTaggedRows();
         if (!Array.isArray(rows) || rows.length === 0) return 0;
 
@@ -3714,11 +3744,12 @@
 
         try {
             while (isCurrent()) {
-                await syncManualFlipTags();
-                if (!isCurrent()) break;
+                // v3.6.7 — priorité au chemin de vente. Les anciennes versions lançaient
+                // deux syncManualFlipTags() avant même de calculer les slots ; chacune pouvait
+                // scanner jusqu'à 40 pages de collection. Les tags manuels restent synchronisés
+                // par le timer périodique dédié plus bas.
+                setStatus('<span style="color:#888;">💸 Préparation rapide de la file Flip…</span>');
                 await retryPendingFlipTags();
-                if (!isCurrent()) break;
-                await syncManualFlipTags();
                 if (!isCurrent()) break;
                 await syncFlipSaleResults();
                 if (!isCurrent()) break;
@@ -20193,7 +20224,9 @@
                     })
                     .catch(() => { });
             }
-            syncManualFlipTags().catch(() => { });
+            syncManualFlipTags()
+                .then(linked => { if (linked > 0) wakeFlipSeller(); })
+                .catch(() => { });
             retryPendingFlipTags().catch(() => { });
             syncFlipSaleResults().catch(() => { });
 
