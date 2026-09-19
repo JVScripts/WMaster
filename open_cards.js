@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.9';
+    const WM_VERSION = '3.6.10';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -511,6 +511,12 @@
     } catch (e) { }
     let flipSellerRunning = false;
     let flipSellerBusy = false;
+
+    // v3.6.10 — la réconciliation des ventes ne doit jamais bloquer tout le Flip Seller.
+    // Une maintenance lente (retour d'invendu / vente orpheline) tourne en arrière-plan,
+    // tandis que les enchères connues par leur auction_id restent synchronisées en priorité.
+    let flipSaleSyncBusy = false;
+    const flipSaleMaintenanceInFlight = new Set();
     // v3.6.8 — la réparation de tags manquants ne doit jamais bloquer les flips déjà prêts.
     let flipMissingTagRepairBusy = false;
     // v3.6.6 — génération de boucle : une réinjection SPA du dashboard peut recréer le bouton
@@ -3339,6 +3345,18 @@
 
         saveFlipLedger();
 
+        // v3.6.10 — si l'intercepteur n'a pas capturé l'auction_id lors du POST UI,
+        // rattache immédiatement l'annonce active fraîchement créée. Cela évite de laisser
+        // un Flip en `listed` orphelin jusqu'à sa vente, état ensuite plus difficile à réconcilier.
+        if (!rec.saleAuctionId) {
+            const linked = await findActiveSellerAuctionForFlip(rec).catch(() => null);
+            if (linked?.id) {
+                rec.saleAuctionId = linked.id;
+                rec.lastError = null;
+                saveFlipLedger();
+            }
+        }
+
         wmLog(
             `💸 Flip Seller : <b>${rec.title}</b> [${rec.rarity}] · ` +
             `acheté ${rec.buyPrice} → listé <b>${rec.listPrice} 💰</b> ` +
@@ -3574,93 +3592,126 @@
 
 
     async function syncFlipSaleResults() {
-        // Une navigation UI peut réussir alors que l'auction_id n'a pas été capturé.
-        // Avant de traiter les IDs exacts, rattache ces ventes orphelines via card_id /
-        // titre-rareté-prix afin qu'un futur invendu puisse lui aussi être re-tag + relist.
+        // v3.6.10 — priorité absolue aux ventes ayant un auction_id exact. Avant, les ventes
+        // orphelines étaient réconciliées EN PREMIER et pouvaient bloquer cette fonction ; de
+        // même, le retour d'un invendu était `await` malgré le commentaire disant l'inverse.
+        // Résultat possible : une carte réellement vendue restait `listed` dans le ledger.
+        if (flipSaleSyncBusy) return;
+        flipSaleSyncBusy = true;
+
+        try {
+            const listed = flipLedger.filter(r => r && r.status === 'listed' && r.saleAuctionId);
+            if (listed.length > 0) {
+                const rows = await fetchAuctionsByIds(listed.map(r => r.saleAuctionId));
+                if (rows instanceof Map) {
+                    let changed = false;
+
+                    for (const rec of listed) {
+                        const row = rows.get(rec.saleAuctionId);
+                        if (!row || auctionRowStillActive(row)) continue;
+
+                        const fp = Number(row.final_price);
+                        if (row.winner_id && Number.isFinite(fp) && fp > 0) {
+                            rec.status = 'sold';
+                            rec.soldPrice = fp;
+                            rec.soldAt = row.settled_at ? new Date(row.settled_at).getTime() : Date.now();
+                            rec.profit = fp - Number(rec.buyPrice || 0);
+                            rec.userCardId = null;
+                            rec.lastError = null;
+                            changed = true;
+                            wmLog(`💰 Flip vendu : <b>${rec.title}</b> · achat ${rec.buyPrice} → vente <b>${fp} 💰</b> · résultat <b style="color:${rec.profit >= 0 ? '#4ade80' : '#ef4444'};">${rec.profit >= 0 ? '+' : ''}${rec.profit} 💰</b>.`);
+                            continue;
+                        }
+
+                        // Ne jamais conclure "invendue" immédiatement à T=0 : winner_id/final_price
+                        // peuvent arriver quelques secondes après end_at.
+                        const rowEndTs = new Date(row.end_at || NaN).getTime();
+                        if (
+                            Number.isFinite(rowEndTs) &&
+                            serverNow() < rowEndTs + FLIP_SETTLEMENT_GRACE_MS
+                        ) {
+                            rec.lastError = 'enchère terminée · règlement en cours';
+                            changed = true;
+                            continue;
+                        }
+
+                        // Dernière relecture exacte après la grâce.
+                        const confirmMap = await fetchAuctionsByIds([rec.saleAuctionId]).catch(() => null);
+                        const confirmRow = confirmMap instanceof Map ? confirmMap.get(rec.saleAuctionId) : null;
+                        const confirmFp = Number(confirmRow?.final_price);
+
+                        if (confirmRow?.winner_id && Number.isFinite(confirmFp) && confirmFp > 0) {
+                            rec.status = 'sold';
+                            rec.soldPrice = confirmFp;
+                            rec.soldAt = confirmRow.settled_at ? new Date(confirmRow.settled_at).getTime() : Date.now();
+                            rec.profit = confirmFp - Number(rec.buyPrice || 0);
+                            rec.userCardId = null;
+                            rec.lastError = null;
+                            changed = true;
+                            wmLog(`💰 Flip vendu (confirmation tardive) : <b>${rec.title}</b> → <b>${confirmFp} 💰</b>.`);
+                            continue;
+                        }
+
+                        if (confirmRow && auctionRowStillActive(confirmRow)) {
+                            rec.lastError = null;
+                            continue;
+                        }
+
+                        // Enchère réellement invendue : libère immédiatement le suivi exact,
+                        // puis effectue le retour collection / re-tag en arrière-plan.
+                        rec.saleAuctionId = null;
+                        rec.relists = Number(rec.relists || 0) + 1;
+                        moveFlipToQueueTail(rec, `invendue #${rec.relists}`);
+                        changed = true;
+
+                        const maintenanceKey = String(rec.auctionId || rec.title || Math.random());
+                        if (!flipSaleMaintenanceInFlight.has(maintenanceKey)) {
+                            flipSaleMaintenanceInFlight.add(maintenanceKey);
+                            restoreUnsoldFlipToSaleTag(rec)
+                                .catch(e => {
+                                    if (!flipLedger.includes(rec) || rec.status === 'sold') return;
+                                    rec.status = 'pending_tag';
+                                    rec.userCardId = null;
+                                    rec.returningFromUnsold = true;
+                                    rec.lastError = `invendue · exception re-tag · ${e?.message || e}`;
+                                    rec.nextTagRetryAt = Date.now() + 15_000;
+                                    saveFlipLedger();
+                                })
+                                .finally(() => {
+                                    flipSaleMaintenanceInFlight.delete(maintenanceKey);
+                                    wakeFlipSeller();
+                                });
+                        }
+                    }
+
+                    if (changed) saveFlipLedger();
+                }
+            }
+        } finally {
+            // Libère le verrou AVANT les réconciliations orphelines : celles-ci ne doivent
+            // jamais empêcher le prochain passage exact 15 s plus tard.
+            flipSaleSyncBusy = false;
+        }
+
+        // Les listings dont l'auction_id n'avait pas été capturé sont traités ensuite, chacun
+        // sous verrou individuel et sans bloquer syncFlipSaleResults(). Une vente exacte future
+        // continue donc d'être reconnue même si une réconciliation orpheline est lente.
         const orphanListed = flipLedger.filter(
             r => r && r.status === 'listed' && !r.saleAuctionId
         );
-        for (const rec of orphanListed.slice(0, 10)) {
-            await reconcileFlipAbsentFromCollection(rec).catch(() => ({ handled: false }));
+
+        for (const rec of orphanListed.slice(0, 6)) {
+            const maintenanceKey = String(rec.auctionId || rec.title || 'orphan');
+            if (flipSaleMaintenanceInFlight.has(maintenanceKey)) continue;
+
+            flipSaleMaintenanceInFlight.add(maintenanceKey);
+            reconcileFlipAbsentFromCollection(rec)
+                .catch(() => ({ handled: false }))
+                .finally(() => {
+                    flipSaleMaintenanceInFlight.delete(maintenanceKey);
+                    wakeFlipSeller();
+                });
         }
-
-        const listed = flipLedger.filter(r => r && r.status === 'listed' && r.saleAuctionId);
-        if (listed.length === 0) return;
-        const rows = await fetchAuctionsByIds(listed.map(r => r.saleAuctionId));
-        if (!(rows instanceof Map)) return;
-        let changed = false;
-        for (const rec of listed) {
-            const row = rows.get(rec.saleAuctionId);
-            if (!row || auctionRowStillActive(row)) continue;
-            const fp = Number(row.final_price);
-            if (row.winner_id && Number.isFinite(fp) && fp > 0) {
-                rec.status = 'sold';
-                rec.soldPrice = fp;
-                rec.soldAt = row.settled_at ? new Date(row.settled_at).getTime() : Date.now();
-                rec.profit = fp - Number(rec.buyPrice || 0);
-                rec.lastError = null;
-                changed = true;
-                wmLog(`💰 Flip vendu : <b>${rec.title}</b> · achat ${rec.buyPrice} → vente <b>${fp} 💰</b> · résultat <b style="color:${rec.profit >= 0 ? '#4ade80' : '#ef4444'};">${rec.profit >= 0 ? '+' : ''}${rec.profit} 💰</b>.`);
-                continue;
-            }
-
-            // Ne jamais conclure "invendue" immédiatement à T=0 : winner_id/final_price
-            // peuvent arriver quelques secondes après end_at.
-            const rowEndTs = new Date(row.end_at || NaN).getTime();
-            if (
-                Number.isFinite(rowEndTs) &&
-                serverNow() < rowEndTs + FLIP_SETTLEMENT_GRACE_MS
-            ) {
-                rec.lastError = 'enchère terminée · règlement en cours';
-                changed = true;
-                continue;
-            }
-
-            // Enchère terminée sans acheteur APRÈS délai de grâce :
-            // WikiMasters retire le tag lors du listing.
-            // On oublie l'ancien auction/user_card_id, puis on retrouve l'exemplaire revenu et
-            // on remet immédiatement le tag `vente` — même logique que le Trash Seller.
-            // Dernière relecture exacte après la grâce : évite qu'un snapshot ancien
-            // sans winner/final_price déclenche un faux invendu.
-            const confirmMap = await fetchAuctionsByIds([rec.saleAuctionId]).catch(() => null);
-            const confirmRow = confirmMap instanceof Map ? confirmMap.get(rec.saleAuctionId) : null;
-            const confirmFp = Number(confirmRow?.final_price);
-
-            if (confirmRow?.winner_id && Number.isFinite(confirmFp) && confirmFp > 0) {
-                rec.status = 'sold';
-                rec.soldPrice = confirmFp;
-                rec.soldAt = confirmRow.settled_at ? new Date(confirmRow.settled_at).getTime() : Date.now();
-                rec.profit = confirmFp - Number(rec.buyPrice || 0);
-                rec.lastError = null;
-                changed = true;
-                wmLog(`💰 Flip vendu (confirmation tardive) : <b>${rec.title}</b> → <b>${confirmFp} 💰</b>.`);
-                continue;
-            }
-
-            if (confirmRow && auctionRowStillActive(confirmRow)) {
-                rec.lastError = null;
-                continue;
-            }
-
-            rec.saleAuctionId = null;
-            rec.relists = Number(rec.relists || 0) + 1;
-            // v3.4.3 — round-robin : toute carte réellement invendue repart au fond.
-            // Ainsi 1,2,3,4,5 laissent la place aux suivantes avant de revenir.
-            moveFlipToQueueTail(rec, `invendue #${rec.relists}`);
-            changed = true;
-
-            // Ne bloque pas toute la boucle si le retour collection prend quelques secondes.
-            // restoreUnsoldFlipToSaleTag() sauvegarde elle-même chaque état intermédiaire.
-            await restoreUnsoldFlipToSaleTag(rec).catch(e => {
-                rec.status = 'pending_tag';
-                rec.userCardId = null;
-                rec.returningFromUnsold = true;
-                rec.lastError = `invendue · exception re-tag · ${e?.message || e}`;
-                rec.nextTagRetryAt = Date.now() + 15_000;
-                saveFlipLedger();
-            });
-        }
-        if (changed) saveFlipLedger();
     }
 
     function renderFlipHistory() {
