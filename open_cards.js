@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.5';
+    const WM_VERSION = '3.6.6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -511,6 +511,12 @@
     } catch (e) { }
     let flipSellerRunning = false;
     let flipSellerBusy = false;
+    // v3.6.6 — génération de boucle : une réinjection SPA du dashboard peut recréer le bouton
+    // alors que l'ancienne boucle Flip est encore marquée busy. Chaque nouveau démarrage invalide
+    // proprement l'ancienne génération au lieu de rester sur STOP avec un statut vide.
+    let flipSellerRunEpoch = 0;
+    let flipSellerBusyEpoch = 0;
+    const flipListingInFlight = new Set();
 
     // v2.6.5 : une nouvelle victoire Flip ne doit pas attendre la fin d'un sleep de
     // 10/15 secondes du seller. Une seule boucle seller existe, donc un wake resolver suffit.
@@ -3691,20 +3697,36 @@
             (hidden ? `<div style="font-size:8px;color:#777;margin-top:4px;">+${hidden} autre(s) flip(s) en cours non affiché(s).</div>` : '');
     }
 
-    async function runFlipSeller(btn, statusEl) {
-        if (flipSellerBusy) return;
+    async function runFlipSeller(btn, statusEl, epoch = flipSellerRunEpoch) {
+        // Une boucle de la même génération existe déjà : pas de doublon. Une nouvelle génération
+        // (réinjection SPA / redémarrage) peut en revanche repartir même si l'ancienne est restée
+        // bloquée dans un await ; l'ancienne s'auto-invalidera dès qu'elle reprendra.
+        if (flipSellerBusy && flipSellerBusyEpoch === epoch) return;
         flipSellerBusy = true;
+        flipSellerBusyEpoch = epoch;
+
+        const isCurrent = () => flipSellerRunning && epoch === flipSellerRunEpoch;
+        const setStatus = html => {
+            const live = document.getElementById('wm-flip-status');
+            const target = live || (statusEl?.isConnected ? statusEl : null);
+            if (target) target.innerHTML = html;
+        };
+
         try {
-            while (flipSellerRunning) {
+            while (isCurrent()) {
                 await syncManualFlipTags();
+                if (!isCurrent()) break;
                 await retryPendingFlipTags();
+                if (!isCurrent()) break;
                 await syncManualFlipTags();
+                if (!isCurrent()) break;
                 await syncFlipSaleResults();
-                if (!flipSellerRunning) break;
+                if (!isCurrent()) break;
 
                 let taggedIds = await fetchFlipTaggedUserCardIds();
+                if (!isCurrent()) break;
                 if (taggedIds == null) {
-                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Tag vente illisible — réessai dans 15s…</span>';
+                    setStatus('<span style="color:#fbbf24;">⚠ Tag vente illisible — réessai dans 15s…</span>');
                     await flipSellerSleep(15000);
                     continue;
                 }
@@ -3712,8 +3734,10 @@
                 // v2.4.6 : AVANT de filtrer `ready`, répare les lignes dont le ledger dit
                 // `vente prêt` mais dont le tag a disparu. Sinon elles sont exclues à vie.
                 const repairedMissing = await repairAllMissingFlipSaleTags(taggedIds).catch(() => 0);
+                if (!isCurrent()) break;
                 if (repairedMissing > 0) {
                     taggedIds = await fetchFlipTaggedUserCardIds();
+                    if (!isCurrent()) break;
                     if (taggedIds == null) {
                         await flipSellerSleep(5000);
                         continue;
@@ -3730,8 +3754,9 @@
                     );
 
                 const state = await fetchSellingState();
+                if (!isCurrent()) break;
                 if (!state) {
-                    if (statusEl) statusEl.innerHTML = '<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>';
+                    setStatus('<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>');
                     await flipSellerSleep(15000);
                     continue;
                 }
@@ -3739,33 +3764,39 @@
                 const slots = Math.max(0, maxActive - state.count);
                 const slotSource = state.countSource === 'db' ? 'base' : '/mine';
                 if (ready.length === 0) {
-                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
+                    setStatus(`<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(15000);
                     continue;
                 }
                 if (slots === 0) {
-                    if (statusEl) statusEl.innerHTML = `<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`;
-                    // v3.6.3 — seul changement de cadence conservé : quand la file attend un slot,
-                    // revérifie rapidement au lieu de laisser un trou jusqu'à 15 s.
+                    setStatus(`<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
                     await flipSellerSleep(4000);
                     continue;
                 }
 
-                // v3.4.3 — ne prend plus seulement `ready.slice(0, slots)` : une carte
-                // non vendable (<15 ventes, erreur ponctuelle...) ne doit pas bloquer celles
-                // placées derrière elle. On parcourt la file jusqu'à remplir les slots ou
-                // épuiser les candidats de CE tour, sans retenter deux fois la même carte.
-                if (statusEl) statusEl.innerHTML = `<span style="color:#06b6d4;">💸 Roulement Flip · jusqu'à ${slots} slot(s) à remplir…</span>`;
+                setStatus(`<span style="color:#06b6d4;">💸 Roulement Flip · jusqu'à ${slots} slot(s) à remplir…</span>`);
                 let ok = 0, fail = 0, blockedMarket = 0, attempted = 0;
                 for (const rec of ready) {
-                    if (!flipSellerRunning || ok >= slots) break;
+                    if (!isCurrent() || ok >= slots) break;
+
+                    const lockKey = String(rec.userCardId || rec.auctionId || '');
+                    if (lockKey && flipListingInFlight.has(lockKey)) continue;
+
                     attempted++;
-                    const r = await listFlipRecord(rec);
-                    if (r.ok) ok++;
+                    if (lockKey) flipListingInFlight.add(lockKey);
+                    let r;
+                    try {
+                        r = await listFlipRecord(rec);
+                    } finally {
+                        if (lockKey) flipListingInFlight.delete(lockKey);
+                    }
+                    if (!isCurrent()) break;
+
+                    if (r?.ok) ok++;
                     else {
                         fail++;
                         if (r?.blockedMarket) blockedMarket++;
-                        rec.lastError = r.reason || 'échec mise en vente';
+                        rec.lastError = r?.reason || 'échec mise en vente';
                         saveFlipLedger();
                         wmLog(
                             r?.blockedMarket
@@ -3775,16 +3806,15 @@
                     }
                     await new Promise(r => setTimeout(r, 800 + Math.random() * 700));
                 }
-                if (statusEl) {
-                    statusEl.innerHTML = attempted > 0 && blockedMarket === attempted && ok === 0
+
+                if (!isCurrent()) break;
+                setStatus(
+                    attempted > 0 && blockedMarket === attempted && ok === 0
                         ? `<span style="color:#fbbf24;">⏳ ${blockedMarket} flip(s) parcouru(s), tous en attente d'au moins ${RECENT_MARKET_MIN_SALES} ventes</span>`
-                        : `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} candidat(s) passé(s)</span>` : ''}`;
-                }
+                        : `<span style="color:#4ade80;">✔ ${ok} flip(s) listé(s)</span>${fail ? ` <span style="color:#888;">· ${fail} candidat(s) passé(s)</span>` : ''}`
+                );
                 renderFlipHistory();
 
-                // Une carte bloquée par manque d'historique reste taguée `vente`, mais on évite
-                // de recharger le Recent Market toutes les 1,5 s. Le cycle périodique de 15 s
-                // la réévaluera automatiquement.
                 const stillReady = flipLedger.some(r => r && r.status === 'tagged' && r.userCardId);
                 const waitMs = blockedMarket > 0 && ok === 0
                     ? 15000
@@ -3792,7 +3822,10 @@
                 await flipSellerSleep(waitMs);
             }
         } finally {
-            flipSellerBusy = false;
+            if (flipSellerBusyEpoch === epoch) {
+                flipSellerBusy = false;
+                flipSellerBusyEpoch = 0;
+            }
         }
     }
 
@@ -20117,11 +20150,16 @@
         function startFlipSeller() {
             if (!flipBtn) return;
             flipSellerRunning = true;
+            const epoch = ++flipSellerRunEpoch;
+            // Réveille une ancienne génération éventuellement endormie : elle verra l'epoch
+            // différent et sortira sans pouvoir lancer un nouveau listing.
+            wakeFlipSeller();
             flipBtn.innerText = '⏹ STOP';
             flipBtn.className = 'wm-btn wm-r wm-sm';
             sessionStorage.setItem('wm_flipseller_active', '1');
-            runFlipSeller(flipBtn, flipStatus).catch(e => {
-                if (flipStatus) flipStatus.textContent = 'Erreur Flip Seller : ' + (e?.message || e);
+            runFlipSeller(flipBtn, flipStatus, epoch).catch(e => {
+                const liveStatus = document.getElementById('wm-flip-status') || flipStatus;
+                if (liveStatus) liveStatus.textContent = 'Erreur Flip Seller : ' + (e?.message || e);
             });
             renderFlipHistory();
         }
@@ -20131,10 +20169,13 @@
                 if (!flipSellerRunning) startFlipSeller();
                 else {
                     flipSellerRunning = false;
+                    ++flipSellerRunEpoch;
+                    wakeFlipSeller();
                     flipBtn.innerText = '▶ START';
                     flipBtn.className = 'wm-btn wm-g wm-sm';
                     sessionStorage.removeItem('wm_flipseller_active');
-                    if (flipStatus) flipStatus.innerHTML = '<span style="color:#888;">Arrêté.</span>';
+                    const liveStatus = document.getElementById('wm-flip-status') || flipStatus;
+                    if (liveStatus) liveStatus.innerHTML = '<span style="color:#888;">Arrêté.</span>';
                     wmLog('⏹ Flip Seller arrêté');
                 }
             };
