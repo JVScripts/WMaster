@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.12';
+    const WM_VERSION = '3.6.13';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -557,7 +557,13 @@
     function scheduleFlipNextListingAt() {
         const now = Date.now();
         const existing = readFlipNextListingAt();
-        if (existing > now) return existing;
+
+        // v3.6.13 — IMPORTANT : une échéance déjà créée reste la source de vérité,
+        // même lorsqu'elle vient d'expirer. En 3.6.12, `existing <= now` recréait ici
+        // immédiatement un nouveau délai 60–90 s ; la boucle n'atteignait donc jamais
+        // la tentative de mise en vente.
+        if (existing > 0) return existing;
+
         const span = FLIP_SLOT_LISTING_DELAY_MAX_MS - FLIP_SLOT_LISTING_DELAY_MIN_MS;
         const delay = FLIP_SLOT_LISTING_DELAY_MIN_MS + Math.floor(Math.random() * (span + 1));
         const due = now + delay;
