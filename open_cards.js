@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.22';
+    const WM_VERSION = '3.6.23b';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1203,7 +1203,13 @@
     function flipHasConfirmedSoldEvidence(rec) {
         if (!rec || typeof rec !== 'object') return false;
         const soldPrice = Number(rec.soldPrice);
-        return !!rec.saleAuctionId && Number.isFinite(soldPrice) && soldPrice > 0;
+        const priceKnown = Number.isFinite(soldPrice) && soldPrice > 0;
+        // v3.6.23 — une vente peut être confirmée manuellement lorsque l'auction_id de vente
+        // a été perdu par une ancienne version. Le flag n'est posé que par wmFlipConfirmSold().
+        return priceKnown && (
+            !!rec.saleAuctionId ||
+            rec.manualSoldConfirmed === true
+        );
     }
 
     function normalizeFlipLedgerRecord(rec) {
@@ -5354,6 +5360,67 @@
         const n = await repairPhantomFlipUiRefusals();
         renderFlipHistory();
         return { repaired: n };
+    };
+
+    window.wmFlipConfirmSold = function (titleOrPurchaseAuctionId, soldPrice) {
+        syncFlipLedgerFromStorage(false);
+
+        const needle = String(titleOrPurchaseAuctionId || '').trim();
+        const price = Number(soldPrice);
+        if (!needle || !Number.isFinite(price) || price <= 0) {
+            console.warn('Usage : wmFlipConfirmSold("Nom de la carte", prixVente)');
+            return { ok: false, reason: 'arguments_invalides' };
+        }
+
+        const matches = flipLedger.filter(rec =>
+            rec && (
+                String(rec.auctionId || '') === needle ||
+                String(rec.title || '') === needle
+            )
+        );
+
+        if (matches.length === 0) {
+            return { ok: false, reason: 'flip_introuvable', recherche: needle };
+        }
+        if (matches.length > 1) {
+            return {
+                ok: false,
+                reason: 'plusieurs_flips_correspondent',
+                matches: matches.map(rec => ({
+                    carte: rec.title,
+                    achat: Number(rec.buyPrice || 0),
+                    auctionIdAchat: rec.auctionId || null,
+                    statut: rec.status
+                }))
+            };
+        }
+
+        const rec = matches[0];
+        rec.status = 'sold';
+        rec.soldPrice = price;
+        rec.soldAt = Date.now();
+        rec.profit = price - Number(rec.buyPrice || 0);
+        rec.lastError = null;
+        rec.userCardId = null;
+        rec.nextTagRetryAt = 0;
+        rec.returningFromUnsold = false;
+        rec.manualSoldConfirmed = true;
+        rec.manualSoldConfirmedAt = Date.now();
+
+        saveFlipLedger();
+        syncSoldFlipToSellHistory(rec);
+        renderFlipHistory();
+
+        const result = {
+            ok: true,
+            carte: rec.title,
+            achat: Number(rec.buyPrice || 0),
+            vendu: price,
+            profit: rec.profit,
+            confirmation: 'manuelle'
+        };
+        console.log('[WikiMasters][Flip] vente confirmée manuellement', result);
+        return result;
     };
 
     window.wmFlipSaleDiag = async function () {
