@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.17';
+    const WM_VERSION = '3.6.18';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1131,6 +1131,13 @@
     // vente déjà confirmée. On fusionne donc le store avant chaque écriture et on considère
     // `soldPrice + saleAuctionId` comme une preuve terminale de vente si un ancien bug a
     // laissé le statut sur `tagged`/`listed`.
+    //
+    // v3.6.18 — une suppression manuelle doit elle aussi être terminale. Avant, la clé supprimée
+    // n'existait qu'en mémoire pendant saveFlipLedger() puis était oubliée : un autre onglet avec
+    // une vieille copie pouvait donc réinjecter la ligne vendue au prochain save. Les suppressions
+    // sont maintenant persistées sous forme de tombstones partagés entre tous les onglets.
+    const FLIP_LEDGER_DELETED_KEY = 'wm_flip_ledger_deleted_v1';
+    const FLIP_LEDGER_DELETED_MAX = 3000;
     const flipLedgerDeletedKeys = new Set();
 
     function flipLedgerRecordKey(rec) {
@@ -1139,6 +1146,59 @@
         if (rec.userCardId) return `u:${rec.userCardId}`;
         return `f:${String(rec.title || '?')}|${Number(rec.boughtAt || 0)}`;
     }
+
+    function readFlipLedgerDeletionTombstones() {
+        try {
+            const raw = JSON.parse(localStorage.getItem(FLIP_LEDGER_DELETED_KEY) || '[]');
+            if (!Array.isArray(raw)) return [];
+            return raw
+                .filter(x => x && typeof x.key === 'string' && x.key)
+                .map(x => ({ key: x.key, deletedAt: Number(x.deletedAt || 0) || 0 }));
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function syncFlipDeletionTombstonesFromStorage(pruneLedger = true) {
+        const rows = readFlipLedgerDeletionTombstones();
+        let added = 0;
+        for (const row of rows) {
+            if (!flipLedgerDeletedKeys.has(row.key)) {
+                flipLedgerDeletedKeys.add(row.key);
+                added++;
+            }
+        }
+
+        let removed = 0;
+        if (pruneLedger && flipLedgerDeletedKeys.size) {
+            const before = flipLedger.length;
+            flipLedger = flipLedger.filter(rec => !flipLedgerDeletedKeys.has(flipLedgerRecordKey(rec)));
+            removed = before - flipLedger.length;
+        }
+        return added + removed;
+    }
+
+    function persistFlipDeletionTombstone(key) {
+        if (!key) return false;
+        const now = Date.now();
+        const rows = readFlipLedgerDeletionTombstones();
+        const byKey = new Map(rows.map(x => [x.key, x]));
+        byKey.set(key, { key, deletedAt: now });
+        const compact = [...byKey.values()]
+            .sort((a, b) => Number(a.deletedAt || 0) - Number(b.deletedAt || 0))
+            .slice(-FLIP_LEDGER_DELETED_MAX);
+        try {
+            localStorage.setItem(FLIP_LEDGER_DELETED_KEY, JSON.stringify(compact));
+        } catch (e) {
+            return false;
+        }
+        flipLedgerDeletedKeys.clear();
+        for (const row of compact) flipLedgerDeletedKeys.add(row.key);
+        return true;
+    }
+
+    // Applique aussi les suppressions persistantes au chargement de cette instance.
+    syncFlipDeletionTombstonesFromStorage(true);
 
     function normalizeFlipLedgerRecord(rec) {
         if (!rec || typeof rec !== 'object') return false;
@@ -1199,6 +1259,9 @@
     }
 
     function syncFlipLedgerFromStorage(render = false) {
+        // Toujours absorber les suppressions partagées avant de fusionner le ledger.
+        syncFlipDeletionTombstonesFromStorage(true);
+
         let stored;
         try {
             stored = JSON.parse(localStorage.getItem(FLIP_LEDGER_KEY) || '[]');
@@ -1249,6 +1312,14 @@
     }
 
     window.addEventListener('storage', e => {
+        if (e.key === FLIP_LEDGER_DELETED_KEY) {
+            const changed = syncFlipDeletionTombstonesFromStorage(true);
+            if (changed) {
+                renderFlipHistory();
+                wakeFlipSeller();
+            }
+            return;
+        }
         if (e.key !== FLIP_LEDGER_KEY) return;
         const changed = syncFlipLedgerFromStorage(true);
         if (changed) wakeFlipSeller();
@@ -1512,13 +1583,16 @@
         try {
             // v3.6.11 : absorbe d'abord les changements venant d'une autre instance/onglet.
             // En particulier, un état `sold` externe est terminal et gagne toujours.
+            // v3.6.18 : absorbe également les tombstones de suppression avant toute fusion.
+            syncFlipDeletionTombstonesFromStorage(true);
             syncFlipLedgerFromStorage(false);
             for (const rec of flipLedger) normalizeFlipLedgerRecord(rec);
             flipLedger = flipLedger.filter(rec => !flipLedgerDeletedKeys.has(flipLedgerRecordKey(rec)));
             flipLedger.sort((a, b) => Number(a.boughtAt || 0) - Number(b.boughtAt || 0));
             flipLedger = flipLedger.slice(-1500);
             localStorage.setItem(FLIP_LEDGER_KEY, JSON.stringify(flipLedger));
-            flipLedgerDeletedKeys.clear();
+            // Ne surtout pas vider flipLedgerDeletedKeys : les suppressions doivent rester
+            // terminales pour empêcher une vieille instance de ressusciter une ligne.
         } catch (e) { }
         renderFlipHistory();
     }
@@ -2939,6 +3013,11 @@
             : '\n\nLe tag vente sera retiré de cet exemplaire si possible.';
         if (!confirm(`Supprimer « ${rec.title || '?'} » du Flip Seller ?${listedNote}`)) return false;
 
+        const deletedKey = flipLedgerRecordKey(rec);
+        // Persiste la suppression AVANT tout appel réseau : un autre onglet est ainsi averti
+        // immédiatement et ne peut plus ressusciter cette ligne pendant le retrait du tag.
+        persistFlipDeletionTombstone(deletedKey);
+
         // Si la carte est encore dans la collection, retirer le tag vente évite de laisser un tag orphelin.
         if (rec.status !== 'listed' && rec.userCardId) {
             const untag = await removeFlipTagFromUserCard(rec.userCardId);
@@ -2947,7 +3026,7 @@
             }
         }
 
-        flipLedgerDeletedKeys.add(flipLedgerRecordKey(rec));
+        flipLedgerDeletedKeys.add(deletedKey);
         flipLedger = flipLedger.filter(r => r !== rec);
         autoFlipCandidates.delete(auctionId);
         saveAutoFlipCandidates();
@@ -5192,7 +5271,8 @@
         const result = {
             version: WM_VERSION,
             memoire: summarize(flipLedger),
-            stockage: summarize(stored)
+            stockage: summarize(stored),
+            suppressionsPersistantes: readFlipLedgerDeletionTombstones().length
         };
         console.log('[WikiMasters][Flip] ledger mémoire vs stockage', result);
         return result;
