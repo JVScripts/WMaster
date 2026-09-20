@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WMaster
 // @namespace    WmMaster bot
-// @version      3.6.19
+// @version      3.6.21
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller — pour wiki-masters.com
 // @author       Snizzle
 // @match        https://www.wiki-masters.com/*

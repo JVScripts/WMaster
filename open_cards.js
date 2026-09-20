@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.19';
+    const WM_VERSION = '3.6.21';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3334,6 +3334,60 @@
         return match;
     }
 
+    // v3.6.21 — fallback same-origin pour le suivi Flip. Les lectures directes de la table
+    // `auctions` peuvent être bloquées par CORS alors que l'API applicative du site reste
+    // accessible. Cette fonction ne regarde que les annonces ACTIVES de la carte et ne crée
+    // aucune vente ; elle sert uniquement à rattacher l'auction_id après un listing UI.
+    async function findActiveSellerAuctionForFlipSameOrigin(rec) {
+        if (!rec?.cardId) return { ok: false, match: null, reason: 'card_id_manquant' };
+        try {
+            const res = await fetch(
+                `${MARKET_API_BASE}?card_id=${encodeURIComponent(rec.cardId)}&limit=50&sort=ending_soon`,
+                { credentials: 'include' }
+            );
+            if (!res.ok) return { ok: false, match: null, reason: `HTTP ${res.status}` };
+            const data = await res.json();
+            const uid = currentUserId();
+            const now = Date.now();
+            const rows = (Array.isArray(data?.auctions) ? data.auctions : [])
+                .filter(a => {
+                    const cid = a?.card_id || a?.card?.id || null;
+                    if (cid !== rec.cardId) return false;
+                    const end = new Date(a?.end_at || NaN).getTime();
+                    if (Number.isFinite(end) && end <= now) return false;
+                    if (a?.status != null && !isActiveSellingStatus(a.status)) return false;
+                    const sellerId = a?.seller_id || a?.seller?.id || a?.seller?.user_id || null;
+                    // Quand l'API expose le vendeur, on exige explicitement notre propre compte.
+                    if (uid && sellerId && String(sellerId) !== String(uid)) return false;
+                    return true;
+                });
+
+            if (rows.length === 0) return { ok: true, match: null };
+
+            // Si l'API ne fournit pas seller_id, on ne retient qu'un candidat suffisamment
+            // spécifique (card_id + rareté + prix) pour éviter d'attraper l'annonce d'un tiers.
+            const withSeller = rows.filter(a => a?.seller_id || a?.seller?.id || a?.seller?.user_id);
+            const pool = withSeller.length > 0 ? withSeller : rows.filter(a => {
+                const rr = String(a?.snapshot_rarity || a?.card?.rarity || '').toUpperCase();
+                const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+                const base = Number(a?.listing_base_amount ?? a?.base_amount);
+                const wantedPrice = Number(rec.listPrice);
+                const rarityOk = !wantedRarity || !rr || rr === wantedRarity;
+                const priceOk = !Number.isFinite(wantedPrice) || wantedPrice <= 0 ||
+                    (Number.isFinite(base) && base === wantedPrice);
+                return rarityOk && priceOk;
+            });
+
+            const match = chooseUniqueFlipAuction(rec, pool, withSeller.length > 0 ? 60 : 130);
+            if (match?.ambiguous) {
+                return { ok: true, match: null, ambiguous: true, count: match.count || 2 };
+            }
+            return { ok: true, match: match || null };
+        } catch (e) {
+            return { ok: false, match: null, reason: e?.message || 'exception réseau' };
+        }
+    }
+
     async function findRecentSoldSellerAuctionForFlip(rec) {
         if (!rec) return null;
 
@@ -3388,6 +3442,7 @@
                     rec.userCardId = null;
                     rec.lastError = null;
                     saveFlipLedger();
+                    syncSoldFlipToSellHistory(rec);
                     return { handled: true, state: 'sold', auctionId: rec.saleAuctionId };
                 }
 
@@ -3410,7 +3465,9 @@
         }
 
         // 2) auctionId perdu : cherche d'abord une vente encore active de cette card_id.
-        const active = await findActiveSellerAuctionForFlip(rec).catch(() => null);
+        // v3.6.21 : API same-origin avant Supabase pour survivre aux blocages CORS.
+        const sameOriginActive = await findActiveSellerAuctionForFlipSameOrigin(rec);
+        const active = sameOriginActive?.match || await findActiveSellerAuctionForFlip(rec).catch(() => null);
         if (active?.id) {
             if (active.card_id && active.card_id !== rec.cardId) {
                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
@@ -3471,6 +3528,7 @@
             rec.userCardId = null;
             rec.lastError = null;
             saveFlipLedger();
+            syncSoldFlipToSellHistory(rec);
 
             wmLog(
                 `💰 Flip Seller : vente retrouvée après coup → <b>${rec.title}</b>` +
@@ -3640,12 +3698,17 @@
         // v2.4.1 : même chemin fiable que le Trash Seller.
         // Le POST direct /api/marketplace est déjà documenté plus bas comme rejeté par le site
         // avec "Vous ne possédez pas cette carte", alors que les contrôles React natifs passent.
+        rec.lastListAttemptAt = Date.now();
+        rec.listPrice = priceInfo.price;
+        saveFlipLedger();
+
         const ui = await sellCardViaUI(
             rec.cardId,
             rec.title,
             rec.rarity,
             priceInfo.price,
-            duration
+            duration,
+            rec.userCardId
         );
 
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
@@ -3676,10 +3739,14 @@
             ? Number(ui.actualDurationMin)
             : duration;
 
+        // Une carte listée n'est plus un exemplaire possédé. Garder l'ancien user_card_id
+        // permettait à des routines de réparation de la remettre par erreur en `tagged`.
+        rec.userCardId = null;
+
         // Une nouvelle vente vient d'être créée : le prochain calcul des slots doit relire
         // immédiatement l'état au lieu de réutiliser le cache précédent.
         invalidateSalesDetail();
-        rec.listedAt = Date.now();
+        rec.listedAt = Number(rec.lastListAttemptAt) || Date.now();
 
         rec.lastError = ui.anomaly
             ? ui.anomaly
@@ -3689,9 +3756,20 @@
 
         saveFlipLedger();
 
-        // v3.6.10 — si l'intercepteur n'a pas capturé l'auction_id lors du POST UI,
-        // rattache immédiatement l'annonce active fraîchement créée. Cela évite de laisser
-        // un Flip en `listed` orphelin jusqu'à sa vente, état ensuite plus difficile à réconcilier.
+        // v3.6.21 — rattachement same-origin EN PREMIER : ne dépend pas de CORS Supabase.
+        if (!rec.saleAuctionId) {
+            const localApi = await findActiveSellerAuctionForFlipSameOrigin(rec);
+            const linked = localApi?.match;
+            if (linked?.id) {
+                rec.saleAuctionId = linked.id;
+                rec.lastError = null;
+                const createdTs = new Date(linked.created_at || NaN).getTime();
+                if (Number.isFinite(createdTs)) rec.listedAt = createdTs;
+                saveFlipLedger();
+            }
+        }
+
+        // Filet historique via la base si elle reste accessible.
         if (!rec.saleAuctionId) {
             const linked = await findActiveSellerAuctionForFlip(rec).catch(() => null);
             if (linked?.id) {
@@ -3935,8 +4013,99 @@
     }
 
 
+    let _flipPhantomRefusalRepairBusy = false;
+    async function repairPhantomFlipUiRefusals() {
+        if (_flipPhantomRefusalRepairBusy) return 0;
+        const targets = flipLedger.filter(r =>
+            r && r.status === 'tagged' && r.userCardId &&
+            r.lastError === 'mise en vente refusée par le site' &&
+            Number(r.listPrice || 0) > 0
+        ).slice(0, 4);
+        if (targets.length === 0) return 0;
+
+        _flipPhantomRefusalRepairBusy = true;
+        let repaired = 0;
+        try {
+            for (const rec of targets) {
+                const oldUserCardId = rec.userCardId;
+                invalidateFlipOwnedCollectionSnapshot();
+                const owned = await verifyOwnedFlipUserCardId(oldUserCardId).catch(() => null);
+                if (owned?.id) continue; // vrai refus : la carte est encore chez nous
+
+                // Le clic de lancement a retiré l'exemplaire de la collection : ce n'était pas
+                // un refus. Cherche d'abord l'annonce active via l'API du site.
+                const probe = await findActiveSellerAuctionForFlipSameOrigin(rec);
+                if (!probe?.ok || probe?.ambiguous) {
+                    // Impossible de distinguer active/vendue sans source fiable : on ne devine pas.
+                    continue;
+                }
+
+                if (probe.match?.id) {
+                    const a = probe.match;
+                    rec.status = 'listed';
+                    rec.saleAuctionId = a.id;
+                    rec.userCardId = null;
+                    rec.lastError = null;
+                    const base = Number(a.listing_base_amount ?? a.base_amount);
+                    if (Number.isFinite(base) && base > 0) rec.listPrice = base;
+                    const createdTs = new Date(a.created_at || NaN).getTime();
+                    rec.listedAt = Number.isFinite(createdTs)
+                        ? createdTs
+                        : (Number(rec.lastListAttemptAt) || Date.now());
+                    const dur = actualAuctionDurationMinutes(a);
+                    if (Number.isFinite(dur) && dur > 0) rec.listDurationMin = dur;
+                    repaired++;
+                    wmLog(`🧭 Flip Seller : faux refus réparé → <b>${rec.title}</b> retrouvée en vente.`);
+                    saveFlipLedger();
+                    continue;
+                }
+
+                // L'API active a répondu correctement, aucune annonce n'existe, et l'exemplaire
+                // lancé n'est plus dans la collection. Pour éviter un faux "vendu" pendant les
+                // quelques secondes d'indexation de la marketplace, on exige aussi que la tentative
+                // ne soit plus fraîche. Les vieux enregistrements 3.6.20 (sans lastListAttemptAt)
+                // utilisent boughtAt comme borne conservatrice.
+                const attemptRef = Number(rec.lastListAttemptAt || rec.listedAt || rec.boughtAt || 0);
+                if (attemptRef > 0 && Date.now() - attemptRef < 90_000) {
+                    rec.status = 'listed';
+                    rec.userCardId = null;
+                    rec.lastError = 'listing probablement accepté · attente identification enchère';
+                    rec.listedAt = Number(rec.lastListAttemptAt || rec.listedAt || Date.now());
+                    saveFlipLedger();
+                    repaired++;
+                    continue;
+                }
+
+                // Hors fenêtre d'indexation : la carte n'est ni possédée ni encore active.
+                // On la classe vendue, mais sans inventer un prix final.
+                rec.status = 'sold';
+                rec.saleAuctionId = rec.saleAuctionId || null;
+                rec.userCardId = null;
+                rec.soldPrice = Number.isFinite(Number(rec.soldPrice)) && Number(rec.soldPrice) > 0
+                    ? Number(rec.soldPrice)
+                    : null;
+                rec.soldAt = Date.now();
+                rec.profit = Number.isFinite(Number(rec.soldPrice))
+                    ? Number(rec.soldPrice) - Number(rec.buyPrice || 0)
+                    : null;
+                rec.lastError = rec.soldPrice
+                    ? null
+                    : 'vendue · prix final indisponible (auction_id non capturé)';
+                repaired++;
+                saveFlipLedger();
+                syncSoldFlipToSellHistory(rec);
+                wmLog(`💰 Flip Seller : faux refus réparé → <b>${rec.title}</b> classée vendue${rec.soldPrice ? ` · ${rec.soldPrice} 💰` : ' · prix final indisponible'}.`);
+            }
+        } finally {
+            _flipPhantomRefusalRepairBusy = false;
+        }
+        if (repaired) renderFlipHistory();
+        return repaired;
+    }
+
     async function syncFlipSaleResults() {
         syncFlipLedgerFromStorage(false);
+        await repairPhantomFlipUiRefusals().catch(() => 0);
         // v3.6.10 — priorité absolue aux ventes ayant un auction_id exact. Avant, les ventes
         // orphelines étaient réconciliées EN PREMIER et pouvaient bloquer cette fonction ; de
         // même, le retour d'un invendu était `await` malgré le commentaire disant l'inverse.
@@ -3967,6 +4136,7 @@
                             rec.userCardId = null;
                             rec.lastError = null;
                             changed = true;
+                            syncSoldFlipToSellHistory(rec);
                             wmLog(`💰 Flip vendu : <b>${rec.title}</b> · achat ${rec.buyPrice} → vente <b>${fp} 💰</b> · résultat <b style="color:${rec.profit >= 0 ? '#4ade80' : '#ef4444'};">${rec.profit >= 0 ? '+' : ''}${rec.profit} 💰</b>.`);
                             continue;
                         }
@@ -3996,6 +4166,7 @@
                             rec.userCardId = null;
                             rec.lastError = null;
                             changed = true;
+                            syncSoldFlipToSellHistory(rec);
                             wmLog(`💰 Flip vendu (confirmation tardive) : <b>${rec.title}</b> → <b>${confirmFp} 💰</b>.`);
                             continue;
                         }
@@ -5147,6 +5318,12 @@
         console.table(result);
         if (sample.length) console.table(sample);
         return { ...result, sample };
+    };
+
+    window.wmFlipRepairPhantomSales = async function () {
+        const n = await repairPhantomFlipUiRefusals();
+        renderFlipHistory();
+        return { repaired: n };
     };
 
     window.wmFlipSaleDiag = async function () {
@@ -15294,7 +15471,7 @@
         return Math.round((end - start) / 60000);
     }
 
-    async function sellCardViaUI(cardId, title, rarity, price, duration) {
+    async function sellCardViaUI(cardId, title, rarity, price, duration, userCardId = null) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
         const requestedPrice = Math.max(1, Math.round(Number(price) || 0));
@@ -15440,17 +15617,59 @@
         _lastUiListingAuctionId = null;
         launchBtn.click();
 
-        await new Promise(r => setTimeout(r, 900));
+        // v3.6.20 — le site peut mettre plusieurs secondes à valider la création.
+        // L'ancien délai fixe de 900 ms produisait de faux "mise en vente refusée" alors
+        // que React était simplement encore en train d'attendre la réponse. On attend maintenant
+        // jusqu'à 8 s une PREUVE de succès : id intercepté, navigation marketplace, ou fermeture
+        // réelle du modal. Aucune seconde tentative n'est lancée pendant cette attente.
+        const acceptStartedAt = Date.now();
+        let createdAuctionId = null;
+        let listingAccepted = false;
 
-        // Si le modal existe encore, le site a refusé ou n'a pas encore accepté le listing.
-        if (document.body.contains(launchBtn)) {
+        while (Date.now() - acceptStartedAt < 8000) {
+            if (_lastUiListingAuctionId) {
+                createdAuctionId = _lastUiListingAuctionId;
+                listingAccepted = true;
+                break;
+            }
+
+            const m = location.pathname.match(/\/marketplace\/([0-9a-f-]{20,})/i);
+            if (m) {
+                createdAuctionId = m[1];
+                listingAccepted = true;
+                break;
+            }
+
+            const currentModal = findAuctionSellModal();
+            if (!launchBtn.isConnected || !currentModal) {
+                listingAccepted = true;
+                break;
+            }
+
+            await new Promise(r => setTimeout(r, 150));
+        }
+
+        if (!listingAccepted && userCardId) {
+            // v3.6.21 — le modal peut rester affiché alors que le POST a réellement réussi.
+            // La preuve la plus fiable côté client est alors la disparition de CET exemplaire
+            // de /api/my-collection. On ne relance surtout pas une deuxième vente.
+            invalidateFlipOwnedCollectionSnapshot();
+            const stillOwned = await verifyOwnedFlipUserCardId(userCardId).catch(() => null);
+            if (!stillOwned) {
+                listingAccepted = true;
+            }
+        }
+
+        if (!listingAccepted) {
             return { ok: false, reason: 'modal_still_open' };
         }
 
-        let createdAuctionId = _lastUiListingAuctionId;
         if (!createdAuctionId) {
-            const m = location.pathname.match(/\/marketplace\/([0-9a-f-]{20,})/i);
-            if (m) createdAuctionId = m[1];
+            createdAuctionId = _lastUiListingAuctionId;
+            if (!createdAuctionId) {
+                const m = location.pathname.match(/\/marketplace\/([0-9a-f-]{20,})/i);
+                if (m) createdAuctionId = m[1];
+            }
         }
 
         let actualPrice = requestedPrice;
@@ -16438,6 +16657,61 @@
                 recoverMissingSaleAuctionIds().catch(() => { });
             }, 1200);
         }
+    }
+
+
+    // v3.6.21 — les ventes Flip ont leur propre ledger et n'étaient historiquement pas
+    // reportées dans l'Historique des ventes. Synchronise une vente TERMINÉE, sans passer par
+    // la logique de re-tag Trash des ventes ordinaires.
+    function syncSoldFlipToSellHistory(rec) {
+        if (!rec || rec.status !== 'sold') return null;
+
+        const flipKey = String(rec.auctionId || ''); // auction d'achat = identifiant stable du flip
+        let row = null;
+        if (rec.saleAuctionId) {
+            row = sellHistory.find(s => s?.auctionId === rec.saleAuctionId) || null;
+        }
+        if (!row && flipKey) {
+            row = sellHistory.find(s => s?.source === 'flip' && s?.flipPurchaseAuctionId === flipKey) || null;
+        }
+
+        const soldPrice = Number(rec.soldPrice);
+        const priceKnown = Number.isFinite(soldPrice) && soldPrice > 0;
+
+        if (!row) {
+            row = {
+                title: rec.title || '?',
+                rarity: String(rec.rarity || rec.purchaseRarity || 'C').toUpperCase(),
+                price: Number(rec.listPrice || rec.soldPrice || 0) || 0,
+                finalPrice: priceKnown ? soldPrice : null,
+                status: 'sold',
+                auctionId: rec.saleAuctionId || null,
+                userCardId: null,
+                cardId: rec.cardId || rec.purchaseCardId || null,
+                timestamp: Number(rec.soldAt || rec.listedAt || Date.now()),
+                source: 'flip',
+                flipPurchaseAuctionId: flipKey || null,
+                finalPriceUnknown: !priceKnown
+            };
+            sellHistory.push(row);
+        } else {
+            row.status = 'sold';
+            row.source = row.source || 'flip';
+            row.flipPurchaseAuctionId = row.flipPurchaseAuctionId || flipKey || null;
+            row.auctionId = row.auctionId || rec.saleAuctionId || null;
+            row.cardId = row.cardId || rec.cardId || rec.purchaseCardId || null;
+            row.userCardId = null;
+            if (priceKnown) {
+                row.finalPrice = soldPrice;
+                row.finalPriceUnknown = false;
+            }
+        }
+
+        // Ne crédite les statistiques que lorsqu'un vrai prix final est connu.
+        if (priceKnown) creditSoldSale(row, soldPrice);
+        saveSellHistory();
+        renderSellHistory();
+        return row;
     }
 
     const SUPABASE_REF = "cyrxjeppjqsxxjayfrur";
@@ -19183,7 +19457,7 @@
         const soldItems = sessionSales.filter(s => s.status === 'sold');
         const unsoldItems = sessionSales.filter(s => s.status === 'unsold');
         const pendingItems = sessionSales.filter(s => s.status === 'pending');
-        const totalGained = soldItems.reduce((a, b) => a + (b.finalPrice || b.price), 0);
+        const totalGained = soldItems.reduce((a, b) => a + (b.finalPriceUnknown ? 0 : (b.finalPrice || b.price || 0)), 0);
 
         // Stats par rareté — moyenne du PRIX RÉEL de vente (finalPrice), pas du prix de base
         const byRarity = {};
@@ -19192,8 +19466,10 @@
             // minuscules : sans ça « SR » et « sr » feraient deux colonnes distinctes.
             const r = (s.rarity || '').toUpperCase();
             if (!byRarity[r]) byRarity[r] = { count: 0, total: 0 };
-            byRarity[r].count++;
-            byRarity[r].total += (s.finalPrice ?? s.price);
+            if (!s.finalPriceUnknown) {
+                byRarity[r].count++;
+                byRarity[r].total += (s.finalPrice ?? s.price ?? 0);
+            }
         });
 
         // Toujours de la plus rare à la plus commune (L → C). Sans ce tri, Object.entries
@@ -19201,6 +19477,7 @@
         // Une rareté inconnue (hors RARITY_ORDER) atterrit en fin de ligne plutôt que
         // de disparaître.
         const rarityRows = Object.entries(byRarity)
+            .filter(([, d]) => d.count > 0)
             .sort((a, b) => (RARITY_ORDER[b[0]] ?? -1) - (RARITY_ORDER[a[0]] ?? -1))
             .map(([r, d]) => {
                 const rc = RARITY[r] || { color: "#aaa" };
