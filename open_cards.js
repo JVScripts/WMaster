@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.14';
+    const WM_VERSION = '3.6.16';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -275,6 +275,14 @@
     let sessionStart = null;
     let timerInterval = null;
     let minimized = false;
+
+    // v3.6.15 — garde locale contre le curseur de régénération serveur périmé.
+    // Certains retours /api/packs/open peuvent exposer un last_regen très ancien alors
+    // que packs_remaining reste élevé. Le bot n'essaie pas de "rattraper" ce curseur :
+    // il autorise seulement le stock déjà observé, puis repasse au rythme normal du cooldown.
+    const PACK_REGEN_GUARD_KEY = 'wm_pack_regen_guard_v1';
+    let packLastServerState = null;
+
 
     let marketWatcherInterval = null;
     let salesMonitorInterval = null;
@@ -593,6 +601,81 @@
     function wakeFlipSeller() {
         const wake = flipSellerWakeResolver;
         if (wake) wake();
+    }
+
+    // v3.6.16 — déclenchement par changement du compteur de ventes actives.
+    // Le Flip Seller ne sonde plus /mine toutes les 4 s quand on est à 5/5 : il réutilise
+    // le refresh normal des ventes actives (30 s). Quand le compteur passe de plein à < max,
+    // ou baisse encore alors qu'un slot est déjà libre, on réveille le seller. Aucune requête
+    // supplémentaire n'est créée pour surveiller les slots.
+    let flipObservedSellingCount = null;
+    let flipObservedSellingMax = null;
+    const FLIP_SLOT_EVENT_IDLE_SLEEP_MS = 10 * 60 * 1000;
+
+    function noteFlipSellingState(count, maxActive, triggerOnDrop = true) {
+        const c = Number(count);
+        const m = Number(maxActive);
+        if (!Number.isFinite(c) || !Number.isFinite(m) || m <= 0) return false;
+
+        const prevCount = Number.isFinite(flipObservedSellingCount)
+            ? flipObservedSellingCount
+            : null;
+        const prevMax = Number.isFinite(flipObservedSellingMax)
+            ? flipObservedSellingMax
+            : m;
+
+        const wasFull = prevCount != null && prevCount >= prevMax;
+        const countDropped = prevCount != null && c < prevCount;
+        const becameFree = c < m && (prevCount == null || wasFull || countDropped);
+
+        flipObservedSellingCount = c;
+        flipObservedSellingMax = m;
+
+        if (c >= m) {
+            // Si le slot a été rempli manuellement ou par un autre module pendant le délai,
+            // l'échéance n'a plus lieu d'être.
+            clearFlipNextListingAt();
+        } else if (triggerOnDrop && becameFree) {
+            // Ne pas recréer l'échéance ici : si un deuxième slot se libère pendant qu'une
+            // première mise en vente est déjà planifiée, on conserve le premier délai. Après
+            // cette vente, le compteur estimé restera < max et un nouveau délai sera créé.
+            wakeFlipSeller();
+        }
+
+        return becameFree;
+    }
+
+    async function waitFlipListingDeadlinePassive(nextListingAt, slots, setStatus, isCurrent) {
+        const due = Number(nextListingAt) || 0;
+        if (!(due > Date.now())) return;
+
+        await new Promise(resolve => {
+            let finished = false;
+            let intervalId = null;
+            let timeoutId = null;
+
+            const finish = () => {
+                if (finished) return;
+                finished = true;
+                if (intervalId) clearInterval(intervalId);
+                if (timeoutId) clearTimeout(timeoutId);
+                resolve();
+            };
+
+            const tick = () => {
+                if (!isCurrent()) return finish();
+                const remainingMs = due - Date.now();
+                if (remainingMs <= 0) return finish();
+                setStatus(
+                    `<span style="color:#06b6d4;">💸 ${slots} slot(s) libre(s)</span>` +
+                    `<span style="color:#888;"> · prochaine mise en vente dans ~${Math.max(1, Math.ceil(remainingMs / 1000))} s</span>`
+                );
+            };
+
+            tick();
+            intervalId = setInterval(tick, 1000); // affichage uniquement : zéro requête réseau
+            timeoutId = setTimeout(finish, Math.max(0, due - Date.now()));
+        });
     }
 
     function getFlipMarkupPct() {
@@ -3985,9 +4068,25 @@
                 // ou réécrire une carte déjà vendue.
                 syncFlipLedgerFromStorage(false);
 
-                // v3.6.8 — chemin critique minimal : aucune maintenance secondaire ne doit
-                // retarder une carte déjà `tagged`. Les retries de tag et la synchro des ventes
-                // terminées tournent déjà toutes les 15 s dans le timer dédié.
+                // v3.6.16 — si le dernier compteur connu dit 5/5, aucune raison de refaire
+                // un GET /mine toutes les quelques secondes. Le refresh normal des ventes actives
+                // appellera noteFlipSellingState() et réveillera cette boucle lorsque le compteur
+                // tombera réellement à 4/5 (ou moins).
+                if (
+                    Number.isFinite(flipObservedSellingCount) &&
+                    Number.isFinite(flipObservedSellingMax) &&
+                    flipObservedSellingCount >= flipObservedSellingMax &&
+                    readFlipNextListingAt() <= 0
+                ) {
+                    setStatus(
+                        `<span style="color:#888;">⏳ ${flipObservedSellingCount}/${flipObservedSellingMax} ventes actives · attente d'un slot libre…</span>`
+                    );
+                    await flipSellerSleep(FLIP_SLOT_EVENT_IDLE_SLEEP_MS);
+                    continue;
+                }
+
+                // Chemin critique minimal : aucune maintenance secondaire ne doit retarder une
+                // carte déjà `tagged`.
                 setStatus('<span style="color:#888;">💸 Lecture des tags vente…</span>');
 
                 const taggedIds = await fetchFlipTaggedUserCardIds();
@@ -4013,57 +4112,82 @@
 
                 const ready = flipLedger
                     .filter(r => r && r.status === 'tagged' && r.userCardId && taggedIds.has(r.userCardId))
-                    // v3.4.3 — vraie file FIFO/round-robin persistante, indépendante de boughtAt.
-                    // Un invendu reçoit un nouveau queueAt et passe derrière les cartes en attente.
                     .sort((a, b) =>
                         flipQueueOrder(a) - flipQueueOrder(b) ||
                         Number(a.boughtAt || 0) - Number(b.boughtAt || 0)
                     );
 
-                setStatus(`<span style="color:#888;">💸 ${ready.length} flip(s) prêt(s) · vérification des slots…</span>`);
+                // Normalement le compteur est déjà alimenté par refreshActiveSales() (30 s).
+                // Au tout premier démarrage seulement, s'il est encore inconnu, on fait UNE
+                // lecture rapide pour initialiser l'état.
+                let slotCount = flipObservedSellingCount;
+                let maxActive = flipObservedSellingMax;
+                let slotSource = 'suivi ventes actives';
+
+                if (!Number.isFinite(slotCount) || !Number.isFinite(maxActive)) {
+                    setStatus(`<span style="color:#888;">💸 ${ready.length} flip(s) prêt(s) · initialisation des slots…</span>`);
+                    const initialState = await fetchSellingSlotStateFast();
+                    if (!isCurrent()) break;
+                    if (!initialState) {
+                        setStatus('<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>');
+                        await flipSellerSleep(15000);
+                        continue;
+                    }
+                    maxActive = effectiveMaxActive(initialState.max);
+                    slotCount = initialState.count;
+                    slotSource = initialState.countSource === 'db' || initialState.countSource === 'db-cache' ? 'base' : '/mine';
+                    noteFlipSellingState(slotCount, maxActive, false);
+                }
+
+                let slots = Math.max(0, maxActive - slotCount);
+
+                if (ready.length === 0) {
+                    clearFlipNextListingAt();
+                    setStatus(`<span style="color:#888;">💸 Aucun vente prêt · ${slotCount}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
+                    await flipSellerSleep(15000);
+                    continue;
+                }
+
+                if (slots === 0) {
+                    clearFlipNextListingAt();
+                    noteFlipSellingState(slotCount, maxActive, false);
+                    setStatus(`<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${slotCount}/${maxActive} ventes actives · attente d'un slot libre…</span>`);
+                    await flipSellerSleep(FLIP_SLOT_EVENT_IDLE_SLEEP_MS);
+                    continue;
+                }
+
+                // Un slot libre a été signalé par le compteur des ventes actives. On programme
+                // une seule mise en vente 18–33 s plus tard. Pendant cette attente, le timer UI
+                // se met à jour localement mais AUCUNE vérification réseau de slot n'est faite.
+                const nextListingAt = scheduleFlipNextListingAt();
+                await waitFlipListingDeadlinePassive(nextListingAt, slots, setStatus, isCurrent);
+                if (!isCurrent()) break;
+
+                // Une seule vérification au moment où l'échéance arrive : si quelqu'un a rempli
+                // le slot entre-temps, on ne liste rien. Sinon on utilise ce snapshot pour
+                // calculer combien de places restent réellement.
+                setStatus('<span style="color:#06b6d4;">💸 Échéance atteinte · confirmation du slot libre…</span>');
                 const state = await fetchSellingSlotStateFast();
                 if (!isCurrent()) break;
                 if (!state) {
-                    setStatus('<span style="color:#fbbf24;">⚠ Ventes actives illisibles — réessai dans 15s…</span>');
-                    await flipSellerSleep(15000);
-                    continue;
-                }
-                const maxActive = effectiveMaxActive(state.max);
-                const slots = Math.max(0, maxActive - state.count);
-                const slotSource = state.countSource === 'db' || state.countSource === 'db-cache' ? 'base' : '/mine';
-                if (ready.length === 0) {
-                    // Pas de candidat prêt : le prochain slot disponible devra repartir avec
-                    // un délai complet 18–33 s lorsqu'un candidat redeviendra vendable.
                     clearFlipNextListingAt();
-                    setStatus(`<span style="color:#888;">💸 Aucun vente prêt · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
+                    setStatus('<span style="color:#fbbf24;">⚠ Vérification du slot impossible — nouveau délai au prochain passage…</span>');
                     await flipSellerSleep(15000);
                     continue;
                 }
+
+                maxActive = effectiveMaxActive(state.max);
+                slotCount = state.count;
+                noteFlipSellingState(slotCount, maxActive, false);
+                slots = Math.max(0, maxActive - slotCount);
+
                 if (slots === 0) {
-                    // Tant que tous les slots sont occupés il n'y a rien à minuter. Lorsque
-                    // le prochain slot se libérera, on démarrera alors un NOUVEAU délai 18–33 s.
                     clearFlipNextListingAt();
-                    setStatus(`<span style="color:#888;">⏳ ${ready.length} flip(s) prêt(s) · ${state.count}/${maxActive} ventes actives <span style="color:#555;">(${slotSource})</span></span>`);
-                    await flipSellerSleep(4000);
+                    setStatus(`<span style="color:#888;">⏳ ${slotCount}/${maxActive} ventes actives · le slot a déjà été repris.</span>`);
                     continue;
                 }
 
-                // v3.6.12 — un slot vient d'être observé libre. On programme UNE seule mise
-                // en vente dans 18–33 s. Le sleep peut être réveillé par d'autres événements,
-                // mais le timestamp absolu reste la source de vérité et empêche tout départ
-                // anticipé (c'était la cause des écarts observés autour de 25 s en v3.6.9/11).
-                const nextListingAt = scheduleFlipNextListingAt();
-                const remainingMs = nextListingAt - Date.now();
-                if (remainingMs > 0) {
-                    setStatus(
-                        `<span style="color:#06b6d4;">💸 ${slots} slot(s) libre(s)</span>` +
-                        `<span style="color:#888;"> · prochaine mise en vente dans ~${Math.max(1, Math.ceil(remainingMs / 1000))} s</span>`
-                    );
-                    await flipSellerSleep(Math.min(4000, remainingMs));
-                    continue;
-                }
-
-                setStatus(`<span style="color:#06b6d4;">💸 Slot libre · tentative d'une mise en vente…</span>`);
+                setStatus(`<span style="color:#06b6d4;">💸 ${slots} slot(s) libre(s) confirmé(s) · tentative d'une mise en vente…</span>`);
                 let ok = 0, fail = 0, blockedMarket = 0, attempted = 0;
                 for (const rec of ready) {
                     if (!isCurrent() || ok >= 1) break;
@@ -4083,11 +4207,15 @@
 
                     if (r?.ok) {
                         ok++;
-                        // Une seule vente réussie par passage. On efface l'échéance : la boucle
-                        // relira ensuite le vrai nombre de slots. S'il en reste un libre, elle
-                        // créera un nouveau délai 18–33 s ; si tout est plein, aucun chrono ne
-                        // tourne et le délai ne commencera qu'au prochain slot réellement libre.
                         clearFlipNextListingAt();
+
+                        // On connaît localement l'effet de notre propre listing : +1 vente active.
+                        // Cela évite un GET supplémentaire juste après. S'il reste encore un slot
+                        // libre (ex. on était à 3/5), le passage suivant créera simplement un
+                        // nouveau délai 18–33 s. À 5/5, la boucle se rendort jusqu'au prochain
+                        // changement de compteur observé par le refresh normal des ventes.
+                        const estimatedCount = Math.min(maxActive, slotCount + 1);
+                        noteFlipSellingState(estimatedCount, maxActive, false);
                         break;
                     } else {
                         fail++;
@@ -4103,8 +4231,8 @@
                     }
                 }
 
-                // Si aucune carte n'a pu être créée malgré le slot libre, évite de marteler
-                // immédiatement le site : on repart sur un nouveau délai complet avant un retry.
+                // Si aucune carte n'a pu être créée malgré le slot libre, le prochain retry
+                // repartira sur un nouveau délai 18–33 s, sans polling intermédiaire.
                 if (ok === 0) clearFlipNextListingAt();
 
                 if (!isCurrent()) break;
@@ -8704,6 +8832,129 @@
     async function sleep(ms) {
         return sleepUntil(Date.now() + ms);
     }
+
+    function readPackRegenGuard() {
+        try {
+            const g = JSON.parse(localStorage.getItem(PACK_REGEN_GUARD_KEY) || 'null');
+            if (!g || typeof g !== 'object') return null;
+            return g;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    function writePackRegenGuard(g) {
+        try {
+            if (!g) localStorage.removeItem(PACK_REGEN_GUARD_KEY);
+            else localStorage.setItem(PACK_REGEN_GUARD_KEY, JSON.stringify(g));
+        } catch (e) { }
+    }
+
+    function extractPackLastRegenMs(data) {
+        if (!data || typeof data !== 'object') return NaN;
+        const raw = data.last_regen ?? data.last_regen_at ?? data.lastRegen ?? data.regen_at ?? null;
+        if (raw == null || raw === '') return NaN;
+        if (typeof raw === 'number' && Number.isFinite(raw)) {
+            return raw < 10_000_000_000 ? raw * 1000 : raw;
+        }
+        const ts = new Date(raw).getTime();
+        return Number.isFinite(ts) ? ts : NaN;
+    }
+
+    function packCooldownMs() {
+        const sec = Math.max(30, Number(getSetting('packCooldown')) || 180);
+        return sec * 1000;
+    }
+
+    function inspectPackServerState(data) {
+        const now = Date.now();
+        const cooldownMs = packCooldownMs();
+        const regenTs = extractPackLastRegenMs(data);
+        const remaining = Number(data?.packs_remaining);
+        const ageMs = Number.isFinite(regenTs) ? Math.max(0, now - regenTs) : NaN;
+        // Deux cooldowns de marge : évite de déclencher le garde sur un simple retard réseau.
+        const stale = Number.isFinite(ageMs) && ageMs > cooldownMs * 2;
+        packLastServerState = {
+            at: now,
+            lastRegenRaw: data?.last_regen ?? data?.last_regen_at ?? data?.lastRegen ?? data?.regen_at ?? null,
+            lastRegenMs: Number.isFinite(regenTs) ? regenTs : null,
+            ageMs: Number.isFinite(ageMs) ? ageMs : null,
+            packsRemaining: Number.isFinite(remaining) ? remaining : null,
+            cooldownMs,
+            stale
+        };
+        return packLastServerState;
+    }
+
+    function updatePackRegenGuardAfterOpen(data) {
+        const st = inspectPackServerState(data);
+        const remaining = Math.max(0, Number(st.packsRemaining) || 0);
+        const now = Date.now();
+
+        if (!st.stale) {
+            if (readPackRegenGuard()) writePackRegenGuard(null);
+            return { stale: false, budget: null, nextAllowedAt: 0, state: st };
+        }
+
+        let g = readPackRegenGuard();
+        if (!g || !g.active) {
+            // Premier constat anormal : le nombre renvoyé après CETTE ouverture devient le
+            // budget maximum encore autorisé à cadence rapide. Ainsi un stock réellement
+            // accumulé peut être vidé, mais un curseur serveur bloqué ne crée pas une boucle infinie.
+            g = {
+                active: true,
+                detectedAt: now,
+                bankBudget: remaining,
+                lastOpenAt: now,
+                nextAllowedAt: 0,
+                lastServerRegenMs: st.lastRegenMs,
+                lastServerRemaining: remaining
+            };
+            wmLog(`⚠️ Packs : horodatage serveur ancien détecté (${Math.round((st.ageMs || 0) / 60000)} min). Garde locale activée · ${remaining} pack(s) de stock observé restant(s).`);
+        } else {
+            const oldBudget = Math.max(0, Number(g.bankBudget) || 0);
+            const consumedBudget = Math.max(0, oldBudget - 1);
+            g.bankBudget = Math.min(consumedBudget, remaining);
+            g.lastOpenAt = now;
+            g.lastServerRegenMs = st.lastRegenMs;
+            g.lastServerRemaining = remaining;
+        }
+
+        if (Number(g.bankBudget) <= 0) {
+            g.bankBudget = 0;
+            g.nextAllowedAt = Math.max(Number(g.nextAllowedAt) || 0, now + st.cooldownMs);
+        } else {
+            g.nextAllowedAt = 0;
+        }
+
+        writePackRegenGuard(g);
+        return { stale: true, budget: g.bankBudget, nextAllowedAt: g.nextAllowedAt || 0, state: st };
+    }
+
+    function getPackRegenGuardWait() {
+        const g = readPackRegenGuard();
+        if (!g?.active || Number(g.bankBudget) > 0) return 0;
+        return Math.max(0, Number(g.nextAllowedAt || 0) - Date.now());
+    }
+
+    function armNextPackGuardCooldown() {
+        const g = readPackRegenGuard();
+        if (!g?.active || Number(g.bankBudget) > 0) return;
+        g.nextAllowedAt = Date.now() + packCooldownMs();
+        writePackRegenGuard(g);
+    }
+
+    window.wmPackRegenDiag = function () {
+        const g = readPackRegenGuard();
+        return {
+            version: WM_VERSION,
+            serveur: packLastServerState,
+            garde: g,
+            attenteRestanteSec: g?.active && Number(g.bankBudget) <= 0
+                ? Math.max(0, Math.ceil((Number(g.nextAllowedAt || 0) - Date.now()) / 1000))
+                : 0
+        };
+    };
 
     // === Calcul de la prochaine mise minimale ===
     // - Pas de mise en cours → base_amount exactement (être 1er bidder = égaliser la base)
@@ -14263,14 +14514,21 @@
         lastActiveSales = auctions;
         updateBidsSumDisplay();
 
-        const el = document.getElementById('wm-active-sales');
-        const lblCount = document.getElementById('wm-active-sales-count');
-        if (!el) return;
-
         // Le compteur serveur prime : il reste juste même quand le détail n'est pas fourni.
         const count = state && Number.isFinite(state.count) ? state.count : auctions.length;
         const maxA = effectiveMaxActive(state && state.max);
+
+        // v3.6.16 — seul le refresh COMPLET (avec `state.count`) sert de signal de slots.
+        // Les petits refreshs 2 s du prix/meneur peuvent avoir une liste détaillée partielle :
+        // on ne les laisse donc jamais fabriquer un faux 5/5 → 3/5.
+        if (state && Number.isFinite(state.count)) {
+            noteFlipSellingState(count, maxA, true);
+        }
+
+        const el = document.getElementById('wm-active-sales');
+        const lblCount = document.getElementById('wm-active-sales-count');
         if (lblCount) lblCount.innerText = `${count}/${maxA}`;
+        if (!el) return;
 
         if (auctions.length === 0) {
             // Distinguer « rien en vente » de « le serveur en annonce N mais ne les détaille
@@ -23416,12 +23674,29 @@
                     await new Promise(r => setTimeout(r, 5000));
                     continue;
                 }
+
+                // v3.6.15 : si le serveur garde un last_regen ancien après épuisement du
+                // stock réellement observé, on ne le laisse pas provoquer des ouvertures
+                // rapprochées. Une seule ouverture redevient possible par cooldown réel.
+                const guardWaitMs = getPackRegenGuardWait();
+                if (guardWaitMs > 0) {
+                    const guardEnd = Date.now() + guardWaitMs;
+                    while (isCurrent() && Date.now() < guardEnd) {
+                        const left = Math.max(0, Math.ceil((guardEnd - Date.now()) / 1000));
+                        if (alertEl) alertEl.innerHTML = `<span style="color:#fbbf24">⚠️ Horodatage packs serveur ancien · prochaine ouverture dans ${left}s</span>`;
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                    if (!isCurrent()) break;
+                }
+
                 const data = await openPack();
                 if (!isCurrent()) break; // stoppé/relancé pendant l'ouverture → on n'enchaîne pas
 
                 // Comptabilisation + affichage + alertes (mutualisé avec les
                 // ouvertures manuelles interceptées, cf. handlePackOpened).
                 await handlePackOpened(data, { animate: true });
+
+                const regenGuard = updatePackRegenGuardAfterOpen(data);
 
                 // ✅ Regen
                 if (data.packs_remaining === 0 || data.error) {
@@ -23461,7 +23736,15 @@
                     continue;
                 }
 
-                // ✅ délai humanisé
+                // Si le stock observé au moment de l'anomalie a été entièrement consommé,
+                // la prochaine ouverture doit respecter un cooldown complet même si l'API
+                // continue de renvoyer packs_remaining > 0 avec un curseur ancien.
+                if (regenGuard?.stale && Number(regenGuard.budget) <= 0) {
+                    armNextPackGuardCooldown();
+                    continue;
+                }
+
+                // Petit délai entre packs réellement présents en stock.
                 let delay = 1200 + Math.random() * 1800;
                 await sleep(delay);
 
