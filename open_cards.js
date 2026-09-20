@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.18';
+    const WM_VERSION = '3.6.19';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3379,8 +3379,8 @@
                     return { handled: true, state: 'listed', auctionId: rec.saleAuctionId };
                 }
 
-                const fp = Number(row.final_price);
-                if (row.winner_id && Number.isFinite(fp) && fp > 0) {
+                const fp = auctionRowSoldPrice(row);
+                if (auctionRowSettledSold(row) && Number.isFinite(fp) && fp > 0) {
                     rec.status = 'sold';
                     rec.soldPrice = fp;
                     rec.soldAt = row.settled_at ? new Date(row.settled_at).getTime() : Date.now();
@@ -3448,8 +3448,8 @@
         // 3) Si on avait effectivement listé ce flip, une vente conclue unique peut être
         // retrouvée même si l'auctionId n'avait pas été capturé.
         const sold = await findRecentSoldSellerAuctionForFlip(rec).catch(() => null);
-        if (sold?.id && sold.winner_id) {
-            const fp = Number(sold.final_price);
+        if (sold?.id && auctionRowSettledSold(sold)) {
+            const fp = auctionRowSoldPrice(sold);
 
             if (sold.card_id && sold.card_id !== rec.cardId) {
                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
@@ -3945,7 +3945,10 @@
         flipSaleSyncBusy = true;
 
         try {
-            const listed = flipLedger.filter(r => r && r.status === 'listed' && r.saleAuctionId);
+            // v3.6.19 : l'auction_id exact reste la source de vérité même si un ancien
+            // passage a laissé localement la ligne en `tagged`/`pending_tag`. Limiter cette
+            // réconciliation à status='listed' pouvait rendre une vraie vente invisible.
+            const listed = flipLedger.filter(r => r && r.status !== 'sold' && r.saleAuctionId);
             if (listed.length > 0) {
                 const rows = await fetchAuctionsByIds(listed.map(r => r.saleAuctionId));
                 if (rows instanceof Map) {
@@ -3955,8 +3958,8 @@
                         const row = rows.get(rec.saleAuctionId);
                         if (!row || auctionRowStillActive(row)) continue;
 
-                        const fp = Number(row.final_price);
-                        if (row.winner_id && Number.isFinite(fp) && fp > 0) {
+                        const fp = auctionRowSoldPrice(row);
+                        if (auctionRowSettledSold(row) && Number.isFinite(fp) && fp > 0) {
                             rec.status = 'sold';
                             rec.soldPrice = fp;
                             rec.soldAt = row.settled_at ? new Date(row.settled_at).getTime() : Date.now();
@@ -3983,9 +3986,9 @@
                         // Dernière relecture exacte après la grâce.
                         const confirmMap = await fetchAuctionsByIds([rec.saleAuctionId]).catch(() => null);
                         const confirmRow = confirmMap instanceof Map ? confirmMap.get(rec.saleAuctionId) : null;
-                        const confirmFp = Number(confirmRow?.final_price);
+                        const confirmFp = auctionRowSoldPrice(confirmRow);
 
-                        if (confirmRow?.winner_id && Number.isFinite(confirmFp) && confirmFp > 0) {
+                        if (auctionRowSettledSold(confirmRow) && Number.isFinite(confirmFp) && confirmFp > 0) {
                             rec.status = 'sold';
                             rec.soldPrice = confirmFp;
                             rec.soldAt = confirmRow.settled_at ? new Date(confirmRow.settled_at).getTime() : Date.now();
@@ -5144,6 +5147,33 @@
         console.table(result);
         if (sample.length) console.table(sample);
         return { ...result, sample };
+    };
+
+    window.wmFlipSaleDiag = async function () {
+        syncFlipLedgerFromStorage(false);
+        const targets = flipLedger.filter(r => r && r.status !== 'sold' && r.saleAuctionId);
+        const byId = targets.length
+            ? await fetchAuctionsByIds(targets.map(r => r.saleAuctionId)).catch(() => null)
+            : new Map();
+        const rows = targets.map(rec => {
+            const srv = byId instanceof Map ? byId.get(rec.saleAuctionId) : null;
+            const soldPrice = auctionRowSoldPrice(srv);
+            return {
+                carte: rec.title,
+                statutLocal: rec.status,
+                venteId: rec.saleAuctionId,
+                statutServeur: srv?.status ?? null,
+                finServeur: srv?.end_at ?? null,
+                winnerId: srv?.winner_id ?? null,
+                finalPrice: srv?.final_price ?? null,
+                currentBid: srv?.current_bid ?? null,
+                actifServeur: srv ? auctionRowStillActive(srv) : null,
+                venduServeur: srv ? auctionRowSettledSold(srv) : null,
+                prixVenteDetecte: soldPrice
+            };
+        });
+        console.table(rows);
+        return rows;
     };
 
     window.wmFlipReconcileStates = async function () {
@@ -18451,7 +18481,23 @@
     // Vrai si une ligne désigne une vente CONCLUE avec un gagnant (même test relâché
     // qu'ailleurs : on ne dépend plus du libellé exact `settled_sold`, absent en base).
     function auctionRowSettledSold(row) {
-        return !!row && (row.winner_id != null || Number.isFinite(row.final_price));
+        if (!row) return false;
+        const fp = Number(row.final_price);
+        return row.winner_id != null || (Number.isFinite(fp) && fp > 0);
+    }
+
+    // Prix final utilisable pour un état vendu. Certains retours `auctions` exposent
+    // `final_price` avant/indépendamment de `winner_id`; inversement, si le gagnant est
+    // connu mais que final_price tarde, current_bid est le meilleur prix terminal disponible.
+    function auctionRowSoldPrice(row) {
+        if (!row) return null;
+        const fp = Number(row.final_price);
+        if (Number.isFinite(fp) && fp > 0) return fp;
+        if (row.winner_id != null) {
+            const bid = Number(row.current_bid);
+            if (Number.isFinite(bid) && bid > 0) return bid;
+        }
+        return null;
     }
 
     /* ── Sonde ciblée de tables ──
