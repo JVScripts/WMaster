@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.16';
+    const WM_VERSION = '3.6.17';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11028,7 +11028,18 @@
         }, MARKET_COUNTDOWN_TICK_MS);
     }
 
-    // Délai avant/entre les mises auto. Adapté à l'urgence : INSTANTANÉ quand
+    // Riposte auto-bid : jamais instantanée. Une surenchère adverse déclenche
+    // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
+    // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
+    // conservent leur timing existant.
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 4000;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 7000;
+    function autoBidResponseDelayMs() {
+        return AUTOBID_RESPONSE_DELAY_MIN_MS
+            + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
+    }
+
+    // Délai avant/entre les mises auto hors riposte. Adapté à l'urgence : INSTANTANÉ quand
     // l'enchère se termine bientôt (précision de snipe), court sinon. Le plafond
     // du cas "froid" est réglable via Paramètres (0 = mises instantanées partout).
     function bidDelayMs(auction) {
@@ -11718,7 +11729,7 @@
                 if (bidLockSet.has(a.id)) continue;
                 if (!automaticBidTimeAllowed(a)) continue;
                 bidLockSet.add(a.id);
-                await new Promise(r => setTimeout(r, bidDelayMs(a)));
+                await new Promise(r => setTimeout(r, autoBidResponseDelayMs()));
 
                 // Le scan complet peut être obsolète en pleine bataille. On relit toujours
                 // cette enchère juste avant la riposte du scan normal.
@@ -13439,28 +13450,57 @@
                         if (hunterCardLockReady) {
                             bidLockSet.add(a.id);
                             try {
-                                // ⚡ Pas de délai humanisé : fire instantané (c'est le but de la hot lane).
-                                // L'état `a` vient d'être relu côté serveur dans CE tick ; on revalide
-                                // malgré tout la fenêtre de temps au dernier moment.
-                                if (!automaticBidTimeAllowed(a)) {
+                                // Une riposte hot-lane n'est jamais instantanée : 4–7 s minimum/maximum.
+                                // Le verrou reste pris pendant l'attente, ce qui empêche le scan normal
+                                // d'envoyer une deuxième riposte sur la même enchère en parallèle.
+                                await new Promise(r => setTimeout(r, autoBidResponseDelayMs()));
+
+                                // Le prix peut avoir bougé pendant ces quelques secondes : on relit
+                                // systématiquement l'enchère et on recalcule la mise minimale.
+                                const delayedFresh = await fetchSingleAuction(a.id).catch(() => null);
+                                if (!delayedFresh) {
                                     continue;
                                 }
+                                applyFreshAuctionState(delayedFresh, { render: true, logExtension: true });
+
+                                if (!automaticBidTimeAllowed(delayedFresh)
+                                    || iAmLeading(delayedFresh)
+                                    || autoBidBlockedByUncertainSelfState(delayedFresh)) {
+                                    continue;
+                                }
+
+                                let delayedHunterFresh = true;
+                                if (isDynamicHunterAuction(delayedFresh)) {
+                                    delayedHunterFresh = !!(await ensureFreshHunterReference(
+                                        delayedFresh,
+                                        Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                                    ));
+                                }
+                                if (!delayedHunterFresh || !dynamicHunterContinuationAllowed(delayedFresh)) {
+                                    continue;
+                                }
+
+                                const delayedBidAmount = minNextBid(delayedFresh);
+                                if (!autoBidWithinCap(delayedFresh, delayedBidAmount)) {
+                                    continue;
+                                }
+
                                 const res = await fetch(
                                     `${MARKET_API_BASE}/${a.id}/bid`,
                                     {
                                         method: "POST", credentials: "include",
                                         headers: { "Content-Type": "application/json" },
-                                        body: JSON.stringify({ amount: bidAmount })
+                                        body: JSON.stringify({ amount: delayedBidAmount })
                                     }
                                 );
                                 if (res.ok) {
-                                    markAuctionAsMine(a.id, bidAmount, a);
-                                    markAutoFlipCandidate(a, 'autobid_hotlane', bidAmount);
-                                    wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
+                                    markAuctionAsMine(a.id, delayedBidAmount, delayedFresh);
+                                    markAutoFlipCandidate(delayedFresh, 'autobid_hotlane', delayedBidAmount);
+                                    wmLog(`⚡ Hot-lane bid : <b>${titleOb}</b> [${rarOb}] → <span style="color:#fbbf24;">${delayedBidAmount} 💰</span>`);
                                     // Refresh balance en arrière-plan, sans bloquer le tick
                                     fetchBalance().catch(() => { });
                                     sendToDiscord(
-                                        "⚡ Hot-lane bid : **" + titleOb + "** → **" + bidAmount + " 💰**",
+                                        "⚡ Hot-lane bid : **" + titleOb + "** → **" + delayedBidAmount + " 💰**",
                                         5763719,
                                         'market'
                                     );
@@ -13474,6 +13514,9 @@
                                     // Un seul retry, après NOUVELLE lecture serveur, jamais à l'aveugle.
                                     if (/mise\s+trop\s+basse/i.test(errText) && Number.isFinite(serverMin)) {
                                         try {
+                                            // Une nouvelle hausse adverse entre notre lecture et le POST
+                                            // déclenche une nouvelle latence complète avant le retry.
+                                            await new Promise(r => setTimeout(r, autoBidResponseDelayMs()));
                                             const retryFresh = await fetchSingleAuction(a.id);
                                             if (retryFresh) {
                                                 applyFreshAuctionState(retryFresh, { render: true, logExtension: true });
