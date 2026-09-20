@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.21';
+    const WM_VERSION = '3.6.22';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1200,11 +1200,17 @@
     // Applique aussi les suppressions persistantes au chargement de cette instance.
     syncFlipDeletionTombstonesFromStorage(true);
 
+    function flipHasConfirmedSoldEvidence(rec) {
+        if (!rec || typeof rec !== 'object') return false;
+        const soldPrice = Number(rec.soldPrice);
+        return !!rec.saleAuctionId && Number.isFinite(soldPrice) && soldPrice > 0;
+    }
+
     function normalizeFlipLedgerRecord(rec) {
         if (!rec || typeof rec !== 'object') return false;
         let changed = false;
         const soldPrice = Number(rec.soldPrice);
-        const hasSoldEvidence = !!rec.saleAuctionId && Number.isFinite(soldPrice) && soldPrice > 0;
+        const hasSoldEvidence = flipHasConfirmedSoldEvidence(rec);
 
         if (hasSoldEvidence && rec.status !== 'sold') {
             rec.status = 'sold';
@@ -1214,6 +1220,21 @@
                 rec.soldAt = Date.now();
             }
             rec.profit = soldPrice - Number(rec.buyPrice || 0);
+            changed = true;
+        }
+
+        // v3.6.22 : v3.6.21 pouvait classer une carte "sold" uniquement parce qu'elle
+        // n'était plus visible dans la collection et qu'aucune annonce active n'était trouvée.
+        // Ce n'est PAS une preuve de vente. Sans auction_id + prix final > 0, on remet l'état
+        // en réconciliation au lieu de fabriquer "vendu 0" / une perte égale au prix d'achat.
+        if (rec.status === 'sold' && !hasSoldEvidence) {
+            rec.status = 'pending_tag';
+            rec.userCardId = null;
+            rec.soldPrice = null;
+            rec.soldAt = null;
+            rec.profit = null;
+            rec.lastError = 'vente non confirmée · réconciliation requise';
+            rec.nextTagRetryAt = 0;
             changed = true;
         }
         return changed;
@@ -1238,12 +1259,15 @@
         normalizeFlipLedgerRecord(localRec);
         normalizeFlipLedgerRecord(storedRec);
 
-        // `sold` est terminal pour un achat Flip donné : aucune ancienne instance ne doit
-        // pouvoir le remettre en tagged/listed ensuite.
-        if (localRec.status === 'sold' || storedRec.status === 'sold') {
-            const winner = localRec.status === 'sold' && storedRec.status !== 'sold'
+        // `sold` n'est terminal que lorsqu'il existe une preuve serveur exploitable :
+        // auction_id exact + prix final strictement positif. Un simple status='sold' local
+        // (notamment issu du faux positif v3.6.21) ne doit jamais contaminer les autres onglets.
+        const localSoldConfirmed = localRec.status === 'sold' && flipHasConfirmedSoldEvidence(localRec);
+        const storedSoldConfirmed = storedRec.status === 'sold' && flipHasConfirmedSoldEvidence(storedRec);
+        if (localSoldConfirmed || storedSoldConfirmed) {
+            const winner = localSoldConfirmed && !storedSoldConfirmed
                 ? localRec
-                : storedRec.status === 'sold' && localRec.status !== 'sold'
+                : storedSoldConfirmed && !localSoldConfirmed
                     ? storedRec
                     : (flipLedgerFreshness(localRec) >= flipLedgerFreshness(storedRec) ? localRec : storedRec);
             return { ...localRec, ...storedRec, ...winner, status: 'sold', userCardId: null, lastError: null };
@@ -4076,25 +4100,24 @@
                     continue;
                 }
 
-                // Hors fenêtre d'indexation : la carte n'est ni possédée ni encore active.
-                // On la classe vendue, mais sans inventer un prix final.
-                rec.status = 'sold';
-                rec.saleAuctionId = rec.saleAuctionId || null;
-                rec.userCardId = null;
-                rec.soldPrice = Number.isFinite(Number(rec.soldPrice)) && Number(rec.soldPrice) > 0
-                    ? Number(rec.soldPrice)
-                    : null;
-                rec.soldAt = Date.now();
-                rec.profit = Number.isFinite(Number(rec.soldPrice))
-                    ? Number(rec.soldPrice) - Number(rec.buyPrice || 0)
-                    : null;
-                rec.lastError = rec.soldPrice
-                    ? null
-                    : 'vendue · prix final indisponible (auction_id non capturé)';
+                // v3.6.22 : absence de la collection + absence d'annonce active n'est PAS
+                // une preuve de vente (retour d'invendu retardé, snapshot incomplet, API partielle…).
+                // Passe par le réconciliateur conservateur : il ne classe sold que s'il retrouve
+                // une enchère conclue identifiable. Sinon la carte reste en attente de preuve.
+                const reconciled = await reconcileFlipAbsentFromCollection(rec)
+                    .catch(() => ({ handled: false }));
+                if (!reconciled?.handled) {
+                    rec.status = 'pending_tag';
+                    rec.userCardId = null;
+                    rec.soldPrice = null;
+                    rec.soldAt = null;
+                    rec.profit = null;
+                    rec.lastError = 'mise en vente non confirmée · attente réconciliation';
+                    rec.nextTagRetryAt = Date.now() + 10_000;
+                    saveFlipLedger();
+                }
                 repaired++;
-                saveFlipLedger();
-                syncSoldFlipToSellHistory(rec);
-                wmLog(`💰 Flip Seller : faux refus réparé → <b>${rec.title}</b> classée vendue${rec.soldPrice ? ` · ${rec.soldPrice} 💰` : ' · prix final indisponible'}.`);
+                wmLog(`🧭 Flip Seller : <b>${rec.title}</b> · état de vente non prouvé, réconciliation conservatrice.`);
             }
         } finally {
             _flipPhantomRefusalRepairBusy = false;
@@ -4254,7 +4277,14 @@
         }
 
         const stateLabel = r => {
-            if (r.status === 'sold') return `<span style="color:#4ade80;">vendu ${Number(r.soldPrice || 0).toLocaleString('fr-FR')} · ${r.profit >= 0 ? '+' : ''}${Number(r.profit || 0).toLocaleString('fr-FR')} 💰</span>`;
+            if (r.status === 'sold') {
+                const sp = Number(r.soldPrice);
+                const pf = Number(r.profit);
+                if (Number.isFinite(sp) && sp > 0) {
+                    return `<span style="color:#4ade80;">vendu ${sp.toLocaleString('fr-FR')} · ${pf >= 0 ? '+' : ''}${Number.isFinite(pf) ? pf.toLocaleString('fr-FR') : '—'} 💰</span>`;
+                }
+                return `<span style="color:#fbbf24;">vente à confirmer</span>`;
+            }
             if (r.status === 'listed') {
                 const duration = Number(r.listDurationMin);
                 const durText = Number.isFinite(duration) && duration > 0
@@ -9054,6 +9084,25 @@
 
     function loadSellHistory() {
         try { sellHistory = JSON.parse(localStorage.getItem(SELL_HISTORY_KEY) || '[]'); } catch (e) { sellHistory = []; }
+
+        // v3.6.22 : retire uniquement les lignes historiques créées par le faux positif v3.6.21
+        // (Flip sans auction_id de vente et sans prix final confirmé). Aucune statistique n'avait
+        // été créditée pour ces lignes, donc cette purge ne retire pas de vraie vente comptabilisée.
+        const unconfirmedFlipPurchaseIds = new Set(
+            flipLedger
+                .filter(r => r && !flipHasConfirmedSoldEvidence(r))
+                .map(r => String(r.auctionId || ''))
+                .filter(Boolean)
+        );
+        const before = sellHistory.length;
+        sellHistory = sellHistory.filter(row => {
+            if (row?.source !== 'flip') return true;
+            if (row?.auctionId) return true;
+            if (Number(row?.finalPrice) > 0) return true;
+            const k = String(row?.flipPurchaseAuctionId || '');
+            return !k || !unconfirmedFlipPurchaseIds.has(k);
+        });
+        if (sellHistory.length !== before) saveSellHistory();
     }
     function saveSellHistory() {
         try { localStorage.setItem(SELL_HISTORY_KEY, JSON.stringify(sellHistory.slice(-500))); } catch (e) { } // garde max 500
