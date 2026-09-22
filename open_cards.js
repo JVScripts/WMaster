@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.26';
+    const WM_VERSION = '3.6.28';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -254,10 +254,43 @@
 
     // Source Standards = KEYWORDS_ALERT uniquement. Prioritaires/Fourbe/Chasseur ciblé sont exclus
     // de cette définition (ils disposent déjà de leur propre logique d'action).
+    //
+    // v3.6.27 : l'endpoint LISTE marketplace peut fournir le texte de recherche pré-calculé
+    // dans `snapshot_search_document` sans exposer systématiquement `card.wikipedia_title` /
+    // `card.category`. En 3.6.26 cela pouvait donner 0 candidat Standards alors que des
+    // centaines d'annonces étaient bien dans la fenêtre Hunter. On matche donc le document
+    // snapshot en plus des champs carte, sans modifier la sémantique des mots-clés.
     function standardSearchMatchesAuction(auction) {
         if (!auction) return false;
-        const card = auction.card || auction;
-        return !!card && hasKeyword(card, false) && !hasExcludedWord(card);
+
+        const card = auction.card || {};
+        const fields = [
+            auction.snapshot_search_document,
+            card.snapshot_search_document,
+            card.wikipedia_title,
+            card.title,
+            card.name,
+            card.category,
+            auction.wikipedia_title,
+            auction.title,
+            auction.name,
+            auction.category
+        ]
+            .filter(v => typeof v === 'string' && v.trim())
+            .map(v => v.toLowerCase());
+
+        if (fields.length === 0) return false;
+
+        const excluded = KEYWORDS_EXCLUDE.some(k => {
+            const needle = String(k || '').toLowerCase();
+            return needle && fields.some(f => f.includes(needle));
+        });
+        if (excluded) return false;
+
+        return KEYWORDS_ALERT.some(k => {
+            const needle = String(k || '').toLowerCase();
+            return needle && fields.some(f => f.includes(needle));
+        });
     }
 
     function hunterDynamicMatchesSource(auction, standardMatch) {
@@ -14336,13 +14369,16 @@
             if (!hotLaneActive) startHotLane();
             else scheduleHotLane();
 
+            // v3.6.28 : le Hunter autonome ne dépend plus des mots-clés Standards/Global.
+            // Toutes les enchères de la fenêtre T-1 min sont soumises au moteur Hunter ;
+            // shouldAutoSnipe() reste l'unique filtre économique/sécurité (Recent Market,
+            // liquidité, cohérence, plafond, doublon, solde, etc.).
             const freshCandidates =
-                getHunterDynamicCandidatePool(batch)
-                    .filter(a => {
-                        if (!a?.id || seenCandidateIds.has(a.id)) return false;
-                        seenCandidateIds.add(a.id);
-                        return true;
-                    });
+                batch.filter(a => {
+                    if (!a?.id || seenCandidateIds.has(a.id)) return false;
+                    seenCandidateIds.add(a.id);
+                    return true;
+                });
 
             streamedCandidateCount += freshCandidates.length;
 
@@ -14385,8 +14421,7 @@
 
         // Filet de sécurité pour une enchère dédupliquée différemment entre deux pages.
         const leftoverCandidates =
-            getHunterDynamicCandidatePool(auctions)
-                .filter(a => a?.id && !seenCandidateIds.has(a.id));
+            auctions.filter(a => a?.id && !seenCandidateIds.has(a.id));
 
         if (leftoverCandidates.length > 0) {
             hunterHeadlessStats.lastCandidates += leftoverCandidates.length;
@@ -14517,6 +14552,9 @@
             hunterOn: autoSnipeEnabled,
             mode: getSetting('autoSnipeMode'),
             source: hunterDynamicSource,
+            headlessCandidateSource: 'all_market',
+            standardsKeywords: KEYWORDS_ALERT.length,
+            exclusKeywords: KEYWORDS_EXCLUDE.length,
             marketWatcherOn: marketWatcherActive,
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
