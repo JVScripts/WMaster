@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.23b';
+    const WM_VERSION = '3.6.24';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -47,6 +47,9 @@
     // Config de vente par rareté (prix + durée), modifiable dans Paramètres
     const SELL_CONFIG_KEY = 'wm_sell_config';
     const SELL_CONFIG_DEFAULT = {
+        // L+ = exemplaire L shiny. Valeur séparée de L dans toute la logique du bot.
+        // Le prix statique reste configurable ; le Flip Seller, lui, utilise son marché L+ séparé.
+        'L+': { price: 100, duration: 10 },
         L: { price: 100, duration: 10 },
         UR: { price: 50, duration: 10 },
         SR: { price: 25, duration: 10 },
@@ -91,6 +94,7 @@
     } catch (e) { }
 
     const RARITY = {
+        'L+': { color: "#FFF2A8", bg: "rgba(255,242,168,0.17)", label: "L+" },
         L: { color: "#FFD700", bg: "rgba(255,215,0,0.15)", label: "L" },
         UR: { color: "#FF8C00", bg: "rgba(255,140,0,0.15)", label: "UR" },
         SR: { color: "#FF69B4", bg: "rgba(255,105,180,0.15)", label: "SR" },
@@ -98,6 +102,85 @@
         PC: { color: "#3B82F6", bg: "rgba(59,130,246,0.15)", label: "PC" },
         C: { color: "#22C55E", bg: "rgba(34,197,94,0.15)", label: "C" },
     };
+
+
+    /* ══════════ VARIANTES SHINY / L+ ══════════
+       WikiMasters expose les L+ comme : rarity/snapshot_rarity = "L" + is_shiny = true.
+       Pour WMaster, L et L+ sont DEUX marchés distincts : historique, Hunter, doublons,
+       undercut, Flip Seller et affichage ne doivent jamais les mélanger. */
+    function normalizeRarityCode(rarity) {
+        return String(rarity || '').trim().toUpperCase();
+    }
+
+    function normalizeShinyFlag(value) {
+        if (value === true || value === 1 || value === '1' || String(value).toLowerCase() === 'true') return true;
+        if (value === false || value === 0 || value === '0' || String(value).toLowerCase() === 'false') return false;
+        return null;
+    }
+
+    function ownShinyFlag(obj) {
+        if (!obj || typeof obj !== 'object') return null;
+        for (const key of ['is_shiny', 'isShiny', 'shiny']) {
+            if (Object.prototype.hasOwnProperty.call(obj, key)) {
+                const v = normalizeShinyFlag(obj[key]);
+                if (v !== null) return v;
+            }
+        }
+        return null;
+    }
+
+    function entityShinyFlag(entity) {
+        const own = ownShinyFlag(entity);
+        if (own !== null) return own;
+        return ownShinyFlag(entity?.card);
+    }
+
+    function effectiveRarity(rarity, isShiny = null) {
+        const rr = normalizeRarityCode(rarity);
+        if (rr === 'L+') return 'L+';
+        return rr === 'L' && normalizeShinyFlag(isShiny) === true ? 'L+' : rr;
+    }
+
+    function effectiveRarityFromEntity(entity, fallbackRarity = '', fallbackShiny = null) {
+        const raw = normalizeRarityCode(
+            entity?.snapshot_rarity || entity?.card?.rarity || entity?.rarity || fallbackRarity || ''
+        );
+        let shiny = entityShinyFlag(entity);
+        if (shiny === null) shiny = normalizeShinyFlag(fallbackShiny);
+        if (shiny === null && normalizeRarityCode(fallbackRarity) === 'L+') shiny = true;
+        return effectiveRarity(raw || fallbackRarity, shiny);
+    }
+
+    function backendRarityForEffective(rarity) {
+        const rr = normalizeRarityCode(rarity);
+        return rr === 'L+' ? 'L' : rr;
+    }
+
+    function shinyExpectationForEffective(rarity) {
+        const rr = normalizeRarityCode(rarity);
+        if (rr === 'L+') return true;
+        if (rr === 'L') return false;
+        return null;
+    }
+
+    function variantRequiresShinyMetadata(rarity) {
+        const rr = normalizeRarityCode(rarity);
+        return rr === 'L' || rr === 'L+';
+    }
+
+    function variantMatchesParts(rawRarity, shinyFlag, expectedEffectiveRarity) {
+        const wanted = normalizeRarityCode(expectedEffectiveRarity);
+        if (!wanted) return true;
+        const actual = effectiveRarity(rawRarity, shinyFlag);
+        return actual === wanted;
+    }
+
+    function variantMatchesEntity(entity, expectedEffectiveRarity) {
+        const wanted = normalizeRarityCode(expectedEffectiveRarity);
+        if (!wanted) return true;
+        const raw = entity?.snapshot_rarity || entity?.card?.rarity || entity?.rarity || '';
+        return variantMatchesParts(raw, entityShinyFlag(entity), wanted);
+    }
 
 
     /* ══════════ RECHERCHE GLOBALE + SOURCE HUNTER DYNAMIQUE ══════════
@@ -129,7 +212,7 @@
             && remaining > 0
             && remaining <= AUTOMATIC_BID_MAX_REMAINING_MS;
     }
-    const GLOBAL_SEARCH_RARITY_CODES = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+    const GLOBAL_SEARCH_RARITY_CODES = ['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
 
     let GLOBAL_SEARCH_RARITIES = new Set();
     try {
@@ -157,12 +240,7 @@
     }
 
     function globalAuctionRarity(auction) {
-        return String(
-            auction?.snapshot_rarity ||
-            auction?.card?.rarity ||
-            auction?.rarity ||
-            ''
-        ).trim().toUpperCase();
+        return effectiveRarityFromEntity(auction);
     }
 
     // Recherche globale = rareté cochée, RIEN D'AUTRE. Les Standards n'interviennent jamais ici.
@@ -271,7 +349,7 @@
     let totalPacks = 0;
     let totalCards = 0;
     let cardStats = {};
-    let rarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+    let rarityStats = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
     let sessionStart = null;
     let timerInterval = null;
     let minimized = false;
@@ -304,7 +382,7 @@
     // historique. Persistées dans sessionStorage : un simple F5 poursuit LA MÊME session
     // (avant, chaque rechargement repartait de zéro et fragmentait/perdait le récap).
     const SESSION_METRICS_KEY = 'wm_session_metrics';
-    const emptyRarities = () => ({ L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 });
+    const emptyRarities = () => ({ 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 });
     let sessionMetrics = {
         id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         start: Date.now(),
@@ -338,7 +416,7 @@
     // Stats du Pack Opener fusionnées PAR JOUR (persistées). Ne repartent plus de zéro
     // à chaque refresh ; reset automatique au changement de date (todayKey).
     const DAILY_STATS_KEY = 'wm_daily_pack_stats';
-    let dailyPackStats = { date: todayKey(), packs: 0, cards: 0, rarities: { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 } };
+    let dailyPackStats = { date: todayKey(), packs: 0, cards: 0, rarities: { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 } };
     try {
         const raw = JSON.parse(localStorage.getItem(DAILY_STATS_KEY) || 'null');
         if (raw && raw.date === todayKey()) {
@@ -346,7 +424,7 @@
                 date: todayKey(),
                 packs: raw.packs || 0,
                 cards: raw.cards || 0,
-                rarities: { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0, ...(raw.rarities || {}) }
+                rarities: { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0, ...(raw.rarities || {}) }
             };
         }
     } catch (e) { }
@@ -354,7 +432,7 @@
     // Stats du jour pour l'affichage du Pack Opener — AMORCÉES depuis le cumul persistant.
     let sessionPacks = dailyPackStats.packs;
     let sessionCards = dailyPackStats.cards;
-    let sessionRarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0, ...dailyPackStats.rarities };
+    let sessionRarityStats = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0, ...dailyPackStats.rarities };
     // Jour auquel appartiennent les stats ci-dessus. Sert au reset automatique à minuit même
     // si l'onglet reste ouvert (sinon les stats d'hier continuaient de s'accumuler ET étaient
     // ré-estampillées "aujourd'hui" par saveDailyPackStats → survivaient au reload).
@@ -379,7 +457,7 @@
         sessionStatsDay = tk;
         sessionPacks = 0;
         sessionCards = 0;
-        sessionRarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+        sessionRarityStats = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         saveDailyPackStats(); // écrase le store : { date: aujourd'hui, 0… }
         // Rafraîchit l'affichage s'il est monté
         try {
@@ -436,11 +514,15 @@
         const ts = w.settled_at ? new Date(w.settled_at).getTime()
             : w.end_at ? new Date(w.end_at).getTime()
                 : Date.now();
+        const candidate = autoFlipCandidates.get(w.id) || null;
+        const purchaseShiny = entityShinyFlag(w) ?? normalizeShinyFlag(candidate?.isShiny);
+        const purchaseRarity = effectiveRarityFromEntity(w, candidate?.rarity || '', purchaseShiny);
         buyHistoryIds.add(w.id);
         buyHistory.push({
             id: w.id,
             title: w.card?.wikipedia_title || '?',
-            rarity: (w.snapshot_rarity || w.card?.rarity || '').toUpperCase(),
+            rarity: purchaseRarity,
+            isShiny: purchaseShiny,
             base: w.listing_base_amount ?? w.base_amount ?? null,
             price: w.final_price ?? w.current_bid ?? 0,
             seller: w.seller?.username || w.seller_username || null,
@@ -1096,6 +1178,12 @@
             resolvedSource = 'hunter_dynamic';
         }
 
+        const currentShiny = entityShinyFlag(auction);
+        const resolvedShiny = currentShiny !== null
+            ? currentShiny
+            : (normalizeShinyFlag(prev.isShiny) ?? (normalizeRarityCode(prev.rarity) === 'L+' ? true : null));
+        const resolvedRarity = effectiveRarityFromEntity(auction, prev.rarity || '', resolvedShiny);
+
         autoFlipCandidates.set(auction.id, {
             auctionId: auction.id,
             cardId,
@@ -1103,11 +1191,8 @@
                 auction.card?.wikipedia_title ||
                 prev.title ||
                 '?',
-            rarity:
-                globalAuctionRarity(auction) ||
-                auction.snapshot_rarity ||
-                prev.rarity ||
-                '',
+            rarity: resolvedRarity,
+            isShiny: resolvedShiny,
             source: resolvedSource,
             firstBidAt: prev.firstBidAt || Date.now(),
             updatedAt: Date.now(),
@@ -1215,6 +1300,29 @@
     function normalizeFlipLedgerRecord(rec) {
         if (!rec || typeof rec !== 'object') return false;
         let changed = false;
+
+        // v3.6.24 — L+ est stocké côté site comme L + is_shiny=true. Les anciens records
+        // L sans métadonnée shiny restent volontairement `null` jusqu'à résolution collection :
+        // on préfère bloquer un prix auto quelques secondes plutôt que mélanger L et L+.
+        if (!Object.prototype.hasOwnProperty.call(rec, 'isShiny')) {
+            rec.isShiny = normalizeRarityCode(rec.rarity) === 'L+' ? true : null;
+            changed = true;
+        } else {
+            const normalizedShiny = normalizeShinyFlag(rec.isShiny);
+            if (rec.isShiny !== normalizedShiny) { rec.isShiny = normalizedShiny; changed = true; }
+        }
+        if (!Object.prototype.hasOwnProperty.call(rec, 'purchaseIsShiny')) {
+            rec.purchaseIsShiny = normalizeRarityCode(rec.purchaseRarity) === 'L+' ? true : rec.isShiny;
+            changed = true;
+        } else {
+            const normalizedPurchaseShiny = normalizeShinyFlag(rec.purchaseIsShiny);
+            if (rec.purchaseIsShiny !== normalizedPurchaseShiny) { rec.purchaseIsShiny = normalizedPurchaseShiny; changed = true; }
+        }
+        const effNow = effectiveRarity(rec.rarity, rec.isShiny);
+        if (effNow && effNow !== rec.rarity) { rec.rarity = effNow; changed = true; }
+        const effPurchase = effectiveRarity(rec.purchaseRarity || rec.rarity, rec.purchaseIsShiny);
+        if (effPurchase && effPurchase !== rec.purchaseRarity) { rec.purchaseRarity = effPurchase; changed = true; }
+
         const soldPrice = Number(rec.soldPrice);
         const hasSoldEvidence = flipHasConfirmedSoldEvidence(rec);
 
@@ -1362,6 +1470,8 @@
         if (!r || typeof r !== 'object') return;
         if (!r.purchaseCardId) r.purchaseCardId = r.cardId || null;
         if (!r.purchaseRarity) r.purchaseRarity = r.rarity || '';
+        if (!Object.prototype.hasOwnProperty.call(r, 'isShiny')) r.isShiny = normalizeRarityCode(r.rarity) === 'L+' ? true : null;
+        if (!Object.prototype.hasOwnProperty.call(r, 'purchaseIsShiny')) r.purchaseIsShiny = normalizeRarityCode(r.purchaseRarity) === 'L+' ? true : r.isShiny;
         if (!Number.isFinite(Number(r.tagRetryCount))) r.tagRetryCount = 0;
         if (!Number.isFinite(Number(r.lastTagAttemptAt))) r.lastTagAttemptAt = 0;
         if (!Number.isFinite(Number(r.nextTagRetryAt))) r.nextTagRetryAt = 0;
@@ -1639,17 +1749,21 @@
         const buyPrice = Number(w.final_price ?? w.current_bid ?? candidate?.lastAutoBid ?? 0);
         const boughtAt = w.settled_at ? new Date(w.settled_at).getTime()
             : w.end_at ? new Date(w.end_at).getTime() : Date.now();
+        const winShiny = entityShinyFlag(w) ?? normalizeShinyFlag(candidate?.isShiny);
+        const winRarity = effectiveRarityFromEntity(w, candidate?.rarity || '', winShiny);
         if (!rec) {
             rec = {
                 auctionId: w.id,
                 cardId: w.card?.id || w.card_id || candidate?.cardId || null,
                 title: w.card?.wikipedia_title || candidate?.title || '?',
-                rarity: (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase(),
+                rarity: winRarity,
+                isShiny: winShiny,
                 buyPrice: Number.isFinite(buyPrice) ? buyPrice : 0,
                 boughtAt: Number.isFinite(boughtAt) ? boughtAt : Date.now(),
                 source: candidate?.source || 'wmaster_bid',
                 purchaseCardId: w.card?.id || w.card_id || candidate?.cardId || null,
-                purchaseRarity: (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase(),
+                purchaseRarity: winRarity,
+                purchaseIsShiny: winShiny,
                 userCardId: null,
                 status: 'pending_tag',
                 tagAppliedAt: null,
@@ -1688,15 +1802,16 @@
                 rec.title = betterTitle || '?';
             }
 
-            const betterRarity =
-                (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase();
-            if (!rec.rarity && betterRarity) {
-                rec.rarity = betterRarity;
-            }
+            const betterRarity = winRarity;
+            if (!rec.rarity && betterRarity) rec.rarity = betterRarity;
+            if (winShiny !== null) rec.isShiny = winShiny;
+            if (rec.rarity) rec.rarity = effectiveRarity(rec.rarity, rec.isShiny);
 
             rec.source = rec.source || candidate?.source || 'wmaster_bid';
             rec.purchaseCardId = rec.purchaseCardId || rec.cardId || w.card?.id || w.card_id || candidate?.cardId || null;
-            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || (w.snapshot_rarity || w.card?.rarity || candidate?.rarity || '').toUpperCase();
+            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || betterRarity;
+            if (rec.purchaseIsShiny == null && winShiny !== null) rec.purchaseIsShiny = winShiny;
+            if (rec.purchaseRarity) rec.purchaseRarity = effectiveRarity(rec.purchaseRarity, rec.purchaseIsShiny);
         }
         saveFlipLedger();
 
@@ -1969,17 +2084,43 @@
     function flipCollectionItemMeta(it) {
         if (!it) return null;
         const card = it.card || {};
+        const isShiny = entityShinyFlag(it);
+        const rarity = effectiveRarity(it.snapshot_rarity || card.rarity || it.rarity || '', isShiny);
         return {
             // /api/my-collection expose l'exemplaire possédé ; sur WikiMasters `id`
             // est le user_card_id. Si un champ explicite existe, on le préfère.
             userCardId: it.user_card_id || it.id || null,
             cardId: it.card_id || card.id || null,
             title: card.wikipedia_title || it.wikipedia_title || it.title || '',
-            rarity: String(it.snapshot_rarity || card.rarity || it.rarity || '').toUpperCase(),
+            rarity,
+            isShiny,
             obtainedTs: itemObtainedTs(it),
             tags: Array.isArray(it.tags) ? it.tags : [],
             raw: it
         };
+    }
+
+    function applyFlipVariantMeta(rec, meta) {
+        if (!rec || !meta) return false;
+        let changed = false;
+        const shiny = normalizeShinyFlag(meta.isShiny);
+        const rr = normalizeRarityCode(meta.rarity);
+        if (shiny !== null && rec.isShiny !== shiny) { rec.isShiny = shiny; changed = true; }
+        const effective = effectiveRarity(rr || rec.rarity, rec.isShiny);
+        if (effective && effective !== rec.rarity) {
+            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
+            rec.rarity = effective;
+            changed = true;
+        }
+        if (rec.purchaseIsShiny == null && rec.isShiny !== null) {
+            rec.purchaseIsShiny = rec.isShiny;
+            changed = true;
+        }
+        if (rec.purchaseRarity) {
+            const pe = effectiveRarity(rec.purchaseRarity, rec.purchaseIsShiny);
+            if (pe && pe !== rec.purchaseRarity) { rec.purchaseRarity = pe; changed = true; }
+        }
+        return changed;
     }
 
     function itemHasFlipTag(meta) {
@@ -2177,7 +2318,8 @@
                     !wantedRarity || !m.rarity || m.rarity === wantedRarity;
 
                 if (!idMatch && !titleMatch) return null;
-                if (titleMatch && !rarityMatch) return null;
+                // L et L+ partagent le même card_id : un card_id exact ne suffit donc plus.
+                if (wantedRarity && !rarityMatch) return null;
 
                 const delta = Number.isFinite(m.obtainedTs)
                     ? Math.abs(m.obtainedTs - targetTs)
@@ -2219,10 +2361,7 @@
                     rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                     rec.cardId = exact.cardId;
                 }
-                if (exact.rarity && exact.rarity !== rec.rarity) {
-                    rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                    rec.rarity = exact.rarity;
-                }
+                applyFlipVariantMeta(rec, exact);
                 return exact.userCardId;
             }
         }
@@ -2242,10 +2381,7 @@
             rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
             rec.cardId = best.cardId;
         }
-        if (best.rarity && best.rarity !== rec.rarity) {
-            rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-            rec.rarity = best.rarity;
-        }
+        applyFlipVariantMeta(rec, best);
 
         return best.userCardId;
     }
@@ -2283,6 +2419,7 @@
                 if (!idMatch && !titleMatch) continue;
 
                 const rarityMatch = !wantedRarity || !m.rarity || m.rarity === wantedRarity;
+                if (wantedRarity && !rarityMatch) continue;
                 const tagged = itemHasFlipTag(m);
                 const delta = Number.isFinite(m.obtainedTs)
                     ? Math.abs(m.obtainedTs - targetTs)
@@ -2313,10 +2450,7 @@
                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                 const old = rec.cardId;
                 rec.cardId = best.cardId;
-                if (best.rarity && best.rarity !== rec.rarity) {
-                    rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                    rec.rarity = best.rarity;
-                }
+                applyFlipVariantMeta(rec, best);
                 wmLog(`🔄 Flip Seller : card_id actualisé pour <b>${rec.title}</b>${old ? ` (${String(old).slice(0, 8)}… → ${String(best.cardId).slice(0, 8)}…)` : ''}.`);
             }
 
@@ -2439,16 +2573,13 @@
                                 !m.rarity ||
                                 m.rarity === wantedRarity;
 
-                            if (!idMatch && !(titleMatch && rarityMatch)) continue;
+                            if (!rarityMatch || (!idMatch && !titleMatch)) continue;
 
                             if (m.cardId && m.cardId !== rec.cardId) {
                                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                                 rec.cardId = m.cardId;
                             }
-                            if (m.rarity && m.rarity !== rec.rarity) {
-                                rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                                rec.rarity = m.rarity;
-                            }
+                            applyFlipVariantMeta(rec, m);
 
                             // L'item vient directement de /api/my-collection : il est possédé.
                             rec.userCardId = m.userCardId;
@@ -2706,11 +2837,13 @@
                         ...row,
                         id: auctionId,
                         card_id: row.card_id || candidate?.cardId || null,
-                        snapshot_rarity: row.snapshot_rarity || candidate?.rarity || '',
+                        snapshot_rarity: backendRarityForEffective(row.snapshot_rarity || candidate?.rarity || ''),
+                        is_shiny: normalizeShinyFlag(row.is_shiny) ?? normalizeShinyFlag(candidate?.isShiny),
                         card: {
                             id: row.card_id || candidate?.cardId || null,
                             wikipedia_title: candidate?.title || '?',
-                            rarity: row.snapshot_rarity || candidate?.rarity || ''
+                            rarity: backendRarityForEffective(row.snapshot_rarity || candidate?.rarity || ''),
+                            is_shiny: normalizeShinyFlag(row.is_shiny) ?? normalizeShinyFlag(candidate?.isShiny)
                         }
                     };
 
@@ -2947,7 +3080,8 @@
                 userCardId: row?.user_card_id || uc?.id || meta?.userCardId || null,
                 cardId: uc?.card_id || meta?.cardId || null,
                 title: meta?.title || '',
-                rarity: String(meta?.rarity || '').toUpperCase(),
+                rarity: normalizeRarityCode(meta?.rarity || ''),
+                isShiny: normalizeShinyFlag(meta?.isShiny),
                 createdAt: uc?.created_at
                     ? new Date(uc.created_at).getTime()
                     : (Number.isFinite(meta?.obtainedTs) ? meta.obtainedTs : NaN)
@@ -2978,9 +3112,10 @@
                 const pool = tagged
                     .filter(x => {
                         if (activeUsed.has(x.userCardId) && x.userCardId !== rec.userCardId) return false;
-                        if (rec.cardId && x.cardId === rec.cardId) return true;
+                        const variantOk = !wantedRarity || !x.rarity || x.rarity === wantedRarity;
+                        if (rec.cardId && x.cardId === rec.cardId) return variantOk;
                         if (wantedTitle && wantedTitle !== '?' && x.title === wantedTitle) {
-                            return !wantedRarity || !x.rarity || x.rarity === wantedRarity;
+                            return variantOk;
                         }
                         return false;
                     })
@@ -2994,7 +3129,8 @@
 
             if (!hit) continue;
 
-            const changed = rec.status !== 'tagged' || rec.userCardId !== hit.userCardId;
+            const variantChanged = applyFlipVariantMeta(rec, hit);
+            const changed = rec.status !== 'tagged' || rec.userCardId !== hit.userCardId || variantChanged;
             rec.userCardId = hit.userCardId;
             rec.status = 'tagged';
             rec.tagAppliedAt = rec.tagAppliedAt || Date.now();
@@ -3145,7 +3281,29 @@
         const floor = Math.max(1, Math.ceil(buy * (1 + markupPct / 100)));
 
         const cardId = rec?.cardId;
-        const rarity = rec?.rarity || '';
+        const rarity = effectiveRarity(rec?.rarity || rec?.purchaseRarity || '', rec?.isShiny);
+
+        // Une ancienne ligne L sans métadonnée shiny est ambiguë depuis l'arrivée de L+.
+        // On ne la price jamais comme une L normale tant que /my-collection n'a pas confirmé la variante.
+        if (normalizeRarityCode(rarity) === 'L' && normalizeShinyFlag(rec?.isShiny) === null) {
+            return {
+                eligibleForSale: false,
+                blockedByRecentMarket: true,
+                price: null,
+                floor,
+                blockedByMarketIntegrity: false,
+                marketIntegrity: null,
+                basis: 'variante L/L+ inconnue · résolution shiny requise avant prix automatique',
+                reference: null,
+                referenceKind: null,
+                wmAverage: null,
+                recentMarketCount: 0,
+                recentMarketPrices: [],
+                sellPct: null,
+                sellStage: getFlipWmSellStage(rec),
+                undercut: null
+            };
+        }
 
         // v3.4.2 : Recent Market EXCLUSIF. Nouvelle requête à chaque listing/relisting.
         // Sous 15 ventes valides, la carte reste taguée `vente` et attend ; aucun fallback WM.
@@ -3243,7 +3401,7 @@
 
         let undercut = null;
         if (getFlipUndercut()) {
-            const activeStats = await fetchActiveListingStats(rec.cardId).catch(() => null);
+            const activeStats = await fetchActiveListingStats(rec.cardId, rarity).catch(() => null);
             const lowest = Number(activeStats?.lowest);
             if (Number.isFinite(lowest) && lowest > 1) {
                 const under = Math.max(1, Math.round(lowest - 1));
@@ -3305,10 +3463,14 @@
 
         const recTitle = String(rec.title || '').trim();
         const aTitle = String(auction.card?.wikipedia_title || '').trim();
-        const recRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
-        const aRarity = String(
-            auction.snapshot_rarity || auction.card?.rarity || ''
-        ).toUpperCase();
+        const recRarity = effectiveRarity(rec.rarity || rec.purchaseRarity || '', rec.isShiny);
+        const aRarity = effectiveRarityFromEntity(auction);
+
+        // Pour L/L+, une annonce dépourvue de métadonnée shiny n'est pas assez précise
+        // pour servir à une réconciliation par identité (sauf auction_id exact, géré ailleurs).
+        if (variantRequiresShinyMetadata(recRarity) && entityShinyFlag(auction) === null && normalizeRarityCode(auction?.snapshot_rarity) !== 'L+') {
+            return -1;
+        }
 
         let score = 0;
 
@@ -3389,6 +3551,8 @@
                     const sellerId = a?.seller_id || a?.seller?.id || a?.seller?.user_id || null;
                     // Quand l'API expose le vendeur, on exige explicitement notre propre compte.
                     if (uid && sellerId && String(sellerId) !== String(uid)) return false;
+                    const wantedRarity = effectiveRarity(rec.rarity || rec.purchaseRarity || '', rec.isShiny);
+                    if (wantedRarity && globalAuctionRarity(a) !== wantedRarity) return false;
                     return true;
                 });
 
@@ -3398,8 +3562,8 @@
             // spécifique (card_id + rareté + prix) pour éviter d'attraper l'annonce d'un tiers.
             const withSeller = rows.filter(a => a?.seller_id || a?.seller?.id || a?.seller?.user_id);
             const pool = withSeller.length > 0 ? withSeller : rows.filter(a => {
-                const rr = String(a?.snapshot_rarity || a?.card?.rarity || '').toUpperCase();
-                const wantedRarity = String(rec.rarity || rec.purchaseRarity || '').toUpperCase();
+                const rr = effectiveRarityFromEntity(a);
+                const wantedRarity = effectiveRarity(rec.rarity || rec.purchaseRarity || '', rec.isShiny);
                 const base = Number(a?.listing_base_amount ?? a?.base_amount);
                 const wantedPrice = Number(rec.listPrice);
                 const rarityOk = !wantedRarity || !rr || rr === wantedRarity;
@@ -3503,9 +3667,9 @@
                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                 rec.cardId = active.card_id;
             }
-            const activeRarity = String(
-                active.snapshot_rarity || active.card?.rarity || ''
-            ).toUpperCase();
+            const activeShiny = entityShinyFlag(active);
+            const activeRarity = effectiveRarityFromEntity(active, rec.rarity || '', activeShiny);
+            if (activeShiny !== null) rec.isShiny = activeShiny;
             if (activeRarity && activeRarity !== rec.rarity) {
                 rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
                 rec.rarity = activeRarity;
@@ -3542,9 +3706,9 @@
                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                 rec.cardId = sold.card_id;
             }
-            const soldRarity = String(
-                sold.snapshot_rarity || sold.card?.rarity || ''
-            ).toUpperCase();
+            const soldShiny = entityShinyFlag(sold);
+            const soldRarity = effectiveRarityFromEntity(sold, rec.rarity || '', soldShiny);
+            if (soldShiny !== null) rec.isShiny = soldShiny;
             if (soldRarity && soldRarity !== rec.rarity) {
                 rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
                 rec.rarity = soldRarity;
@@ -3876,8 +4040,9 @@
 
 
     async function fetchFlipReturnedRarityPage(page, rarity) {
-        const rr = String(rarity || '').trim().toUpperCase();
-        const rarityParam = rr ? `&rarity=${encodeURIComponent(rr)}` : '';
+        const rr = normalizeRarityCode(rarity);
+        const backendRarity = backendRarityForEffective(rr);
+        const rarityParam = backendRarity ? `&rarity=${encodeURIComponent(backendRarity)}` : '';
         const url =
             `https://www.wiki-masters.com/api/my-collection?page=${page}&limit=50` +
             `&sort=rarity${rarityParam}`;
@@ -3964,10 +4129,7 @@
                     rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                     rec.cardId = meta.cardId;
                 }
-                if (meta.rarity && meta.rarity !== rec.rarity) {
-                    rec.purchaseRarity = rec.purchaseRarity || rec.rarity || '';
-                    rec.rarity = meta.rarity;
-                }
+                applyFlipVariantMeta(rec, meta);
                 return meta;
             }
         }
@@ -4648,7 +4810,7 @@
                 winnerId: w.winner_id,
                 finalPrice: w.final_price,
                 titre: w.card?.wikipedia_title || '?',
-                rarete: w.snapshot_rarity || w.card?.rarity || ''
+                rarete: effectiveRarityFromEntity(w)
             })));
         }
         renderFlipHistory();
@@ -4678,8 +4840,7 @@
             .map(w => ({
                 auctionId: w.id,
                 carte: w.card?.wikipedia_title || '?',
-                rarete:
-                    (w.snapshot_rarity || w.card?.rarity || '').toUpperCase(),
+                rarete: effectiveRarityFromEntity(w, autoFlipCandidates.get(w.id)?.rarity || '', autoFlipCandidates.get(w.id)?.isShiny),
                 prix: Number(w.final_price ?? w.current_bid ?? 0) || 0,
                 date:
                     w.settled_at ||
@@ -4753,8 +4914,7 @@
                     auctionId: id,
                     cardId: w.card?.id || w.card_id || null,
                     title: w.card?.wikipedia_title || '?',
-                    rarity:
-                        (w.snapshot_rarity || w.card?.rarity || '').toUpperCase(),
+                    rarity: effectiveRarityFromEntity(w, autoFlipCandidates.get(id)?.rarity || '', autoFlipCandidates.get(id)?.isShiny),
                     source: 'manual_recovery',
                     firstBidAt: Date.now(),
                     updatedAt: Date.now(),
@@ -5744,7 +5904,7 @@
                 finalizeSession();
 
                 const title = w.card?.wikipedia_title || '?';
-                const rar = (w.snapshot_rarity || w.card?.rarity || '').toUpperCase();
+                const rar = effectiveRarityFromEntity(w);
                 newWins.push({ title, rar, price });
 
                 wmLog(
@@ -5983,12 +6143,12 @@
 
     // Comptage des cartes possédées par rareté : { L, UR, SR, R, PC, C }
     // Recalculé à chaque refresh complet de la collection.
-    let rarityCountMap = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+    let rarityCountMap = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
     function resetRarityCount() {
-        rarityCountMap = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+        rarityCountMap = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
     }
     function addRarityCount(item) {
-        const rar = (item.card?.rarity || item.rarity || '').toUpperCase();
+        const rar = effectiveRarityFromEntity(item);
         if (rar && rarityCountMap[rar] !== undefined) {
             rarityCountMap[rar] += (item.count || 1);
         }
@@ -6019,7 +6179,7 @@
     function renderRarityHeader() {
         const el = document.getElementById('wm-coll-rarity');
         if (!el) return;
-        const order = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+        const order = ['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
         const total = order.reduce((s, r) => s + (rarityCountMap[r] || 0), 0);
         if (total === 0) { el.innerHTML = ''; return; }
         const parts = order.map(r => {
@@ -6073,7 +6233,7 @@
     function marketSearchNorm(s) {
         return (s || '').toString().normalize('NFD').replace(MARKET_SEARCH_DIACRITICS, '').toLowerCase();
     }
-    const RARITY_ORDER = { L: 5, UR: 4, SR: 3, R: 2, PC: 1, C: 0 };
+    const RARITY_ORDER = { 'L+': 6, L: 5, UR: 4, SR: 3, R: 2, PC: 1, C: 0 };
     let lastHitsCache = []; // cache pour re-render sans attendre le prochain scan
     let lastAllMarketAuctions = []; // scan complet : source Recherche globale / Hunter dynamique v2.2
 
@@ -6365,7 +6525,7 @@
     const recentMarketInflight = new Map();
 
     function recentMarketKey(cardId, rarity = '') {
-        return `${String(cardId || '')}|${String(rarity || '').trim().toUpperCase()}`;
+        return `${String(cardId || '')}|${normalizeRarityCode(rarity)}`;
     }
 
     function clamp01(v) {
@@ -7475,11 +7635,12 @@
     }
 
     function buildRecentMarketSnapshot(probe, cardId, rarity) {
-        if (!probe?.ok) {
+        const effective = normalizeRarityCode(rarity);
+        if (!probe?.ok || (variantRequiresShinyMetadata(effective) && probe?.variantSeparated !== true)) {
             return {
                 ok: false,
                 cardId,
-                rarity: String(rarity || '').trim().toUpperCase(),
+                rarity: effective,
                 error: probe?.error || 'échec API auctions',
                 httpStatus: probe?.httpStatus ?? null,
                 fetchedAt: Date.now(),
@@ -7507,6 +7668,7 @@
         }
 
         const rows = (Array.isArray(probe.rows) ? probe.rows : [])
+            .filter(r => !effective || variantMatchesParts(r?.snapshot_rarity, r?.is_shiny, effective))
             .filter(r => Number.isFinite(Number(r?.final_price)) && Number(r.final_price) > 0)
             .slice(0, RECENT_MARKET_LIMIT)
             .sort((a, b) => (recentSaleTimestamp(b) ?? 0) - (recentSaleTimestamp(a) ?? 0));
@@ -7786,7 +7948,8 @@
         return {
             ok: true,
             cardId,
-            rarity: String(rarity || '').trim().toUpperCase(),
+            rarity: effective,
+            isShiny: shinyExpectationForEffective(effective),
             fetchedAt: Date.now(),
             newestSaleAt: Number.isFinite(newestTs) ? newestTs : null,
             oldestSaleAt: Number.isFinite(oldestTs) ? oldestTs : null,
@@ -7846,7 +8009,7 @@
 
     async function fetchRecentMarket(cardId, rarity = '', force = false) {
         const id = String(cardId || '').trim();
-        const rr = String(rarity || '').trim().toUpperCase();
+        const rr = normalizeRarityCode(rarity);
         if (!id || !rr) return null;
 
         const key = recentMarketKey(id, rr);
@@ -8652,7 +8815,7 @@
     function sortHits(hits) {
         const arr = [...hits];
         const bidOf = (a) => a.current_bid ?? a.base_amount ?? 0;
-        const rarOf = (a) => RARITY_ORDER[(a.card?.rarity || '').toUpperCase()] ?? -1;
+        const rarOf = (a) => RARITY_ORDER[globalAuctionRarity(a)] ?? -1;
         const titleOf = (a) => (a.card?.wikipedia_title || '').toLowerCase();
         const endOf = (a) => new Date(a.end_at).getTime();
         const seenOf = (a) => firstSeenMap.get(a.id) ?? 0;
@@ -9208,12 +9371,12 @@
             totalPacks = s.totalPacks || 0;
             totalCards = s.totalCards || 0;
             cardStats = s.cardStats || {};
-            rarityStats = s.rarityStats || { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+            rarityStats = s.rarityStats || { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         } catch (e) { }
     }
 
     function resetStats() {
-        totalPacks = 0; totalCards = 0; cardStats = {}; rarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+        totalPacks = 0; totalCards = 0; cardStats = {}; rarityStats = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         localStorage.removeItem(STATS_STORAGE_KEY);
     }
 
@@ -9221,7 +9384,7 @@
     function resetSessionStats() {
         sessionPacks = 0;
         sessionCards = 0;
-        sessionRarityStats = { L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
+        sessionRarityStats = { 'L+': 0, L: 0, UR: 0, SR: 0, R: 0, PC: 0, C: 0 };
         saveDailyPackStats(); // remet aussi à zéro le cumul du jour persistant
     }
 
@@ -9649,7 +9812,7 @@
 
     async function revealCards(cards, revealEl) {
         for (const c of cards) {
-            const rarity = (c.rarity || "").toUpperCase();
+            const rarity = effectiveRarity(c.rarity || '', entityShinyFlag(c));
             const r = RARITY[rarity] || { color: "#aaa", bg: "rgba(255,255,255,0.05)" };
             const title = c.wikipedia_title || "?";
             const isKW = hasKeyword(c, true); // pack : titre + catégories + description
@@ -9671,7 +9834,7 @@
     function analyzeCards(cards) {
         let keywordHits = [];
         cards.forEach(c => {
-            const rarity = (c.rarity || "").toUpperCase();
+            const rarity = effectiveRarity(c.rarity || '', entityShinyFlag(c));
             const title = c.wikipedia_title || "?";
             cardStats[title] = (cardStats[title] || 0) + 1;
             if (rarityStats[rarity] !== undefined) rarityStats[rarity]++;
@@ -10491,7 +10654,7 @@
             autoBidSet.delete(auction.id);
             saveAutoBidSet();
             const t = auction.card?.wikipedia_title || '?';
-            const r = (auction.card?.rarity || '').toUpperCase();
+            const r = globalAuctionRarity(auction) || '?';
             wmLog(`🛑 Auto-bid coupé (plafond ${cap.toLocaleString('fr-FR')} 💰 atteint) : <b>${t}</b> [${r}] · prochaine mise aurait été ${plannedAmount.toLocaleString('fr-FR')} 💰`);
         }
         return false;
@@ -10946,7 +11109,7 @@
 
     // Rareté requise valide (l'un des 6 codes) — toute autre valeur (y compris vide/absente,
     // le cas normal) veut dire « pas de filtre », comportement identique à avant cette option.
-    const HUNTER_RARITY_CODES = new Set(['L', 'UR', 'SR', 'R', 'PC', 'C']);
+    const HUNTER_RARITY_CODES = new Set(['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C']);
     function normalizeHunterRarity(rarity) {
         const r = String(rarity || '').trim().toUpperCase();
         return HUNTER_RARITY_CODES.has(r) ? r : '';
@@ -11280,7 +11443,7 @@
             if (!armHunterFourbe(a, decision.cap)) continue;
             armed++;
             const title = a.card?.wikipedia_title || '?';
-            const rar = (a.card?.rarity || '').toUpperCase();
+            const rar = globalAuctionRarity(a);
             wmLog(`🕵️ Hunter agressif : <b>${title}</b> [${rar}] — snipe armé à ~${getSetting('snipeSecondsBefore')}s de la fin, plafond <span style="color:#fbbf24;">${decision.cap} 💰</span>`);
         }
         return armed;
@@ -11435,8 +11598,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 4000;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 7000;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1000;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 3000;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -11641,7 +11804,7 @@
                 if (last && last.auction) {
                     const a = last.auction;
                     const t = a.card?.wikipedia_title || '?';
-                    const r = (a.card?.rarity || '').toUpperCase();
+                    const r = globalAuctionRarity(a) || '?';
                     const finalBid = a.current_bid ?? a.base_amount;
                     const winner = a.current_bidder?.username || null;
                     if (winner === currentUsername) {
@@ -11850,7 +12013,7 @@
                     activeHitsMap.set(a.id, { auction: a, endAt: a.end_at });
                     // Log par carte dans le dashboard
                     const t = a.card?.wikipedia_title || '?';
-                    const r = (a.card?.rarity || '?').toUpperCase();
+                    const r = globalAuctionRarity(a) || '?';
                     const p = a.current_bid ?? a.base_amount;
                     const priceLabel = a.current_bid != null ? 'mise' : 'base';
                     const owned = collectionMap.get(a.card?.id) || 0;
@@ -11861,7 +12024,7 @@
                 // 🛒 Notification Discord groupée
                 const lines = newHits.map(a => {
                     const title = a.card?.wikipedia_title || "?";
-                    const rarity = (a.card?.rarity || "?").toUpperCase();
+                    const rarity = globalAuctionRarity(a) || '?';
                     const bid = a.current_bid ?? a.base_amount;
                     const hasBid = a.current_bid !== null;
                     const kw = matchedKeyword(a.card);
@@ -11892,7 +12055,7 @@
                     if (!h) continue;
                     handledByHunter.add(a.id);
                     const title = a.card?.wikipedia_title || '?';
-                    const rar = (a.card?.rarity || '').toUpperCase();
+                    const rar = globalAuctionRarity(a);
                     // Sensible à la rareté (isOwnedDuplicate, déjà utilisée par le Market
                     // Watcher pour son badge « possédé ») plutôt qu'un comptage brut par
                     // card_id : posséder l'UR ne doit PAS bloquer une mise sur la Légendaire
@@ -11981,7 +12144,7 @@
                     if (handledByHunter.has(a.id)) continue; // déjà géré (plafond + mode) par le chasseur
                     if (!hasPriorityKeyword(a.card)) continue;
                     const alreadyLeading = iAmLeading(a) || autoBidBlockedByUncertainSelfState(a);
-                    const alreadyOwned = (collectionMap.get(a.card?.id) || 0) > 0;
+                    const alreadyOwned = isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a));
                     if (alreadyLeading || alreadyOwned || wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) continue;
                     if (bidLockSet.has(a.id)) continue;
 
@@ -12012,7 +12175,7 @@
                         );
                         const data = await res.json().catch(() => ({}));
                         const title = a.card?.wikipedia_title || "?";
-                        const rar = (a.card?.rarity || '').toUpperCase();
+                        const rar = globalAuctionRarity(a);
                         if (res.ok) {
                             markAuctionAsMine(a.id, bidAmount, a);
                             markAutoFlipCandidate(a, 'priority', bidAmount);
@@ -12037,12 +12200,12 @@
                     if (hasPriorityKeyword(a.card)) continue;   // le prioritaire prime (auto-bid immédiat)
                     if (autoBidSet.has(a.id)) continue;          // déjà en auto-bid → on ne double pas
                     if (snipeSet.has(a.id)) continue;            // déjà armé
-                    const alreadyOwned = (collectionMap.get(a.card?.id) || 0) > 0;
+                    const alreadyOwned = isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a));
                     if (alreadyOwned || iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) continue;
                     snipeSet.add(a.id);
                     armedFourbe = true;
                     const title = a.card?.wikipedia_title || '?';
-                    const rar = (a.card?.rarity || '').toUpperCase();
+                    const rar = globalAuctionRarity(a);
                     wmLog(`🕵️ Fourbe armé (mot-clé) : <b>${title}</b> [${rar}] — snipe à ~${getSetting('snipeSecondsBefore')}s de la fin`);
                 }
                 if (armedFourbe) saveSnipeSet();
@@ -12075,7 +12238,7 @@
                             outbidLogMap.set(a.id, bidOb);
                             outbidHits.push(a); // → son + notif Discord groupée plus bas
                             const titleOb = a.card?.wikipedia_title || '?';
-                            const rarOb = (a.card?.rarity || '').toUpperCase();
+                            const rarOb = globalAuctionRarity(a) || '?';
                             wmLog(`😤 Surenchéri : <b>${titleOb}</b> [${rarOb}] · <b>${bidder}</b> à <span style="color:#fbbf24;">${bidOb} 💰</span>`);
                         }
                     }
@@ -12111,7 +12274,7 @@
                 if (window.wmNotify) window.wmNotify(outbidHits.length);
                 const lines = outbidHits.map(a => {
                     const title = a.card?.wikipedia_title || "?";
-                    const rarity = (a.card?.rarity || "?").toUpperCase();
+                    const rarity = globalAuctionRarity(a) || '?';
                     const bid = a.current_bid ?? a.base_amount;
                     const bidder = a.current_bidder?.username || "?";
                     const cd = formatCountdown(a.end_at);
@@ -12189,7 +12352,7 @@
                         markAuctionAsMine(a.id, bidAmount, freshBidAuction);
                         markAutoFlipCandidate(freshBidAuction, 'autobid', bidAmount);
                         const titleAb = a.card?.wikipedia_title || '?';
-                        const rarAb = (a.card?.rarity || '').toUpperCase();
+                        const rarAb = globalAuctionRarity(a) || '?';
                         wmLog(`🤖 Auto-bid (riposte) : <b>${titleAb}</b> [${rarAb}] → <span style="color:#fbbf24;">${bidAmount} 💰</span>`);
                         await fetchBalance();
                         sendToDiscord(
@@ -12260,7 +12423,7 @@
             hits = hits.filter(a => {
                 // Masque les cartes déjà possédées DANS LA MÊME RARETÉ. Une carte possédée en
                 // SR mais listée en UR (revalorisée par le site) n'est PAS un doublon → visible.
-                if (marketHideOwned && isOwnedDuplicate(a.card?.id ?? a.card_id, a.card?.rarity)) return false;
+                if (marketHideOwned && isOwnedDuplicate(a.card?.id ?? a.card_id, globalAuctionRarity(a))) return false;
                 if (sq) {
                     const t = marketSearchNorm(a.card?.wikipedia_title || '');
                     const cat = marketSearchNorm(a.card?.category || '');
@@ -12295,7 +12458,7 @@
 
         const rows = hits.map(a => {
             const title = a.card?.wikipedia_title || "?";
-            const rarity = (a.card?.rarity || "").toUpperCase();
+            const rarity = globalAuctionRarity(a);
             const r = RARITY[rarity] || { color: "#aaa" };
             const myLastBidAmt = myLastBidMap.get(a.id);
             const rawBid = a.current_bid ?? a.base_amount;
@@ -12327,7 +12490,7 @@
             // Badge "possédé". Si possédée mais dans une AUTRE rareté que l'annonce, on le
             // signale (ambre) : ce n'est pas un vrai doublon, d'où l'affichage même en mode masqué.
             const owned = ownedCount(a.card?.id);
-            const listingRar = (a.card?.rarity || '').toUpperCase();
+            const listingRar = globalAuctionRarity(a) || '?';
             const ownedRars = ownedRaritiesOf(a.card?.id);
             const otherRarityOnly = owned > 0 && ownedRars && ownedRars.size > 0
                 && listingRar && !ownedRars.has(listingRar);
@@ -13731,7 +13894,7 @@
 
                         bidLockSet.add(a.id);
                         const titleSn = a.card?.wikipedia_title || '?';
-                        const rarSn = (a.card?.rarity || '').toUpperCase();
+                        const rarSn = globalAuctionRarity(a) || '?';
                         try {
                             const res = await fetch(
                                 `${MARKET_API_BASE}/${a.id}/bid`,
@@ -13773,7 +13936,7 @@
                 markOutbid(a.id);
                 markBidBattle(a.id, BID_BATTLE_KEEP_MS);
                 const titleOb = a.card?.wikipedia_title || '?';
-                const rarOb = (a.card?.rarity || '').toUpperCase();
+                const rarOb = globalAuctionRarity(a) || '?';
                 const bidOb = a.current_bid ?? a.base_amount;
 
                 // Anti-doublon : on ne loggue/sonne/notifie qu'UNE fois par surenchère (id + montant).
@@ -14483,11 +14646,18 @@
 
     // Ajoute une carte fraîchement taguée Trash au pool en mémoire, sans attendre le prochain
     // scan complet. Ignoré tant qu'aucun scan initial n'a eu lieu (rien à mettre à jour).
-    function pushToTrashPoolCache(cardId, title, rarity) {
+    function pushToTrashPoolCache(cardId, title, rarity, isShiny = null) {
         if (!trashPoolCacheReady || !cardId) return;
+        const effective = effectiveRarity(rarity || 'C', isShiny) || 'C';
         trashPoolCache.push({
             card_id: cardId,
-            card: { id: cardId, wikipedia_title: title || '?', rarity: (rarity || 'C').toUpperCase() },
+            is_shiny: shinyExpectationForEffective(effective),
+            card: {
+                id: cardId,
+                wikipedia_title: title || '?',
+                rarity: backendRarityForEffective(effective) || 'C',
+                is_shiny: shinyExpectationForEffective(effective)
+            },
             tags: [{ name: getSellTagName() }]
         });
     }
@@ -14608,7 +14778,7 @@
         // si les C/PC sont réellement présentes dans le pool ou absentes/droppées).
         const rarityCount = {};
         trashCards.forEach(c => {
-            const r = (c.card?.rarity || c.rarity || '?').toUpperCase();
+            const r = effectiveRarityFromEntity(c, c.card?.rarity || c.rarity || '?') || '?';
             rarityCount[r] = (rarityCount[r] || 0) + 1;
         });
         const rarityStr = Object.entries(rarityCount).sort((a, b) => b[1] - a[1])
@@ -14623,7 +14793,7 @@
         // Log chaque nouvelle carte tagguée (max 10 pour éviter de spammer)
         newlyTagged.slice(0, 10).forEach(c => {
             const t = c.card?.wikipedia_title || c.wikipedia_title || '?';
-            const r = (c.card?.rarity || 'C').toUpperCase();
+            const r = effectiveRarityFromEntity(c, c.card?.rarity || 'C') || 'C';
             wmLog(`🏷️ Tag Trash : <b>${t}</b> [${r}]`);
         });
         if (newlyTagged.length > 10) {
@@ -15002,7 +15172,7 @@
 
         el.innerHTML = partialNote + sorted.map(a => {
             const title = a.card?.wikipedia_title || '?';
-            const rarity = (a.card?.rarity || '').toUpperCase();
+            const rarity = globalAuctionRarity(a);
             const r = RARITY[rarity] || { color: '#888' };
             const rarHex = r.color;
             const bid = a.current_bid ?? a.base_amount ?? 0;
@@ -15116,8 +15286,9 @@
 
     // Statistiques des annonces ACTIVES de la carte. On garde plusieurs prix afin qu'une
     // annonce isolée anormalement basse ne puisse plus, seule, aspirer le prix du Flip.
-    async function fetchActiveListingStats(cardId) {
+    async function fetchActiveListingStats(cardId, rarity = '') {
         if (!cardId) return null;
+        const wantedRarity = normalizeRarityCode(rarity);
         try {
             const res = await fetch(`${MARKET_API_BASE}?card_id=${encodeURIComponent(cardId)}&limit=50`, { credentials: 'include' });
             if (!res.ok) return null;
@@ -15128,6 +15299,7 @@
                 // ⚠️ le filtre API card_id peut contenir d'autres cartes : re-filtrage obligatoire.
                 const aCardId = a.card?.id ?? a.card_id;
                 if (aCardId !== cardId) continue;
+                if (wantedRarity && globalAuctionRarity(a) !== wantedRarity) continue;
                 const end = new Date(a.end_at).getTime();
                 if (Number.isFinite(end) && end <= now) continue;
                 const price = Number(a.current_bid ?? a.base_amount);
@@ -15154,8 +15326,8 @@
         } catch (e) { return null; }
     }
 
-    async function fetchLowestActiveListing(cardId) {
-        const stats = await fetchActiveListingStats(cardId);
+    async function fetchLowestActiveListing(cardId, rarity = '') {
+        const stats = await fetchActiveListingStats(cardId, rarity);
         return Number.isFinite(Number(stats?.lowest)) ? Number(stats.lowest) : null;
     }
 
@@ -15204,7 +15376,7 @@
         return [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text) || null;
     }
 
-    function findCollectionTileByTitleAndRarity(title, rarity) {
+    function findCollectionTileByTitleAndRarity(title, rarity, userCardId = null, variantFilterConfirmed = false) {
         const leaves = [...document.querySelectorAll('*')]
             .filter(el => el.children.length === 0 && el.textContent.trim() === title);
 
@@ -15217,14 +15389,37 @@
             if (candidate && !tiles.includes(candidate)) tiles.push(candidate);
         }
 
-        if (tiles.length <= 1) return tiles[0] || null;
+        if (tiles.length === 0) return null;
 
-        const rr = String(rarity || '').trim().toUpperCase();
+        // Si l'UI expose l'id d'exemplaire dans un attribut, c'est le signal le plus fort.
+        // Cela évite surtout de confondre une L normale et sa variante L+ du même card_id.
+        const wantedUserCardId = String(userCardId || '').trim();
+        if (wantedUserCardId) {
+            const exactIdTile = tiles.find(tile => {
+                if (String(tile.outerHTML || '').includes(wantedUserCardId)) return true;
+                for (const el of [tile, ...tile.querySelectorAll('*')]) {
+                    for (const attr of ['data-user-card-id', 'data-usercard-id', 'data-id', 'value']) {
+                        if (String(el.getAttribute?.(attr) || '') === wantedUserCardId) return true;
+                    }
+                }
+                return false;
+            });
+            if (exactIdTile) return exactIdTile;
+        }
+
+        const rr = normalizeRarityCode(rarity);
         if (!rr) return tiles[0];
 
         const escaped = rr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const token = new RegExp(`(^|[^A-Z])${escaped}([^A-Z]|$)`, 'i');
-        return tiles.find(t => token.test(String(t.textContent || '').toUpperCase())) || tiles[0];
+        const matched = tiles.find(t => token.test(String(t.textContent || '').toUpperCase()));
+        if (matched) return matched;
+
+        // L et L+ ont le même card_id : ne JAMAIS choisir arbitrairement le premier tile si
+        // l'interface ne nous permet pas de prouver la variante demandée.
+        if (variantRequiresShinyMetadata(rr) && !variantFilterConfirmed) return null;
+
+        return tiles[0];
     }
 
     // Sondage périodique de l'API directe : le contournement DOM est lent et dépend d'une
@@ -15317,7 +15512,7 @@
 
 
     function collectionRarityFilterControls() {
-        const rarityCodes = new Set(['L', 'UR', 'SR', 'R', 'PC', 'C']);
+        const rarityCodes = new Set(['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C']);
         const controls = [];
 
         for (const el of document.querySelectorAll('button,label,[role="button"]')) {
@@ -15602,26 +15797,40 @@
         }
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
 
+        const normalizedSellRarity = normalizeRarityCode(rarity);
+        let variantFilterConfirmed = false;
+
+        // L/L+ partagent le même card_id. On essaie donc d'abord de faire isoler la variante
+        // par le filtre natif de la Collection avant de cliquer un tile portant le même titre.
+        if (variantRequiresShinyMetadata(normalizedSellRarity)) {
+            variantFilterConfirmed = await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+        }
+
         setReactInputValue(searchInput, title);
 
         let tile = null;
         for (let i = 0; i < 20 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
-            tile = findCollectionTileByTitleAndRarity(title, rarity);
+            tile = findCollectionTileByTitleAndRarity(
+                title, normalizedSellRarity, userCardId, variantFilterConfirmed
+            );
         }
 
-        // Retour d'invendu : le filtre de rareté peut être nécessaire pour faire apparaître
-        // immédiatement la carte dans la collection.
-        if (!tile && rarity) {
-            const filtered = await activateCollectionRarityFilter(rarity).catch(() => false);
+        // Retour d'invendu / rareté non encore filtrée : le filtre peut être nécessaire pour
+        // faire apparaître immédiatement la bonne variante dans la collection.
+        if (!tile && normalizedSellRarity && !variantFilterConfirmed) {
+            const filtered = await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
             if (filtered) {
+                variantFilterConfirmed = true;
                 setReactInputValue(searchInput, '');
                 await new Promise(r => setTimeout(r, 180));
                 setReactInputValue(searchInput, title);
 
                 for (let i = 0; i < 20 && !tile; i++) {
                     await new Promise(r => setTimeout(r, 250));
-                    tile = findCollectionTileByTitleAndRarity(title, rarity);
+                    tile = findCollectionTileByTitleAndRarity(
+                        title, normalizedSellRarity, userCardId, variantFilterConfirmed
+                    );
                 }
             }
         }
@@ -15961,7 +16170,9 @@
         let limitReached = false; // 409 « plafond serveur atteint » → inutile d'insister
         for (const item of cards) {
             if (limitReached) { skipped++; continue; }
-            const rarity = (item.card_id ? (item.card?.rarity || "C") : "C").toUpperCase();
+            const rarity = item.card_id
+                ? effectiveRarityFromEntity(item, item.card?.rarity || 'C')
+                : 'C';
             const cardId = item.card_id || item.card?.id;
             const duration = getSellDuration(rarity);
             const title = item.card?.wikipedia_title || item.wikipedia_title || '?';
@@ -15974,7 +16185,7 @@
             // Undercut : si une annonce active existe déjà pour cette carte, se placer juste en
             // dessous de la plus basse (−1) pour vendre plus vite. Uniquement si ça BAISSE le prix.
             if (getSetting('sellUndercutMarket')) {
-                const lowest = await fetchLowestActiveListing(cardId);
+                const lowest = await fetchLowestActiveListing(cardId, rarity);
                 if (lowest != null && (lowest - 1) < price) {
                     priceInfo.undercut = { from: price, market: lowest };
                     price = Math.max(1, lowest - 1);
@@ -15997,7 +16208,11 @@
             // plus de 15 min (le site a peut-être corrigé le bug entre-temps). Pas de sondage
             // à chaque carte tant qu'elle est confirmée cassée — inutile et ça ralentirait
             // le lot pour rien.
-            const shouldProbeApi = apiSellWorks !== false || (Date.now() - apiSellCheckedTs) > API_SELL_RECHECK_INTERVAL_MS;
+            // L/L+ peuvent partager le même card_id : le POST direct ne permet pas de choisir
+            // l'exemplaire exact. Pour ces deux variantes on force l'UI, qui sélectionne le tile L/L+.
+            const variantSensitiveListing = rarity === 'L' || rarity === 'L+';
+            const shouldProbeApi = !variantSensitiveListing &&
+                (apiSellWorks !== false || (Date.now() - apiSellCheckedTs) > API_SELL_RECHECK_INTERVAL_MS);
             if (shouldProbeApi) {
                 const apiResult = await trySellViaApi(cardId, price, duration);
                 apiSellWorks = apiResult.ok;
@@ -16347,7 +16562,7 @@
         }
         const strategy = getSetting('trashSellStrategy');
         const cardIdOf = (c) => c.card_id || c.card?.id;
-        const rarityOf = (c) => (c.card?.rarity || c.rarity || 'C').toUpperCase();
+        const rarityOf = (c) => effectiveRarityFromEntity(c, c.card?.rarity || c.rarity || 'C') || 'C';
         const valueOf = (c) => {
             const e = getCachedSales(cardIdOf(c), rarityOf(c));
             if (e && e.count > 0 && Number.isFinite(e.avg)) return e.avg;
@@ -16407,7 +16622,7 @@
                 const targetId = await findCurrentUserCardId(cardId, a.card?.wikipedia_title);
                 if (targetId && await reapplyTrashTag(targetId)) {
                     // Ajout direct au pool incrémental (re-tag réussi), sans attendre un rescan
-                    pushToTrashPoolCache(cardId, a.card?.wikipedia_title, a.snapshot_rarity || a.card?.rarity);
+                    pushToTrashPoolCache(cardId, a.card?.wikipedia_title, a.snapshot_rarity || a.card?.rarity, entityShinyFlag(a));
                 }
             }
             return true;
@@ -16740,7 +16955,7 @@
         let total = 0;
         for (const c of cards) {
             const cardId = c.card?.id || c.card_id;
-            const rarity = (c.card?.rarity || c.rarity || "C").toUpperCase();
+            const rarity = effectiveRarityFromEntity(c, c.card?.rarity || c.rarity || 'C') || 'C';
             let price = await fetchMarketPrice(cardId);
             if (!price) price = getSellPrice(rarity);
             total += price;
@@ -16754,7 +16969,7 @@
         // status : 'pending' | 'sold' | 'unsold'
         sellHistory.push({
             title: item.card?.wikipedia_title || "?",
-            rarity: (item.card?.rarity || "C").toUpperCase(),
+            rarity: effectiveRarityFromEntity(item, item.card?.rarity || 'C') || 'C',
             price,
             status,
             auctionId,
@@ -17556,6 +17771,11 @@
     // Convertit une ligne `auctions` vers la forme historique de l'API du site.
     function adaptAuctionRow(row, names) {
         const c = row.cards || null;
+        const shiny = normalizeShinyFlag(
+            Object.prototype.hasOwnProperty.call(row || {}, 'is_shiny')
+                ? row.is_shiny
+                : c?.is_shiny
+        );
         return {
             id: row.id,
             card_id: row.card_id,
@@ -17564,16 +17784,12 @@
                 wikipedia_title: (c && c.wikipedia_title) || '?',
                 // snapshot_rarity D'ABORD : c'est la rareté FIGÉE au moment de la mise en
                 // vente, celle que le site affiche pour CETTE annonce précise. `cards.rarity`
-                // est la rareté LIVE du catalogue, qui peut avoir changé depuis (dérive de
-                // pageviews avec retard côté site — exactement le phénomène étudié plus haut
-                // avec wmCheckRarityDrift). La préférer inversait la rareté affichée pour toute
-                // carte dont la rareté catalogue a bougé après sa mise en vente. Repli sur
-                // `cards.rarity` seulement si le snapshot manque (ancienne donnée). Convention
-                // déjà suivie partout ailleurs dans ce fichier (syncWonAuctions, renderBuyList,
-                // checkRecentSales) — seul cet endroit avait l'ordre inversé.
+                // est la rareté LIVE du catalogue, qui peut avoir changé depuis.
                 rarity: row.snapshot_rarity || (c && c.rarity) || '',
-                image_url: c ? c.image_url : null
+                image_url: c ? c.image_url : null,
+                is_shiny: shiny
             },
+            is_shiny: shiny,
             base_amount: row.base_amount,
             listing_base_amount: row.listing_base_amount,
             current_bid: row.current_bid,
@@ -17615,16 +17831,12 @@
        strictement le JWT utilisateur déjà employé par WMaster pour `auctions`. */
     async function fetchLastVisibleSalesFromAuctions(cardId, rarity = '', limit = RECENT_MARKET_LIMIT) {
         const id = String(cardId || '').trim();
-        const rr = String(rarity || '').trim().toUpperCase();
+        const effective = normalizeRarityCode(rarity);
+        const backendRarity = backendRarityForEffective(effective);
         const lim = Math.max(1, Math.min(50, Number(limit) || RECENT_MARKET_LIMIT));
 
         if (!id) {
-            return {
-                ok: false,
-                httpStatus: null,
-                error: 'card_id manquant',
-                rows: []
-            };
+            return { ok: false, httpStatus: null, error: 'card_id manquant', rows: [] };
         }
 
         const auth = getSupabaseAccessToken();
@@ -17644,21 +17856,22 @@
             'final_price=not.is.null'
         ];
 
-        if (rr) {
-            filters.push(`snapshot_rarity=eq.${encodeURIComponent(rr)}`);
+        if (backendRarity) filters.push(`snapshot_rarity=eq.${encodeURIComponent(backendRarity)}`);
+
+        // CRITIQUE v3.6.24 : L et L+ partagent snapshot_rarity="L". Sans ce filtre,
+        // une vente shiny à 10k au milieu de L à 800 ressemble à une manipulation de marché.
+        if (effective === 'L+') {
+            filters.push('is_shiny=eq.true');
+        } else if (effective === 'L') {
+            // Les anciennes ventes antérieures au champ shiny peuvent être null : elles sont L normales.
+            filters.push('or=(is_shiny.eq.false,is_shiny.is.null)');
         }
 
         const select = [
-            'id',
-            'card_id',
-            'snapshot_rarity',
-            'final_price',
-            'settled_at',
-            'end_at',
-            'status',
-            'winner_id',
-            'seller_id',
-            'created_at'
+            'id', 'card_id', 'snapshot_rarity',
+            ...(variantRequiresShinyMetadata(effective) ? ['is_shiny'] : []),
+            'final_price', 'settled_at', 'end_at', 'status',
+            'winner_id', 'seller_id', 'created_at'
         ].join(',');
 
         const path =
@@ -17669,7 +17882,6 @@
 
         let res;
         let body = '';
-
         try {
             res = await fetchWithTimeout(`${SUPABASE_URL}/${path}`, {
                 credentials: 'omit',
@@ -17686,28 +17898,26 @@
                 httpStatus: null,
                 error: e?.message || String(e),
                 rows: [],
-                path
+                path,
+                variant: effective,
+                variantSeparated: false
             };
         }
 
         if (!res.ok) {
             let parsed = null;
             try { parsed = JSON.parse(body); } catch (e) { }
-
             return {
                 ok: false,
                 httpStatus: res.status,
-                error:
-                    parsed?.message ||
-                    parsed?.error ||
-                    parsed?.hint ||
-                    body ||
-                    `HTTP ${res.status}`,
+                error: parsed?.message || parsed?.error || parsed?.hint || body || `HTTP ${res.status}`,
                 code: parsed?.code || null,
                 details: parsed?.details || null,
                 rows: [],
                 contentRange: res.headers?.get?.('content-range') || null,
-                path
+                path,
+                variant: effective,
+                variantSeparated: false
             };
         }
 
@@ -17722,18 +17932,42 @@
                 error: 'Réponse JSON illisible',
                 rows: [],
                 raw: body.slice(0, 1000),
-                path
+                path,
+                variant: effective,
+                variantSeparated: false
             };
+        }
+
+        // Défense en profondeur : même si le backend ignore un filtre, ne laisse jamais
+        // une vente L+ entrer dans le calcul L (ou inversement).
+        if (variantRequiresShinyMetadata(effective)) {
+            const missingMeta = rows.some(r => !Object.prototype.hasOwnProperty.call(r || {}, 'is_shiny'));
+            if (missingMeta) {
+                return {
+                    ok: false,
+                    httpStatus: res.status,
+                    error: 'historique shiny non discriminé par le serveur',
+                    rows: [],
+                    path,
+                    variant: effective,
+                    variantSeparated: false
+                };
+            }
+            rows = rows.filter(r => variantMatchesParts(r?.snapshot_rarity, r?.is_shiny, effective));
         }
 
         return {
             ok: true,
             httpStatus: res.status,
+            error: null,
             rows,
             contentRange: res.headers?.get?.('content-range') || null,
-            path
+            path,
+            variant: effective,
+            variantSeparated: true
         };
     }
+
 
     function summarizeLastVisibleSales(probe, cardId, rarity, wmAverage = null) {
         const rows = Array.isArray(probe?.rows) ? probe.rows : [];
@@ -17909,6 +18143,20 @@
         };
     }
 
+    window.wmShinyVariantDiag = function (auctionOrCard) {
+        const entity = auctionOrCard || null;
+        const rawRarity = normalizeRarityCode(entity?.snapshot_rarity || entity?.card?.rarity || entity?.rarity || '');
+        const isShiny = entityShinyFlag(entity);
+        return {
+            version: WM_VERSION,
+            rawRarity,
+            isShiny,
+            effectiveRarity: effectiveRarity(rawRarity, isShiny),
+            backendRarity: backendRarityForEffective(effectiveRarity(rawRarity, isShiny)),
+            marketSeparated: rawRarity === 'L' || rawRarity === 'L+'
+        };
+    };
+
     window.wmLastSales = async function (cardId, rarity = '', limit = RECENT_MARKET_LIMIT) {
         const id = String(cardId || '').trim();
         const rr = String(rarity || '').trim().toUpperCase();
@@ -17946,7 +18194,7 @@
                 probe.rows.map((r, i) => ({
                     n: i + 1,
                     auctionId: r.id,
-                    rarete: r.snapshot_rarity || '?',
+                    rarete: effectiveRarity(r.snapshot_rarity || '', r.is_shiny) || '?',
                     finalPrice: r.final_price,
                     settledAt: r.settled_at,
                     endAt: r.end_at,
@@ -19264,10 +19512,8 @@
 
         const sTitle = String(s.title || '').trim();
         const aTitle = String(auction.card?.wikipedia_title || '').trim();
-        const sRarity = String(s.rarity || '').toUpperCase();
-        const aRarity = String(
-            auction.snapshot_rarity || auction.card?.rarity || ''
-        ).toUpperCase();
+        const sRarity = normalizeRarityCode(s.rarity || '');
+        const aRarity = effectiveRarityFromEntity(auction);
 
         let score = 0;
 
@@ -19621,7 +19867,7 @@
         if (!el) return;
 
         const fmt = (n) => Number(n || 0).toLocaleString('fr-FR');
-        const order = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+        const order = ['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
 
         // Barre horizontale proportionnelle
         const bar = (value, max, color) => {
@@ -19742,7 +19988,7 @@
             // Ligne répartition par rareté (si données disponibles et au moins 1 carte)
             let rarityLine = '';
             if (s.rarities) {
-                const ord = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+                const ord = ['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
                 const totalCards = ord.reduce((sum, r) => sum + (s.rarities[r] || 0), 0);
                 if (totalCards > 0) {
                     const rarParts = ord
@@ -19923,7 +20169,7 @@
             map.set(h.id, {
                 id: h.id,
                 title: h.card?.wikipedia_title || '?',
-                rarity: (h.snapshot_rarity || h.card?.rarity || '').toUpperCase(),
+                rarity: effectiveRarityFromEntity(h) || '?',
                 base: h.listing_base_amount ?? h.base_amount ?? null,
                 final: h.final_price ?? h.current_bid ?? null,
                 soldAt: h.settled_at ? new Date(h.settled_at).getTime() : Date.now()
@@ -21678,7 +21924,7 @@
             const tbody = document.getElementById('wm-sell-table-body');
             if (!tbody) return;
             const cfg = getSellConfig();
-            const order = ['L', 'UR', 'SR', 'R', 'PC', 'C'];
+            const order = ['L+', 'L', 'UR', 'SR', 'R', 'PC', 'C'];
             const durLabel = m => m < 60 ? `${m} min` : `${m / 60} h`;
             tbody.innerHTML = order.map(rar => {
                 const c = RARITY[rar] || { color: '#888' };
@@ -21945,7 +22191,7 @@
             const shown = taggerMatches.slice(0, TAGGER_RENDER_CAP);
             let html = shown.map((m, i) => {
                 const title = m.card?.wikipedia_title || m.wikipedia_title || '?';
-                const rar = (m.card?.rarity || m.rarity || 'C').toUpperCase();
+                const rar = effectiveRarityFromEntity(m, m.card?.rarity || m.rarity || 'C') || 'C';
                 const tagNames = (m.tags || []).map(t => t.name).filter(Boolean).join(', ');
                 return `<label style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:10px;cursor:pointer;">
                     <input type="checkbox" class="wm-tagger-cb" data-idx="${i}" checked style="accent-color:#4ade80;flex-shrink:0;">
@@ -23394,7 +23640,7 @@
                 if (!Number.isFinite(soldAt) || Date.now() - soldAt > 2 * 60 * 1000) continue;
 
                 const title = sale.card?.wikipedia_title || "?";
-                const rarity = (sale.snapshot_rarity || sale.card?.rarity || "?").toUpperCase();
+                const rarity = effectiveRarityFromEntity(sale) || '?';
                 const base = sale.listing_base_amount || sale.base_amount || 0;
                 const final = sale.final_price || sale.current_bid || 0;
                 const gain = final - base;
@@ -23512,8 +23758,8 @@
         for (const c of cards) {
             // Filet de sécurité : on peut exclure les Légendaires de l'auto-tag (une L
             // rare qu'on veut garder ne doit pas finir taguée « Trash » via sa description).
-            const rarity = (c.rarity || c.card?.rarity || '').toUpperCase();
-            if (skipLegendary && rarity === 'L') {
+            const rarity = effectiveRarityFromEntity(c, c.rarity || c.card?.rarity || '') || '';
+            if (skipLegendary && (rarity === 'L' || rarity === 'L+')) {
                 const t = c.wikipedia_title || c.card?.wikipedia_title || '?';
                 wmLog(`🛡️ Auto-tag ignoré (Légendaire protégée) : <b>${t}</b>`);
                 continue;
@@ -23621,7 +23867,7 @@
         const lastDropEl = document.getElementById("wm-last-drop");
         if (lastDropEl) {
             lastDropEl.innerHTML = cards.map(c => {
-                const rarity = (c.rarity || "").toUpperCase();
+                const rarity = effectiveRarity(c.rarity || '', entityShinyFlag(c));
                 const r = RARITY[rarity] || { color: "#aaa", bg: "rgba(170,170,170,0.1)" };
                 const title = c.wikipedia_title || "?";
                 const url = c.wikipedia_url || "";
@@ -24790,7 +25036,7 @@
                 const t = String(c?.wikipedia_title || '').trim();
                 if (!cardId || !t) continue;
                 if (t.toLocaleLowerCase('fr-FR').includes(q.toLocaleLowerCase('fr-FR'))) {
-                    const rarity = String(a?.snapshot_rarity || c?.rarity || '').toUpperCase();
+                    const rarity = effectiveRarityFromEntity(a, c?.rarity || '');
                     found.set(`${cardId}|${rarity}`, { cardId, title: t, rarity });
                 }
             }
