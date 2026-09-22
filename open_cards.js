@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0-beta5';
+    const WM_VERSION = '3.7.0-beta6';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -199,13 +199,13 @@
     // Si end_at remonte au-dessus de 1 min 30 après une extension serveur, les ripostes
     // auto-bid se remettent en pause jusqu'à repasser à <= 1 min 30.
     const AUTOMATIC_BID_MAX_REMAINING_MS = 90 * 1000;
-    // 3.7.0-beta5 — avec ~7 s observés par POST sur le serveur, une mise initiale Hunter
-    // ne part plus si l'enchère a <=12 s restantes, même si son historique est déjà en cache.
+    // 3.7.0-beta6 — garde la marge minimale de 12 s observée en beta5 et traite
+    // un seul candidat Hunter par lot pour éviter qu'une carte attende l'analyse des 3 suivantes.
     // La Hot Lane et ses ripostes restent inchangées.
     const HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS = 12 * 1000;
     const HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS = 20 * 1000;
     const HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS = 60 * 1000;
-    const HUNTER_HEADLESS_ACTION_BATCH_SIZE = 4;
+    const HUNTER_HEADLESS_ACTION_BATCH_SIZE = 1;
 
     function automaticBidRemainingMs(auction) {
         if (!auction?.end_at) return NaN;
@@ -11755,7 +11755,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 200;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 550;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 350;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
