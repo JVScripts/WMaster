@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.24';
+    const WM_VERSION = '3.6.25';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11599,7 +11599,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 1000;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 3000;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2000;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -18279,7 +18279,7 @@
             const official =
                 await fetchWmOfficialSummary(c.cardId, true).catch(() => null);
 
-            const rarities = rr
+            let rarities = rr
                 ? [rr]
                 : [...new Set(
                     [
@@ -18289,6 +18289,17 @@
                         .filter(Boolean)
                         .map(x => String(x).toUpperCase())
                 )];
+
+            // v3.6.25 — le résumé officiel ne connaît que la rareté backend "L".
+            // En mode "Toutes", il faut malgré tout sonder séparément L+ (L shiny) et L,
+            // sinon le panneau Prix WM rapide n'affiche jamais la variante shiny.
+            if (!rr && (rarities.includes('L') || rarities.includes('L+'))) {
+                rarities = [
+                    'L+',
+                    'L',
+                    ...rarities.filter(r => r !== 'L' && r !== 'L+')
+                ];
+            }
 
             for (const r of rarities) {
                 const key = `${c.cardId}|${r}`;
@@ -20696,7 +20707,7 @@
                         <div style="display:flex;gap:5px;align-items:center;">
                             <input id="wm-price-lookup" type="text" autocomplete="off" spellcheck="false" placeholder="Nom de la carte…" style="flex:1;min-width:0;padding:4px 7px;border-radius:4px;border:1px solid rgba(6,182,212,.35);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
                             <select id="wm-price-rarity" style="width:58px;padding:4px 3px;border-radius:4px;border:1px solid rgba(255,255,255,.1);background:#0f0f13;color:#fff;font-size:10px;outline:none;">
-                                <option value="">Toutes</option><option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option><option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
+                                <option value="">Toutes</option><option value="L+">L+</option><option value="L">L</option><option value="UR">UR</option><option value="SR">SR</option><option value="R">R</option><option value="PC">PC</option><option value="C">C</option>
                             </select>
                             <button id="wm-price-btn" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(6,182,212,.45);background:rgba(6,182,212,.10);color:#67e8f9;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">Prix WM</button>
                             <button id="wm-last-sales-btn" title="Teste jusqu’aux 25 dernières ventes visibles dans la table auctions avec ta RLS normale" style="padding:4px 8px;border-radius:4px;border:1px solid rgba(251,191,36,.45);background:rgba(251,191,36,.08);color:#fbbf24;font-size:10px;font-weight:700;cursor:pointer;white-space:nowrap;">🧪 25 ventes</button>
