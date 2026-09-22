@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0-beta6';
+    const WM_VERSION = '3.7.0-beta7';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -199,13 +199,15 @@
     // Si end_at remonte au-dessus de 1 min 30 après une extension serveur, les ripostes
     // auto-bid se remettent en pause jusqu'à repasser à <= 1 min 30.
     const AUTOMATIC_BID_MAX_REMAINING_MS = 90 * 1000;
-    // 3.7.0-beta6 — garde la marge minimale de 12 s observée en beta5 et traite
-    // un seul candidat Hunter par lot pour éviter qu'une carte attende l'analyse des 3 suivantes.
-    // La Hot Lane et ses ripostes restent inchangées.
+    // 3.7.0-beta7 — sépare la pré-analyse marché de la mise.
+    // Les historiques sont préparés en amont avec le même plafond de 4 lectures concurrentes
+    // que l'ancien preload Hunter ; les POST de mise restent, eux, strictement sérialisés.
+    // La marge minimale de 12 s et la Hot Lane restent inchangées.
     const HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS = 12 * 1000;
     const HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS = 20 * 1000;
     const HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS = 60 * 1000;
     const HUNTER_HEADLESS_ACTION_BATCH_SIZE = 1;
+    const HUNTER_HEADLESS_PREANALYSIS_WORKERS = 4;
 
     function automaticBidRemainingMs(auction) {
         if (!auction?.end_at) return NaN;
@@ -14384,17 +14386,19 @@
     let hunterHeadlessTimeout = null;
     let hunterHeadlessScanInProgress = false;
 
-    // 3.7.0-beta3 : pipeline léger à deux étages.
-    // 1) T-2m00 → T-1m30 : préchauffe uniquement l'historique 15-25 ventes, aucune mise.
-    // 2) T<=1m30 : une seule file d'action, triée dynamiquement pour traiter d'abord
-    //    les enchères dont l'historique est prêt, puis celles qui gardent le plus de marge.
+    // 3.7.0-beta7 : pipeline réellement séparé en deux étages.
+    // 1) T<=1m30 : pré-analyse le Recent Market en parallèle borné (4), sans aucune mise.
+    //    Seules les cartes qui passent déjà la décision économique sont transmises à l'étage 2.
+    // 2) File d'action sérialisée : relecture fraîche puis POST, avec garde-fou T>12 s.
+    // Cela évite que la file de mise passe son temps à télécharger 15-25 ventes au dernier moment.
     let hunterHeadlessPageActionQueue = [];
     let hunterHeadlessPageWorkerRunning = false;
     const hunterHeadlessPageQueuedIds = new Set();
     let hunterHeadlessPagePending = 0;
 
-    let hunterHeadlessPrewarmChain = Promise.resolve();
-    const hunterHeadlessPrewarmQueuedKeys = new Set();
+    let hunterHeadlessPrewarmQueue = [];
+    let hunterHeadlessPrewarmWorkersActive = 0;
+    const hunterHeadlessPrewarmQueuedIds = new Set();
     let hunterHeadlessPrewarmPending = 0;
 
     const hunterHeadlessStats = {
@@ -14410,6 +14414,9 @@
         prewarmQueued: 0,
         prewarmDone: 0,
         prewarmError: 0,
+        prevalidated: 0,
+        preanalysisRejected: 0,
+        preanalysisTooLate: 0,
         actionTooLate: 0
     };
 
@@ -14441,71 +14448,213 @@
         );
     }
 
+    function hunterHeadlessFastCandidateAllowed(a) {
+        if (!a?.id) return false;
+        if (!automaticBidTimeAllowed(a)) return false;
+        if (matchedHunterEntry(a.card)) return false;
+        if (hasPriorityKeyword(a.card)) return false;
+        if (snipeSet.has(a.id) || hasFourbeKeyword(a.card)) return false;
+        if (autoBidSet.has(a.id)) return false;
+        if (iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) return false;
+
+        const rarity = globalAuctionRarity(a);
+        if (isOwnedDuplicate(a.card?.id ?? a.card_id, rarity)) return false;
+        if (hunterDuplicateExposureState(a).blocked) return false;
+        return true;
+    }
+
+    function hunterPreanalysisPriority(a, b) {
+        const ar = automaticBidRemainingMs(a);
+        const br = automaticBidRemainingMs(b);
+
+        // Préparer d'abord les enchères qui ont le PLUS de marge : si l'historique prend
+        // plusieurs secondes, elles ont encore une chance réaliste d'arriver au POST >12 s.
+        if (!Number.isFinite(ar)) return 1;
+        if (!Number.isFinite(br)) return -1;
+        return br - ar;
+    }
+
+    function queueHunterPageCandidates(list) {
+        if (!hunterHeadlessWanted() || !Array.isArray(list) || list.length === 0) return 0;
+
+        const fresh = list.filter(a =>
+            a?.id &&
+            automaticBidTimeAllowed(a) &&
+            !hunterHeadlessPageQueuedIds.has(a.id)
+        );
+        if (fresh.length === 0) return 0;
+
+        for (const a of fresh) {
+            hunterHeadlessPageQueuedIds.add(a.id);
+            hunterHeadlessPageActionQueue.push(a);
+        }
+        hunterHeadlessPagePending += fresh.length;
+        runHunterPageActionQueue().catch(() => { });
+        return fresh.length;
+    }
+
+    function queuePreparedHunterAction(a) {
+        if (!hunterHeadlessWanted() || !a?.id) return false;
+        if (!hunterHeadlessFastCandidateAllowed(a)) return false;
+
+        const remaining = automaticBidRemainingMs(a);
+        if (!Number.isFinite(remaining) || remaining <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS) {
+            hunterHeadlessStats.preanalysisTooLate++;
+            return false;
+        }
+
+        // L'historique vient d'être préparé. La décision ici sert de pré-filtre économique ;
+        // runHunterAutoBidPass la revalidera encore sur l'état frais juste avant le POST.
+        const decision = shouldAutoSnipe(a);
+        if (!decision?.snipe) {
+            hunterHeadlessStats.preanalysisRejected++;
+            return false;
+        }
+
+        const queued = queueHunterPageCandidates([a]);
+        if (queued > 0) {
+            hunterHeadlessStats.prevalidated += queued;
+            return true;
+        }
+        return false;
+    }
+
+    async function runHunterPreanalysisWorker() {
+        hunterHeadlessPrewarmWorkersActive++;
+        try {
+            while (hunterHeadlessWanted() && hunterHeadlessPrewarmQueue.length > 0) {
+                hunterHeadlessPrewarmQueue.sort(hunterPreanalysisPriority);
+                const a = hunterHeadlessPrewarmQueue.shift();
+                if (!a?.id) continue;
+
+                try {
+                    const remaining = automaticBidRemainingMs(a);
+                    if (!Number.isFinite(remaining) ||
+                        remaining <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS ||
+                        remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
+                        if (Number.isFinite(remaining) && remaining <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS) {
+                            hunterHeadlessStats.preanalysisTooLate++;
+                        }
+                        continue;
+                    }
+
+                    if (!hunterHeadlessFastCandidateAllowed(a)) continue;
+
+                    const cardId = a.card?.id ?? a.card_id;
+                    const rarity = globalAuctionRarity(a);
+                    if (!cardId || !rarity) continue;
+
+                    // Si un snapshot <=60 s existe déjà et dit clairement "pas de mise",
+                    // inutile de refaire une requête lourde juste pour confirmer le même refus.
+                    const cachedDecisionMarket = getCachedRecentMarket(
+                        cardId,
+                        rarity,
+                        HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+                    );
+                    if (cachedDecisionMarket?.ok) {
+                        const cachedDecision = shouldAutoSnipe(a);
+                        if (!cachedDecision?.snipe) {
+                            hunterHeadlessStats.preanalysisRejected++;
+                            continue;
+                        }
+                    }
+
+                    // Pour une carte encore intéressante, rafraîchit à <=5 s AVANT de la
+                    // transmettre à la file de mise. C'est la partie lourde, faite ici en amont.
+                    const recent = await ensureFreshRecentMarket(
+                        cardId,
+                        rarity,
+                        Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                    );
+
+                    if (!recent?.ok) {
+                        hunterHeadlessStats.prewarmError++;
+                        continue;
+                    }
+
+                    hunterHeadlessStats.prewarmDone++;
+                    queuePreparedHunterAction(a);
+                } catch (e) {
+                    hunterHeadlessStats.prewarmError++;
+                    console.warn('[WikiMasters][hunter-headless] preanalysis error:', e);
+                } finally {
+                    hunterHeadlessPrewarmQueuedIds.delete(a.id);
+                    hunterHeadlessPrewarmPending = Math.max(0, hunterHeadlessPrewarmPending - 1);
+                }
+            }
+        } finally {
+            hunterHeadlessPrewarmWorkersActive = Math.max(0, hunterHeadlessPrewarmWorkersActive - 1);
+            pumpHunterPreanalysisWorkers();
+        }
+    }
+
+    function pumpHunterPreanalysisWorkers() {
+        if (!hunterHeadlessWanted()) return;
+        while (
+            hunterHeadlessPrewarmWorkersActive < HUNTER_HEADLESS_PREANALYSIS_WORKERS &&
+            hunterHeadlessPrewarmQueue.length > 0
+        ) {
+            runHunterPreanalysisWorker().catch(e => {
+                hunterHeadlessStats.prewarmError++;
+                console.warn('[WikiMasters][hunter-headless] preanalysis worker error:', e);
+            });
+        }
+    }
+
     function queueHunterPrewarmCandidates(list) {
         if (!hunterHeadlessWanted() || !Array.isArray(list) || list.length === 0) return 0;
 
-        const targets = [];
-        const seen = new Set();
+        let queued = 0;
+
         for (const a of list) {
             if (!a?.id) continue;
+            if (hunterHeadlessPrewarmQueuedIds.has(a.id) || hunterHeadlessPageQueuedIds.has(a.id)) continue;
+            if (!hunterHeadlessFastCandidateAllowed(a)) continue;
+
             const remaining = automaticBidRemainingMs(a);
             if (!Number.isFinite(remaining) ||
-                remaining <= AUTOMATIC_BID_MAX_REMAINING_MS ||
-                remaining > AUTOMATIC_BID_MAX_REMAINING_MS + HUNTER_HEADLESS_MARGIN_MS) {
+                remaining <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS ||
+                remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
                 continue;
             }
 
             const cardId = a.card?.id ?? a.card_id;
             const rarity = globalAuctionRarity(a);
             if (!cardId || !rarity) continue;
-            const key = recentMarketKey(cardId, rarity);
-            if (seen.has(key) || hunterHeadlessPrewarmQueuedKeys.has(key)) continue;
-            seen.add(key);
 
-            if (getCachedRecentMarket(cardId, rarity, HUNTER_RECENT_REFERENCE_MAX_AGE_MS)) continue;
+            // Si l'historique est déjà ultra-frais, la carte peut passer directement
+            // dans la file de mise sans refaire de réseau.
+            const freshForBid = getCachedRecentMarket(
+                cardId,
+                rarity,
+                Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+            );
+            if (freshForBid?.ok) {
+                queuePreparedHunterAction(a);
+                continue;
+            }
 
-            targets.push({ cardId, rarity, key, remaining });
+            // Un cache <=60 s permet au moins d'éliminer immédiatement les cartes dont
+            // la décision économique est déjà négative, sans refresh inutile.
+            const cachedDecisionMarket = getCachedRecentMarket(
+                cardId,
+                rarity,
+                HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+            );
+            if (cachedDecisionMarket?.ok && !shouldAutoSnipe(a)?.snipe) {
+                hunterHeadlessStats.preanalysisRejected++;
+                continue;
+            }
+
+            hunterHeadlessPrewarmQueuedIds.add(a.id);
+            hunterHeadlessPrewarmQueue.push(a);
+            hunterHeadlessPrewarmPending++;
+            hunterHeadlessStats.prewarmQueued++;
+            queued++;
         }
 
-        // Les cartes les plus proches de T-1m30 sont préchauffées d'abord.
-        targets.sort((a, b) => a.remaining - b.remaining);
-        if (targets.length === 0) return 0;
-
-        for (const t of targets) hunterHeadlessPrewarmQueuedKeys.add(t.key);
-        hunterHeadlessPrewarmPending += targets.length;
-        hunterHeadlessStats.prewarmQueued += targets.length;
-
-        hunterHeadlessPrewarmChain = hunterHeadlessPrewarmChain
-            .then(async () => {
-                for (const t of targets) {
-                    if (!hunterHeadlessWanted()) break;
-                    try {
-                        await ensureFreshRecentMarket(
-                            t.cardId,
-                            t.rarity,
-                            HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-                        );
-                        hunterHeadlessStats.prewarmDone++;
-                    } catch (e) {
-                        hunterHeadlessStats.prewarmError++;
-                    } finally {
-                        // Garde la clé réservée jusqu'à la fin du lot : un scan suivant ne peut
-                        // pas ré-enfiler la même carte pendant que ce lot est encore en cours.
-                        hunterHeadlessPrewarmPending = Math.max(0, hunterHeadlessPrewarmPending - 1);
-                    }
-                }
-            })
-            .catch(e => {
-                hunterHeadlessStats.prewarmError++;
-                console.warn('[WikiMasters][hunter-headless] prewarm error:', e);
-            })
-            .finally(() => {
-                // Si le Hunter a été coupé au milieu du lot, nettoie les clés restantes.
-                for (const t of targets) hunterHeadlessPrewarmQueuedKeys.delete(t.key);
-                hunterHeadlessPrewarmPending = hunterHeadlessPrewarmQueuedKeys.size;
-            });
-
-        return targets.length;
+        pumpHunterPreanalysisWorkers();
+        return queued;
     }
 
     function hunterPageActionPriority(a, b) {
@@ -14596,25 +14745,6 @@
         }
     }
 
-    function queueHunterPageCandidates(list) {
-        if (!hunterHeadlessWanted() || !Array.isArray(list) || list.length === 0) return 0;
-
-        const fresh = list.filter(a =>
-            a?.id &&
-            automaticBidTimeAllowed(a) &&
-            !hunterHeadlessPageQueuedIds.has(a.id)
-        );
-        if (fresh.length === 0) return 0;
-
-        for (const a of fresh) {
-            hunterHeadlessPageQueuedIds.add(a.id);
-            hunterHeadlessPageActionQueue.push(a);
-        }
-        hunterHeadlessPagePending += fresh.length;
-        runHunterPageActionQueue().catch(() => { });
-        return fresh.length;
-    }
-
     function seedTrackedAuctionsForHotLane(auctions) {
         if (!Array.isArray(auctions) || auctions.length === 0) return 0;
 
@@ -14685,10 +14815,9 @@
                 });
 
             streamedCandidates += candidates.length;
-            // T-2m00 → T-1m30 : prépare le Recent Market sans jamais placer de mise.
+            // beta7 : toute carte T<=1m30 passe d'abord par la pré-analyse Recent Market.
+            // Seules les candidates économiquement validées rejoignent ensuite la file de POST.
             queueHunterPrewarmCandidates(candidates);
-            // T<=1m30 : entre dans la file de décision/mise priorisée.
-            queueHunterPageCandidates(candidates);
         };
 
         const result =
@@ -14799,7 +14928,7 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · préchauffage T-2m→T-1m30 · file de mise priorisée · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · pré-analyse Recent Market T≤1m30 (${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers max) · file de POST sérialisée · garde-fou initial T>${Math.round(HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -14860,12 +14989,18 @@
             analysesPageEnFile: hunterHeadlessPagePending,
             idsAnalysePageEnFile: hunterHeadlessPageQueuedIds.size,
             workerAnalyseActif: hunterHeadlessPageWorkerRunning,
-            prechauffageEnFile: hunterHeadlessPrewarmPending,
-            prechauffagesLances: hunterHeadlessStats.prewarmQueued,
-            prechauffagesTermines: hunterHeadlessStats.prewarmDone,
-            erreursPrechauffage: hunterHeadlessStats.prewarmError,
+            preanalysesEnFile: hunterHeadlessPrewarmPending,
+            workersPreanalyseActifs: hunterHeadlessPrewarmWorkersActive,
+            workersPreanalyseMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
+            preanalysesLancees: hunterHeadlessStats.prewarmQueued,
+            preanalysesTerminees: hunterHeadlessStats.prewarmDone,
+            candidatsPrevalides: hunterHeadlessStats.prevalidated,
+            rejetsApresPreanalyse: hunterHeadlessStats.preanalysisRejected,
+            abandonsPendantPreanalyse: hunterHeadlessStats.preanalysisTooLate,
+            erreursPreanalyse: hunterHeadlessStats.prewarmError,
             abandonsTropTardInitial: hunterHeadlessStats.actionTooLate,
             seuilMiseInitialeHunterMs: HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS,
+            prioritePreanalyse: 'plus grande marge restante d’abord',
             prioriteHunter: '20-60s > 60-90s > 12-20s',
             erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,
             hotLaneOn: hotLaneActive,
