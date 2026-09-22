@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0-beta';
+    const WM_VERSION = '3.7.0-beta2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -34,7 +34,8 @@
     // v3.2.0 — Hunter autonome : quand le Market Watcher visuel est OFF, le Hunter
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
     const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // lit jusqu'à T-2m00 : fenêtre 1m30 + 30 s de marge de scan
-    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // assez rapide sans scanner inutilement tout le marché
+    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // 3 pages en parallèle, comme la base 3.6.23
+    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 8;    // scan court : au plus 8 pages ending_soon par cycle (~400 enchères)
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -10337,14 +10338,19 @@
     // autorisée avant T-1m30, il est inutile de télécharger les dizaines/centaines
     // de pages situées bien après cette fenêtre lorsque le Market Watcher est OFF.
     //
-    // On garde 30 s de marge : un scan qui arrive légèrement avant T-1m30 aura déjà
-    // la carte au cycle suivant sans trou de découverte.
+    // On garde 30 s de marge pour la découverte, MAIS on ne parcourt plus des dizaines
+    // de pages : au plus 8 pages ending_soon par cycle. Comme le scan repart ~10 s plus
+    // tard, les enchères plus lointaines remonteront naturellement vers ces premières pages.
     async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
         const first = await fetchMarketPage(1);
         const total = Number(first?.total || 0);
         const totalPages = Math.max(
             1,
             Math.ceil(total / MARKET_PAGE_LIMIT)
+        );
+        const maxPageThisScan = Math.min(
+            totalPages,
+            HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
         );
 
         const cutoff =
@@ -10421,14 +10427,14 @@
 
         for (
             let start = 2;
-            start <= totalPages && !boundaryReached;
+            start <= maxPageThisScan && !boundaryReached;
             start += HUNTER_HEADLESS_PAGE_CONCURRENCY
         ) {
             const pages = [];
             for (
                 let p = start;
                 p < start + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
-                p <= totalPages;
+                p <= maxPageThisScan;
                 p++
             ) {
                 pages.push(p);
@@ -10465,7 +10471,9 @@
             total,
             totalPages,
             pagesScanned,
-            cutoffMs: cutoff
+            cutoffMs: cutoff,
+            maxPageThisScan,
+            pageCapReached: totalPages > maxPageThisScan && !boundaryReached
         };
     }
 
@@ -14254,7 +14262,8 @@
         lastAuctionsInWindow: 0,
         lastCandidates: 0,
         lastError: '',
-        lastPageActionError: ''
+        lastPageActionError: '',
+        pageCapStops: 0
     };
 
     function hunterHeadlessWanted() {
@@ -14404,6 +14413,9 @@
             auctions.length;
         hunterHeadlessStats.lastCandidates =
             streamedCandidates;
+        if (result?.pageCapReached) {
+            hunterHeadlessStats.pageCapStops++;
+        }
 
         // Important : on N'ATTEND PAS hunterHeadlessPageActionChain ici.
         // Le scan se termine dès que la pagination se termine ; les candidats des premières
@@ -14485,8 +14497,8 @@
 
             if (!silent) {
                 wmLog(
-                    `⚡ Hunter autonome 3.7.0-beta démarré · ` +
-                    `scan T-2m00 · traitement page par page · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `⚡ Hunter autonome 3.7.0-beta2 démarré · ` +
+                    `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · traitement page par page · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -14542,6 +14554,8 @@
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
             traitementPageParPage: true,
+            maxPagesParScan: HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
+            arretsLimitePages: hunterHeadlessStats.pageCapStops,
             analysesPageEnFile: hunterHeadlessPagePending,
             idsAnalysePageEnFile: hunterHeadlessPageQueuedIds.size,
             erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,
