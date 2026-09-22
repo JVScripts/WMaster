@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.25';
+    const WM_VERSION = '3.6.26';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -33,7 +33,7 @@
     const MARKET_COUNTDOWN_TICK_MS = 100;          // affichage uniquement ; aucun impact sur le moteur
     // v3.2.0 — Hunter autonome : quand le Market Watcher visuel est OFF, le Hunter
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
-    const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // lit jusqu'à T-5m30 pour absorber le jitter de scan
+    const HUNTER_HEADLESS_MARGIN_MS = 10_000;       // lit jusqu'à T-1m10 : 1 cycle de marge avec scan 10 s
     const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // assez rapide sans scanner inutilement tout le marché
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
@@ -193,11 +193,11 @@
     const HUNTER_DYNAMIC_SOURCE_KEY = 'wm_hunter_dynamic_source_v1';
 
     // Règle GLOBALE de temps pour les mises automatiques :
-    // aucune mise automatique n'est autorisée tant qu'il reste plus de 5 minutes.
+    // aucune mise automatique n'est autorisée tant qu'il reste plus de 1 minute.
     // Une enchère peut rester armée dans autoBidSet / snipeSet, mais elle attend.
-    // Si end_at remonte au-dessus de 5 min après une extension serveur, les ripostes
-    // auto-bid se remettent en pause jusqu'à repasser à <= 5 min.
-    const AUTOMATIC_BID_MAX_REMAINING_MS = 5 * 60 * 1000;
+    // Si end_at remonte au-dessus de 1 min après une extension serveur, les ripostes
+    // auto-bid se remettent en pause jusqu'à repasser à <= 1 min.
+    const AUTOMATIC_BID_MAX_REMAINING_MS = 1 * 60 * 1000;
 
     function automaticBidRemainingMs(auction) {
         if (!auction?.end_at) return NaN;
@@ -10334,12 +10334,15 @@
     // Fetch léger du Hunter autonome.
     //
     // La marketplace est triée "ending_soon". Comme AUCUNE mise automatique n'est
-    // autorisée avant T-5 min, il est inutile de télécharger les dizaines/centaines
+    // autorisée avant T-1 min, il est inutile de télécharger les dizaines/centaines
     // de pages situées bien après cette fenêtre lorsque le Market Watcher est OFF.
     //
-    // On garde 30 s de marge : un scan qui arrive légèrement avant T-5 min aura déjà
-    // la carte au cycle suivant sans trou de découverte.
-    async function fetchHunterActionWindowAuctions(onProgress) {
+    // On garde 10 s de marge, soit un cycle de scan : une enchère qui vient d'entrer
+    // dans la minute utile est déjà visible sans élargir inutilement la pagination.
+    //
+    // onBatch est appelé dès qu'une page utile arrive : le Hunter peut donc commencer
+    // son analyse/action sur la page 1 pendant que les pages suivantes se téléchargent.
+    async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
         const first = await fetchMarketPage(1);
         const total = Number(first?.total || 0);
         const totalPages = Math.max(
@@ -10362,6 +10365,7 @@
 
             pagesScanned++;
 
+            const pageUseful = [];
             let furthestRemaining = -Infinity;
             for (const a of rows) {
                 if (!a?.id || !a?.end_at) continue;
@@ -10384,6 +10388,7 @@
                     remaining <= cutoff
                 ) {
                     collected.push(a);
+                    pageUseful.push(a);
                 }
             }
 
@@ -10395,8 +10400,16 @@
                 );
             }
 
+            if (onBatch && pageUseful.length > 0) {
+                try {
+                    onBatch(pageUseful, pageNo, totalPages);
+                } catch (e) {
+                    console.warn('[WikiMasters][hunter-headless] batch callback error:', e);
+                }
+            }
+
             // Pages triées par fin proche : dès que la fin d'une page traverse
-            // T-5m30, les pages suivantes sont hors zone utile.
+            // T-1m10, les pages suivantes sont hors zone utile.
             if (
                 Number.isFinite(furthestRemaining) &&
                 furthestRemaining > cutoff
@@ -11349,7 +11362,7 @@
 
                 // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
                 // notre relecture et le POST, le serveur renvoie son minimum actuel. On relit
-                // encore l'enchère, vérifie self-bid / T-5 / plafond, puis retente UNE fois.
+                // encore l'enchère, vérifie self-bid / T-1 / plafond, puis retente UNE fois.
                 if (!attempt.res.ok) {
                     const serverMinimum = minimumFromTooLowError(attempt.data);
                     if (serverMinimum !== null) {
@@ -11599,7 +11612,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 1000;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2000;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 3000;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -12096,10 +12109,10 @@
                     }
                     // 3) Mise initiale unique (les deux modes), jamais au-dessus du plafond.
                     // Règle globale : on peut ARMER longtemps à l'avance, mais aucune mise
-                    // automatique n'est envoyée avant T-5:00.
+                    // automatique n'est envoyée avant T-1:00.
                     const alreadyLeading = iAmLeading(a) || autoBidBlockedByUncertainSelfState(a);
                     if (!automaticBidTimeAllowed(a)) {
-                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] — attente T-5 min avant toute mise`);
+                        wmLog(`🎯 Chasseur armé (${h.mode === 'fourbe' ? 'fourbe' : 'auto-bid'}, plafond ${h.cap}) : <b>${title}</b> [${rar}] — attente T-1 min avant toute mise`);
                         continue;
                     }
                     if (alreadyLeading || bidLockSet.has(a.id) || wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) {
@@ -12149,7 +12162,7 @@
                     if (bidLockSet.has(a.id)) continue;
 
                     // Active l'auto-bid automatiquement sur cette enchère (riposte ultérieure).
-                    // On peut l'armer tôt, mais la règle globale interdit toute mise avant T-5 min.
+                    // On peut l'armer tôt, mais la règle globale interdit toute mise avant T-1 min.
                     if (!autoBidSet.has(a.id)) {
                         autoBidSet.add(a.id);
                         saveAutoBidSet();
@@ -14298,8 +14311,55 @@
         // Le solde conditionne les décisions de mise.
         await fetchBalance();
 
+        // Les lots sont traités dès leur arrivée. La pagination continue en parallèle
+        // pendant que la file d'analyse Hunter traite page 1, puis les pages suivantes.
+        const seenCandidateIds = new Set();
+        let streamedCandidateCount = 0;
+        let hunterActionChain = Promise.resolve();
+
+        const processHunterBatch = (batch) => {
+            if (!Array.isArray(batch) || batch.length === 0) return;
+
+            // Sécurité anti auto-surenchère au plus tôt, sans attendre la fin du scan.
+            batch.forEach(a => {
+                if (iAmLeading(a)) {
+                    trackMyBid(a.id);
+                    rememberMyLeadingBid(
+                        a,
+                        a.current_bid ?? a.base_amount
+                    );
+                }
+            });
+
+            // Alimente aussi la Hot Lane immédiatement pour les enchères très proches.
+            seedTrackedAuctionsForHotLane(batch);
+            if (!hotLaneActive) startHotLane();
+            else scheduleHotLane();
+
+            const freshCandidates =
+                getHunterDynamicCandidatePool(batch)
+                    .filter(a => {
+                        if (!a?.id || seenCandidateIds.has(a.id)) return false;
+                        seenCandidateIds.add(a.id);
+                        return true;
+                    });
+
+            streamedCandidateCount += freshCandidates.length;
+
+            if (freshCandidates.length > 0) {
+                hunterActionChain = hunterActionChain
+                    .then(() => runHunterAutoBidPass(freshCandidates))
+                    .catch(e => {
+                        console.warn('[WikiMasters][hunter-headless] batch action error:', e);
+                    });
+            }
+        };
+
         const result =
-            await fetchHunterActionWindowAuctions();
+            await fetchHunterActionWindowAuctions(
+                null,
+                processHunterBatch
+            );
 
         const auctions =
             Array.isArray(result?.auctions)
@@ -14312,44 +14372,33 @@
 
         apiHealth.lastMarketScanTs = Date.now();
 
-        // Sécurité anti auto-surenchère identique au scan complet.
-        auctions.forEach(a => {
-            if (iAmLeading(a)) {
-                trackMyBid(a.id);
-                rememberMyLeadingBid(
-                    a,
-                    a.current_bid ?? a.base_amount
-                );
-            }
-        });
-
-        const hunterCandidates =
-            getHunterDynamicCandidatePool(auctions);
-
         hunterHeadlessStats.lastPagesScanned =
             Number(result?.pagesScanned || 0);
         hunterHeadlessStats.lastAuctionsInWindow =
             auctions.length;
         hunterHeadlessStats.lastCandidates =
-            hunterCandidates.length;
+            streamedCandidateCount;
 
-        if (hunterCandidates.length > 0) {
-            await runHunterAutoBidPass(
-                hunterCandidates
-            );
+        // Le scan n'attend plus pour COMMENCER à agir ; on attend seulement ici que
+        // les actions déjà déclenchées finissent avant de planifier le cycle suivant.
+        await hunterActionChain;
+
+        // Filet de sécurité pour une enchère dédupliquée différemment entre deux pages.
+        const leftoverCandidates =
+            getHunterDynamicCandidatePool(auctions)
+                .filter(a => a?.id && !seenCandidateIds.has(a.id));
+
+        if (leftoverCandidates.length > 0) {
+            hunterHeadlessStats.lastCandidates += leftoverCandidates.length;
+            await runHunterAutoBidPass(leftoverCandidates);
         }
 
-        // Important pour le mode Fourbe et les enchères déjà engagées :
-        // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
-        // passe immédiatement à 150/250 ms dans la zone chaude.
+        // Replanifie une dernière fois la Hot Lane avec la vue dédupliquée complète.
         seedTrackedAuctionsForHotLane(auctions);
 
         if (!hotLaneActive) {
             startHotLane();
         } else {
-            // Une carte peut apparaître directement à T-8s.
-            // On recalcule immédiatement le prochain tick au lieu d'attendre
-            // l'ancien sommeil de 10 s.
             scheduleHotLane();
         }
     }
@@ -14416,7 +14465,7 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome démarré · ` +
-                    `scan léger T-5m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `scan léger T-1m10 · traitement par page · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
