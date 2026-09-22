@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0-beta3';
+    const WM_VERSION = '3.7.0-beta4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10596,6 +10596,33 @@
         try { localStorage.setItem(AUTOBID_SET_KEY, JSON.stringify([...autoBidSet])); } catch (e) { }
     }
 
+    // v3.7.0-beta4 — diagnostic de session pour les POST Hunter.
+    // Ces compteurs ne pilotent aucune décision : ils servent uniquement à distinguer
+    // une course de prix (mise trop basse), une enchère déjà terminée et un autre échec serveur.
+    const hunterBidDiagStats = {
+        sessionStartedAt: Date.now(),
+        postsAttempted: 0,
+        postsSucceeded: 0,
+        postsTooLow: 0,
+        postsEnded: 0,
+        postsOtherFailed: 0,
+        retriesAttempted: 0,
+        networkErrors: 0,
+        lastPost: null
+    };
+
+    function hunterBidDiagRemainingLabel(ms) {
+        if (!Number.isFinite(ms)) return '?';
+        return `${Math.max(0, ms) / 1000 >= 10 ? (Math.max(0, ms) / 1000).toFixed(1) : (Math.max(0, ms) / 1000).toFixed(2)}s`;
+    }
+
+    function hunterBidDiagClassifyError(data) {
+        const text = String(data?.error || data?.message || 'erreur');
+        if (/mise\s+trop\s+basse/i.test(text)) return 'too_low';
+        if (/ench[eè]re\s+(?:est\s+)?termin[eé]e|auction\s+(?:is\s+)?(?:ended|finished|closed)/i.test(text)) return 'ended';
+        return 'other';
+    }
+
     // Mode "Fourbe" (snipe) : Set<auctionId> — au lieu de riposter à chaque contre-offre
     // (ce qui fait grimper le prix), on ne mise QU'UNE fois à ~10s de la fin. Miser sous
     // 10s rallonge le timer d'1 min côté site, donc on vise pile au-dessus de 10s pour
@@ -11311,18 +11338,100 @@
             return { auction: fresh, decision, amount, isDynamic };
         }
 
-        async function postHunterBid(auctionId, amount) {
-            const res = await fetch(
-                `${MARKET_API_BASE}/${auctionId}/bid`,
-                {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ amount })
-                }
+        async function postHunterBid(auction, amount, decision, attemptNo = 1) {
+            const auctionId = auction?.id;
+            const title = auction?.card?.wikipedia_title || '?';
+            const rar = globalAuctionRarity(auction) || '';
+            const remainingBeforeMs = automaticBidRemainingMs(auction);
+            const cap = Number(decision?.cap);
+            const capLabel = Number.isFinite(cap) ? `${Math.round(cap)} 💰` : '—';
+            const startedAt = performance.now();
+
+            hunterBidDiagStats.postsAttempted++;
+            if (attemptNo > 1) hunterBidDiagStats.retriesAttempted++;
+
+            wmLog(
+                `🧪 Hunter POST #${attemptNo} : <b>${htmlEsc(title)}</b> [${htmlEsc(rar)}] · ` +
+                `<b>${Math.round(amount)} 💰</b> · T-${hunterBidDiagRemainingLabel(remainingBeforeMs)} · plafond ${capLabel}`
             );
-            const data = await res.json().catch(() => ({}));
-            return { res, data };
+
+            try {
+                const res = await fetch(
+                    `${MARKET_API_BASE}/${auctionId}/bid`,
+                    {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ amount })
+                    }
+                );
+                const data = await res.json().catch(() => ({}));
+                const elapsedMs = Math.round(performance.now() - startedAt);
+                const remainingAfterMs = automaticBidRemainingMs(auction);
+                const errorText = String(data?.error || data?.message || 'erreur');
+                const errorClass = res.ok ? 'ok' : hunterBidDiagClassifyError(data);
+
+                hunterBidDiagStats.lastPost = {
+                    at: Date.now(),
+                    title,
+                    rarity: rar,
+                    attemptNo,
+                    amount: Math.round(amount),
+                    cap: Number.isFinite(cap) ? Math.round(cap) : null,
+                    ok: !!res.ok,
+                    status: res.status,
+                    elapsedMs,
+                    remainingBeforeMs: Number.isFinite(remainingBeforeMs) ? Math.round(remainingBeforeMs) : null,
+                    remainingAfterMs: Number.isFinite(remainingAfterMs) ? Math.round(remainingAfterMs) : null,
+                    error: res.ok ? null : errorText
+                };
+
+                if (res.ok) {
+                    hunterBidDiagStats.postsSucceeded++;
+                    wmLog(
+                        `✅ Hunter POST #${attemptNo} accepté : <b>${htmlEsc(title)}</b> · ` +
+                        `${Math.round(amount)} 💰 · ${elapsedMs} ms · reste ${hunterBidDiagRemainingLabel(remainingAfterMs)}`
+                    );
+                } else {
+                    if (errorClass === 'too_low') hunterBidDiagStats.postsTooLow++;
+                    else if (errorClass === 'ended') hunterBidDiagStats.postsEnded++;
+                    else hunterBidDiagStats.postsOtherFailed++;
+
+                    const min = minimumFromTooLowError(data);
+                    wmLog(
+                        `↪️ Hunter POST #${attemptNo} refusé : <b>${htmlEsc(title)}</b> · ` +
+                        `${htmlEsc(errorText)}` +
+                        `${Number.isFinite(min) ? ` · minimum serveur <b>${min} 💰</b>` : ''}` +
+                        ` · ${elapsedMs} ms · reste ${hunterBidDiagRemainingLabel(remainingAfterMs)}`
+                    );
+                }
+
+                return { res, data };
+            } catch (e) {
+                const elapsedMs = Math.round(performance.now() - startedAt);
+                const remainingAfterMs = automaticBidRemainingMs(auction);
+                hunterBidDiagStats.networkErrors++;
+                hunterBidDiagStats.lastPost = {
+                    at: Date.now(),
+                    title,
+                    rarity: rar,
+                    attemptNo,
+                    amount: Math.round(amount),
+                    cap: Number.isFinite(cap) ? Math.round(cap) : null,
+                    ok: false,
+                    status: null,
+                    elapsedMs,
+                    remainingBeforeMs: Number.isFinite(remainingBeforeMs) ? Math.round(remainingBeforeMs) : null,
+                    remainingAfterMs: Number.isFinite(remainingAfterMs) ? Math.round(remainingAfterMs) : null,
+                    error: String(e?.message || e || 'erreur réseau')
+                };
+                wmLog(
+                    `⚠️ Hunter POST #${attemptNo} erreur réseau : <b>${htmlEsc(title)}</b> · ` +
+                    `${htmlEsc(String(e?.message || e || 'erreur'))} · ${elapsedMs} ms · ` +
+                    `reste ${hunterBidDiagRemainingLabel(remainingAfterMs)}`
+                );
+                throw e;
+            }
         }
 
         function minimumFromTooLowError(data) {
@@ -11369,7 +11478,7 @@
                 hunterCardLockKey = acquireHunterCardRarityBidLock(auction);
                 if (!hunterCardLockKey) continue;
 
-                let attempt = await postHunterBid(auction.id, amount);
+                let attempt = await postHunterBid(auction, amount, decision, 1);
 
                 // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
                 // notre relecture et le POST, le serveur renvoie son minimum actuel. On relit
@@ -11383,7 +11492,17 @@
                             decision = retryPrepared.decision;
                             amount = retryPrepared.amount;
                             isDynamic = retryPrepared.isDynamic;
-                            attempt = await postHunterBid(auction.id, amount);
+                            attempt = await postHunterBid(auction, amount, decision, 2);
+                        } else {
+                            const currentCap = Number(decision?.cap);
+                            const retryReason =
+                                Number.isFinite(currentCap) && serverMinimum > currentCap
+                                    ? `minimum serveur ${serverMinimum} 💰 > plafond ${Math.round(currentCap)} 💰`
+                                    : 'revalidation fraîche refusée ou montant inchangé';
+                            wmLog(
+                                `↪️ Hunter retry abandonné : <b>${htmlEsc(auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
+                                `${htmlEsc(retryReason)}`
+                            );
                         }
                     }
                 }
@@ -11622,8 +11741,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1000;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2500;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 200;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 550;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14646,7 +14765,7 @@
 
             if (!silent) {
                 wmLog(
-                    `⚡ Hunter autonome 3.7.0-beta3 démarré · ` +
+                    `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
                     `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · préchauffage T-2m→T-1m30 · file de mise priorisée · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
@@ -14737,6 +14856,18 @@
                 hunterHeadlessStats.lastAuctionsInWindow,
             candidatesHunter:
                 hunterHeadlessStats.lastCandidates,
+            sessionMiseDepuis:
+                new Date(hunterBidDiagStats.sessionStartedAt).toLocaleTimeString('fr-FR'),
+            postsHunterSession: hunterBidDiagStats.postsAttempted,
+            postsHunterReussisSession: hunterBidDiagStats.postsSucceeded,
+            postsHunterTropBasSession: hunterBidDiagStats.postsTooLow,
+            postsHunterTerminesSession: hunterBidDiagStats.postsEnded,
+            postsHunterAutresEchecsSession: hunterBidDiagStats.postsOtherFailed,
+            retriesHunterSession: hunterBidDiagStats.retriesAttempted,
+            erreursReseauHunterSession: hunterBidDiagStats.networkErrors,
+            dernierPostHunter: hunterBidDiagStats.lastPost
+                ? { ...hunterBidDiagStats.lastPost }
+                : null,
             mesMises: myBidsSet.size,
             autoBidArmes: autoBidSet.size,
             fourbesArmes: snipeSet.size,
