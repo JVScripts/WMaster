@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0';
+    const WM_VERSION = '3.7.1';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -35,6 +35,13 @@
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
     const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // lit jusqu'à T-2m00 : fenêtre 1m30 + 30 s de marge de scan
     const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // assez rapide sans scanner inutilement tout le marché
+    // v3.7.1 stable — garde-fou scanner : même si la frontière T-2m00 est mal détectée
+    // (end_at manquant / réponse incohérente / tri serveur perturbé), le Hunter ne parcourt
+    // jamais tout le marché. 8 pages = jusqu'à 400 enchères ending_soon par cycle.
+    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 8;
+    // Quand une enchère déjà suivie entre dans sa zone chaude, on évite de lancer un nouveau
+    // gros scan réseau en parallèle. La Hot Lane garde ainsi la priorité sur les 20 dernières secondes.
+    const HUNTER_HEADLESS_HOTLANE_PRIORITY_MS = 20_000;
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -10346,6 +10353,10 @@
             1,
             Math.ceil(total / MARKET_PAGE_LIMIT)
         );
+        const maxPageThisScan = Math.min(
+            totalPages,
+            HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
+        );
 
         const cutoff =
             AUTOMATIC_BID_MAX_REMAINING_MS +
@@ -10395,8 +10406,8 @@
                 );
             }
 
-            // Pages triées par fin proche : dès que la fin d'une page traverse
-            // T-2m00, les pages suivantes sont hors zone utile.
+            // Marketplace triée ending_soon : dès qu'une page contient déjà une enchère
+            // au-delà de T-2m00, les pages suivantes n'apportent rien au Hunter immédiat.
             if (
                 Number.isFinite(furthestRemaining) &&
                 furthestRemaining > cutoff
@@ -10409,14 +10420,14 @@
 
         for (
             let start = 2;
-            start <= totalPages && !boundaryReached;
+            start <= maxPageThisScan && !boundaryReached;
             start += HUNTER_HEADLESS_PAGE_CONCURRENCY
         ) {
             const pages = [];
             for (
                 let p = start;
                 p < start + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
-                p <= totalPages;
+                p <= maxPageThisScan;
                 p++
             ) {
                 pages.push(p);
@@ -10453,7 +10464,12 @@
             total,
             totalPages,
             pagesScanned,
-            cutoffMs: cutoff
+            cutoffMs: cutoff,
+            maxPageThisScan,
+            boundaryReached,
+            pageCapReached:
+                totalPages > maxPageThisScan &&
+                !boundaryReached
         };
     }
 
@@ -11598,7 +11614,7 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 600;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 750;
     const AUTOBID_RESPONSE_DELAY_MAX_MS = 1888;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
@@ -14234,6 +14250,10 @@
         lastPagesScanned: 0,
         lastAuctionsInWindow: 0,
         lastCandidates: 0,
+        pageCapStops: 0,
+        hotLanePrioritySkips: 0,
+        lastPageCapReached: false,
+        lastStopReason: '',
         lastError: ''
     };
 
@@ -14279,6 +14299,42 @@
         }
 
         return seeded;
+    }
+
+    function hunterHeadlessCriticalHotLaneRemainingMs() {
+        if (!hotLaneActive || activeHitsMap.size === 0) return null;
+
+        let minRemaining = Infinity;
+        for (const [id, hit] of activeHitsMap.entries()) {
+            if (
+                !myBidsSet.has(id) &&
+                !autoBidSet.has(id) &&
+                !snipeSet.has(id)
+            ) {
+                continue;
+            }
+
+            const endAt =
+                hit?.auction?.end_at ||
+                hit?.endAt;
+            if (!endAt) continue;
+
+            const remaining =
+                new Date(endAt).getTime() -
+                serverNow();
+
+            if (
+                Number.isFinite(remaining) &&
+                remaining > -MARKET_TIMER_SYNC_GRACE_MS &&
+                remaining <= HUNTER_HEADLESS_HOTLANE_PRIORITY_MS
+            ) {
+                minRemaining = Math.min(minRemaining, remaining);
+            }
+        }
+
+        return Number.isFinite(minRemaining)
+            ? minRemaining
+            : null;
     }
 
     async function checkHunterHeadlessMarketplace() {
@@ -14332,6 +14388,18 @@
             auctions.length;
         hunterHeadlessStats.lastCandidates =
             hunterCandidates.length;
+        hunterHeadlessStats.lastPageCapReached =
+            result?.pageCapReached === true;
+        hunterHeadlessStats.lastStopReason =
+            result?.boundaryReached
+                ? 'frontière T-2m atteinte'
+                : result?.pageCapReached
+                    ? `limite ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages`
+                    : 'fin marketplace';
+
+        if (result?.pageCapReached) {
+            hunterHeadlessStats.pageCapStops++;
+        }
 
         if (hunterCandidates.length > 0) {
             await runHunterAutoBidPass(
@@ -14363,6 +14431,25 @@
         }
 
         hunterHeadlessActive = true;
+
+        // v3.7.1 stable : une enchère déjà engagée à <=20 s est plus importante qu'un
+        // nouveau scan de découverte. On reporte simplement le scan de 1,5 s ; la Hot Lane
+        // continue pendant ce temps avec sa synchro serveur rapide.
+        const criticalRemaining =
+            hunterHeadlessCriticalHotLaneRemainingMs();
+
+        if (criticalRemaining != null) {
+            hunterHeadlessStats.hotLanePrioritySkips++;
+            hunterHeadlessStats.lastStopReason =
+                `priorité Hot Lane T-${Math.max(0, criticalRemaining / 1000).toFixed(1)}s`;
+
+            hunterHeadlessTimeout = setTimeout(
+                runHunterHeadlessLoop,
+                MARKET_MIN_GAP_MS
+            );
+            return;
+        }
+
         hunterHeadlessScanInProgress = true;
         const startedAt = Date.now();
 
@@ -14415,8 +14502,10 @@
 
             if (!silent) {
                 wmLog(
-                    `⚡ Hunter autonome démarré · ` +
-                    `scan léger T-2m00 · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `⚡ Hunter autonome v3.7.1 démarré · ` +
+                    `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · ` +
+                    `fenêtre T-2m00 · mises autorisées à T-1m30 · priorité Hot Lane ≤20s · ` +
+                    `Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -14489,6 +14578,16 @@
                 hunterHeadlessStats.lastDurationMs,
             pagesDernierScan:
                 hunterHeadlessStats.lastPagesScanned,
+            maxPagesParScan:
+                HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
+            arretsLimitePages:
+                hunterHeadlessStats.pageCapStops,
+            dernierArretLimitePages:
+                hunterHeadlessStats.lastPageCapReached,
+            skipsPrioriteHotLane:
+                hunterHeadlessStats.hotLanePrioritySkips,
+            raisonArretDernierScan:
+                hunterHeadlessStats.lastStopReason || null,
             annoncesFenetre:
                 hunterHeadlessStats.lastAuctionsInWindow,
             candidatesHunter:
