@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.28';
+    const WM_VERSION = '3.6.29';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11260,7 +11260,8 @@
                 (!marketWatcherActive && enabled)
                     ? ' · autonome'
                     : '';
-            return `⚡ Hunter Trend ${recentPct}% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
+            const sourceLabel = (!marketWatcherActive && enabled) ? 'Valeur marché' : hunterDynamicSourceLabel(true);
+            return `⚡ Hunter Trend ${recentPct}% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${sourceLabel} ${state}${engine}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -11269,8 +11270,13 @@
     // Auto-bid Hunter (mise initiale selon le mode fixe/dynamique) sur une LISTE d'enchères.
     // Mutualisé entre le scan (nouvelles annonces) ET l'activation du Hunter (annonces déjà
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
-    async function runHunterAutoBidPass(list) {
+    async function runHunterAutoBidPass(list, options = {}) {
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
+
+        // v3.6.29 : en Hunter autonome, la sélection est 100% économique.
+        // Le titre / la catégorie / les mots-clés ne servent jamais à décider si une carte
+        // mérite une mise. Ils restent disponibles pour les modules ciblés séparés et l'affichage.
+        const pureValueMode = options?.pureValue === true;
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
             await preloadRecentMarketForHunter(list).catch(() => { });
@@ -11358,9 +11364,12 @@
 
         for (const seed of list) {
             if (!seed || !seed.id) continue;
-            if (matchedHunterEntry(seed.card)) continue;
-            if (hasPriorityKeyword(seed.card)) continue;
-            if (snipeSet.has(seed.id) || hasFourbeKeyword(seed.card)) continue;
+
+            // Le Hunter autonome "valeur pure" ignore tout routage par nom/description.
+            // Seuls les états explicites de CETTE enchère (déjà fourbe/auto-bid) restent prioritaires.
+            if (!pureValueMode && matchedHunterEntry(seed.card)) continue;
+            if (!pureValueMode && hasPriorityKeyword(seed.card)) continue;
+            if (snipeSet.has(seed.id) || (!pureValueMode && hasFourbeKeyword(seed.card))) continue;
             if (autoBidSet.has(seed.id)) continue;
 
             // Filtres rapides sur le snapshot du scan : évitent une relecture serveur inutile.
@@ -14384,7 +14393,7 @@
 
             if (freshCandidates.length > 0) {
                 hunterActionChain = hunterActionChain
-                    .then(() => runHunterAutoBidPass(freshCandidates))
+                    .then(() => runHunterAutoBidPass(freshCandidates, { pureValue: true }))
                     .catch(e => {
                         console.warn('[WikiMasters][hunter-headless] batch action error:', e);
                     });
@@ -14425,7 +14434,7 @@
 
         if (leftoverCandidates.length > 0) {
             hunterHeadlessStats.lastCandidates += leftoverCandidates.length;
-            await runHunterAutoBidPass(leftoverCandidates);
+            await runHunterAutoBidPass(leftoverCandidates, { pureValue: true });
         }
 
         // Replanifie une dernière fois la Hot Lane avec la vue dédupliquée complète.
@@ -14553,6 +14562,8 @@
             mode: getSetting('autoSnipeMode'),
             source: hunterDynamicSource,
             headlessCandidateSource: 'all_market',
+            autonomousDecisionBasis: 'market_value_only',
+            autonomousKeywordRouting: false,
             standardsKeywords: KEYWORDS_ALERT.length,
             exclusKeywords: KEYWORDS_EXCLUDE.length,
             marketWatcherOn: marketWatcherActive,
