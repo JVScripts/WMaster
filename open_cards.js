@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.30';
+    const WM_VERSION = '3.6.32';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -34,7 +34,20 @@
     // v3.2.0 — Hunter autonome : quand le Market Watcher visuel est OFF, le Hunter
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
     const HUNTER_HEADLESS_MARGIN_MS = 10_000;       // lit jusqu'à T-1m10 : 1 cycle de marge avec scan 10 s
-    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // assez rapide sans scanner inutilement tout le marché
+    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 6;     // lots plus larges : évite qu'un scan T-1 min dure lui-même >1 min
+    const HUNTER_HEADLESS_SCAN_BUDGET_MS = 15_000;      // un scan partiel frais vaut mieux qu'un scan exhaustif devenu obsolète
+    const HUNTER_HEADLESS_MAX_PENDING = 120;             // borne la file : priorité aux enchères qui finissent le plus tôt
+    const HUNTER_HEADLESS_ACTION_CHUNK = 4;              // 4 marchés détaillés par lot
+    const HUNTER_HEADLESS_ACTION_LANES = 2;              // 2 workers détaillés, soit 8 historiques max simultanés
+    // v3.6.32 — préfiltre VALEUR très bon marché avant les 25 ventes détaillées.
+    // Le summary officiel ne sert JAMAIS de prix d'achat final : il élimine seulement
+    // les enchères manifestement trop chères. Les survivantes repassent toutes les sécurités
+    // Recent Market 15-25 ventes / liquidité / cohérence / anti-manipulation.
+    const HUNTER_PREFILTER_MAX_PENDING = 240;             // file légère distincte de la file 25 ventes
+    const HUNTER_PREFILTER_WORKERS = 8;                   // summary same-origin bien moins coûteux que l'historique détaillé
+    const HUNTER_PREFILTER_RATIO_CUSHION = 0.30;          // +30 points au ratio Hunter final : filtre volontairement permissif
+    const HUNTER_PREFILTER_RATIO_FLOOR = 0.95;            // ne serre jamais sous 95 % de la moyenne WM
+    const HUNTER_PREFILTER_RATIO_CEIL = 1.05;             // au-delà de 105 % de la moyenne WM, peu de chance de passer un cap Hunter ~70 %
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -10376,6 +10389,8 @@
     // onBatch est appelé dès qu'une page utile arrive : le Hunter peut donc commencer
     // son analyse/action sur la page 1 pendant que les pages suivantes se téléchargent.
     async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
+        const scanStartedAt = Date.now();
+        let budgetReached = false;
         const first = await fetchMarketPage(1);
         const total = Number(first?.total || 0);
         const totalPages = Math.max(
@@ -10458,6 +10473,12 @@
             start <= totalPages && !boundaryReached;
             start += HUNTER_HEADLESS_PAGE_CONCURRENCY
         ) {
+            if (Date.now() - scanStartedAt >= HUNTER_HEADLESS_SCAN_BUDGET_MS) {
+                budgetReached = true;
+                hunterHeadlessStats.scanBudgetStops++;
+                break;
+            }
+
             const pages = [];
             for (
                 let p = start;
@@ -10480,6 +10501,12 @@
                 if (boundaryReached) break;
             }
 
+            if (Date.now() - scanStartedAt >= HUNTER_HEADLESS_SCAN_BUDGET_MS) {
+                budgetReached = true;
+                hunterHeadlessStats.scanBudgetStops++;
+                break;
+            }
+
             if (!boundaryReached) {
                 await new Promise(r => setTimeout(r, 50));
             }
@@ -10499,7 +10526,8 @@
             total,
             totalPages,
             pagesScanned,
-            cutoffMs: cutoff
+            cutoffMs: cutoff,
+            budgetReached
         };
     }
 
@@ -14285,13 +14313,23 @@
     let hunterHeadlessScanStartedAt = 0;
     let hunterHeadlessGeneration = 0;
 
-    // v3.6.30 — le scan marketplace et l'analyse économique sont deux files distinctes.
-    // Un gros lot (ex. plusieurs centaines d'enchères à T<1 min) ne doit jamais garder
-    // hunterHeadlessScanInProgress=true pendant toute l'analyse Recent Market, sinon le
-    // bouton Hunter paraît ON mais aucun nouveau GET /api/marketplace n'est lancé.
-    let hunterHeadlessActionChain = Promise.resolve();
+    // v3.6.32 — scan, préfiltre valeur léger et analyse 25 ventes sont trois étages.
+    // On ne paie le coût du Recent Market détaillé que pour les enchères dont le prix
+    // reste plausible par rapport au summary officiel (ou pour L+, qui bypass ce filtre
+    // car le summary L peut agréger shiny/non-shiny).
+    let hunterHeadlessActionChains = Array.from(
+        { length: HUNTER_HEADLESS_ACTION_LANES },
+        () => Promise.resolve()
+    );
+    let hunterHeadlessActionLaneCursor = 0;
     const hunterHeadlessQueuedIds = new Set();
     let hunterHeadlessActionPending = 0;
+
+    // File de préfiltre valeur : elle reçoit toutes les enchères du scan, mais ne lance
+    // les coûteuses 25 ventes que pour les cartes encore plausibles économiquement.
+    let hunterPrefilterQueue = [];
+    const hunterPrefilterQueuedIds = new Set();
+    let hunterPrefilterWorkersRunning = 0;
 
     const hunterHeadlessStats = {
         scans: 0,
@@ -14301,8 +14339,32 @@
         lastAuctionsInWindow: 0,
         lastCandidates: 0,
         lastError: '',
-        lastActionError: ''
+        lastActionError: '',
+        scanBudgetStops: 0,
+        queueDropped: 0,
+        expiredBeforeAnalysis: 0,
+        prefilterQueued: 0,
+        prefilterPassed: 0,
+        prefilterRejectedPrice: 0,
+        prefilterRejectedNoSummary: 0,
+        prefilterDeferredError: 0,
+        prefilterRecentCacheHit: 0,
+        prefilterLplusBypass: 0,
+        prefilterDropped: 0
     };
+
+    function resetHunterHeadlessActionQueue() {
+        hunterHeadlessActionChains = Array.from(
+            { length: HUNTER_HEADLESS_ACTION_LANES },
+            () => Promise.resolve()
+        );
+        hunterHeadlessActionLaneCursor = 0;
+        hunterHeadlessQueuedIds.clear();
+        hunterHeadlessActionPending = 0;
+        hunterPrefilterQueue = [];
+        hunterPrefilterQueuedIds.clear();
+        hunterPrefilterWorkersRunning = 0;
+    }
 
     function hunterHeadlessWanted() {
         return !!(
@@ -14320,40 +14382,228 @@
         );
     }
 
+    function hunterCheapPrefilterRatio() {
+        const hunterRatio = Number(getSetting('autoSnipeRecentRatio'));
+        const raw = (Number.isFinite(hunterRatio) ? hunterRatio : 0.70) + HUNTER_PREFILTER_RATIO_CUSHION;
+        return Math.max(HUNTER_PREFILTER_RATIO_FLOOR, Math.min(HUNTER_PREFILTER_RATIO_CEIL, raw));
+    }
+
+    async function hunterCheapValuePrefilter(auction, generation = hunterHeadlessGeneration) {
+        if (!auction?.id || generation !== hunterHeadlessGeneration || !hunterHeadlessWanted()) {
+            return { pass: false, reason: 'inactive' };
+        }
+
+        const endTs = new Date(auction?.end_at || NaN).getTime();
+        const remaining = endTs - serverNow();
+        if (!Number.isFinite(remaining) || remaining <= -MARKET_TIMER_SYNC_GRACE_MS) {
+            return { pass: false, reason: 'expired' };
+        }
+
+        const cardId = auction.card?.id ?? auction.card_id;
+        const rarity = globalAuctionRarity(auction);
+        if (!cardId || !rarity) return { pass: false, reason: 'missing_identity' };
+
+        // Filtres gratuits identiques au moteur final : inutile de charger le marché d'une
+        // carte qu'on ne peut de toute façon pas acheter.
+        if (iAmLeading(auction) || autoBidBlockedByUncertainSelfState(auction)) {
+            return { pass: false, reason: 'self' };
+        }
+        if (isOwnedDuplicate(cardId, rarity)) return { pass: false, reason: 'owned' };
+        if (hunterDuplicateExposureState(auction).blocked) return { pass: false, reason: 'duplicate_exposure' };
+
+        // Si le vrai Recent Market est déjà en cache, surtout ne pas repasser par une moyenne
+        // approximative : la décision détaillée peut partir immédiatement.
+        const cachedRecent = getCachedRecentMarket(
+            cardId,
+            rarity,
+            HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+        );
+        if (cachedRecent?.ok) {
+            hunterHeadlessStats.prefilterRecentCacheHit++;
+            return { pass: true, reason: 'recent_cache' };
+        }
+
+        // L+ est encodé backend comme L + is_shiny=true. Le summary officiel peut agréger
+        // les L et L+ ; l'utiliser comme filtre pourrait donc rejeter une vraie L+ à tort.
+        // Les L+ passent directement au contrôle détaillé variant-aware.
+        if (normalizeRarityCode(rarity) === 'L+') {
+            hunterHeadlessStats.prefilterLplusBypass++;
+            return { pass: true, reason: 'lplus_bypass' };
+        }
+
+        let avg = getWmOfficialAverage(cardId, rarity);
+        if (!(Number.isFinite(avg) && avg > 0)) {
+            const summary = await fetchWmOfficialSummary(cardId, false).catch(() => null);
+            if (generation !== hunterHeadlessGeneration || !hunterHeadlessWanted()) {
+                return { pass: false, reason: 'inactive' };
+            }
+            if (!summary) {
+                hunterHeadlessStats.prefilterDeferredError++;
+                return { pass: false, reason: 'summary_unavailable' };
+            }
+            avg = getWmOfficialAverage(cardId, rarity);
+        }
+
+        // Pas de moyenne pour cette rareté = aucune raison de dépenser une requête lourde à
+        // chaque scan. Un futur summary / changement de rareté permettra de retester.
+        if (!(Number.isFinite(avg) && avg > 0)) {
+            hunterHeadlessStats.prefilterRejectedNoSummary++;
+            return { pass: false, reason: 'no_summary' };
+        }
+
+        const nextBid = Number(minNextBid(auction));
+        if (!(Number.isFinite(nextBid) && nextBid > 0)) {
+            return { pass: false, reason: 'no_price' };
+        }
+
+        const ratio = hunterCheapPrefilterRatio();
+        const cheapCeiling = avg * ratio;
+
+        // IMPORTANT : ce n'est PAS un cap d'achat. Le vrai cap reste exclusivement calculé
+        // après les 15-25 ventes détaillées. Ici on jette seulement les cas manifestement
+        // trop chers pour qu'un Hunter à ~70 % ait une chance raisonnable de passer.
+        if (nextBid > cheapCeiling) {
+            hunterHeadlessStats.prefilterRejectedPrice++;
+            return { pass: false, reason: 'too_expensive', avg, nextBid, cheapCeiling, ratio };
+        }
+
+        return { pass: true, reason: 'plausible_value', avg, nextBid, cheapCeiling, ratio };
+    }
+
+    async function hunterPrefilterWorker(generation) {
+        hunterPrefilterWorkersRunning++;
+        try {
+            while (generation === hunterHeadlessGeneration && hunterHeadlessWanted()) {
+                const auction = hunterPrefilterQueue.shift();
+                if (!auction) break;
+
+                try {
+                    const decision = await hunterCheapValuePrefilter(auction, generation);
+                    if (decision?.pass && generation === hunterHeadlessGeneration && hunterHeadlessWanted()) {
+                        hunterHeadlessStats.prefilterPassed++;
+                        enqueueHunterHeadlessBatch([auction], generation);
+                    }
+                } catch (e) {
+                    hunterHeadlessStats.lastActionError = String(e?.message || e || 'erreur préfiltre');
+                } finally {
+                    if (auction?.id) hunterPrefilterQueuedIds.delete(auction.id);
+                }
+            }
+        } finally {
+            hunterPrefilterWorkersRunning = Math.max(0, hunterPrefilterWorkersRunning - 1);
+        }
+    }
+
+    function startHunterPrefilterWorkers(generation = hunterHeadlessGeneration) {
+        while (
+            hunterPrefilterWorkersRunning < HUNTER_PREFILTER_WORKERS &&
+            hunterPrefilterQueue.length > 0 &&
+            generation === hunterHeadlessGeneration &&
+            hunterHeadlessWanted()
+        ) {
+            hunterPrefilterWorker(generation).catch(() => { });
+        }
+    }
+
+    function enqueueHunterValuePrefilter(batch, generation = hunterHeadlessGeneration) {
+        if (!Array.isArray(batch) || batch.length === 0) return 0;
+        if (generation !== hunterHeadlessGeneration || !hunterHeadlessWanted()) return 0;
+
+        const incoming = batch
+            .filter(a =>
+                a?.id &&
+                !hunterPrefilterQueuedIds.has(a.id) &&
+                !hunterHeadlessQueuedIds.has(a.id)
+            )
+            .sort((a, b) => new Date(a?.end_at || 0).getTime() - new Date(b?.end_at || 0).getTime());
+
+        if (incoming.length === 0) return 0;
+        for (const a of incoming) {
+            hunterPrefilterQueuedIds.add(a.id);
+            hunterPrefilterQueue.push(a);
+        }
+
+        // Les scans se chevauchent : garde toujours les échéances les plus proches et borne
+        // la file légère. Une enchère écartée pourra réapparaître au scan suivant si elle devient prioritaire.
+        hunterPrefilterQueue.sort(
+            (a, b) => new Date(a?.end_at || 0).getTime() - new Date(b?.end_at || 0).getTime()
+        );
+        if (hunterPrefilterQueue.length > HUNTER_PREFILTER_MAX_PENDING) {
+            const dropped = hunterPrefilterQueue.splice(HUNTER_PREFILTER_MAX_PENDING);
+            hunterHeadlessStats.prefilterDropped += dropped.length;
+            for (const a of dropped) if (a?.id) hunterPrefilterQueuedIds.delete(a.id);
+        }
+
+        hunterHeadlessStats.prefilterQueued += incoming.length;
+        startHunterPrefilterWorkers(generation);
+        return incoming.length;
+    }
+
     function enqueueHunterHeadlessBatch(batch, generation = hunterHeadlessGeneration) {
         if (!Array.isArray(batch) || batch.length === 0) return 0;
 
-        const queued = batch
-            .filter(a => {
-                if (!a?.id || hunterHeadlessQueuedIds.has(a.id)) return false;
-                hunterHeadlessQueuedIds.add(a.id);
-                return true;
-            })
+        const candidates = batch
+            .filter(a => a?.id && !hunterHeadlessQueuedIds.has(a.id))
             .sort((a, b) => new Date(a?.end_at || 0).getTime() - new Date(b?.end_at || 0).getTime());
 
-        if (queued.length === 0) return 0;
+        if (candidates.length === 0) return 0;
 
-        hunterHeadlessActionPending += queued.length;
+        const capacity = Math.max(0, HUNTER_HEADLESS_MAX_PENDING - hunterHeadlessActionPending);
+        if (capacity <= 0) {
+            hunterHeadlessStats.queueDropped += candidates.length;
+            return 0;
+        }
 
-        hunterHeadlessActionChain = hunterHeadlessActionChain
-            .then(async () => {
-                // Un OFF/ON du Hunter invalide immédiatement toute l'ancienne file.
-                if (generation !== hunterHeadlessGeneration || !hunterHeadlessWanted()) return 0;
-                return await runHunterAutoBidPass(queued, { pureValue: true });
-            })
-            .catch(e => {
-                hunterHeadlessStats.lastActionError = String(e?.message || e || 'erreur');
-                console.warn('[WikiMasters][hunter-headless] batch action error:', e);
-                return 0;
-            })
-            .finally(() => {
-                for (const a of queued) {
-                    if (a?.id) hunterHeadlessQueuedIds.delete(a.id);
-                }
-                hunterHeadlessActionPending = Math.max(0, hunterHeadlessActionPending - queued.length);
-            });
+        const accepted = candidates.slice(0, capacity);
+        hunterHeadlessStats.queueDropped += Math.max(0, candidates.length - accepted.length);
+        if (accepted.length === 0) return 0;
 
-        return queued.length;
+        for (const a of accepted) hunterHeadlessQueuedIds.add(a.id);
+        hunterHeadlessActionPending += accepted.length;
+
+        for (let i = 0; i < accepted.length; i += HUNTER_HEADLESS_ACTION_CHUNK) {
+            const chunk = accepted.slice(i, i + HUNTER_HEADLESS_ACTION_CHUNK);
+            const lane = hunterHeadlessActionLaneCursor++ % HUNTER_HEADLESS_ACTION_LANES;
+
+            hunterHeadlessActionChains[lane] = hunterHeadlessActionChains[lane]
+                .then(async () => {
+                    if (generation !== hunterHeadlessGeneration || !hunterHeadlessWanted()) return 0;
+
+                    const now = serverNow();
+                    const actionable = [];
+                    for (const a of chunk) {
+                        const endTs = new Date(a?.end_at || NaN).getTime();
+                        const remaining = endTs - now;
+                        if (!Number.isFinite(remaining)) continue;
+                        if (remaining <= -MARKET_TIMER_SYNC_GRACE_MS) {
+                            hunterHeadlessStats.expiredBeforeAnalysis++;
+                            continue;
+                        }
+                        // Les 10 s de marge servent à découvrir/préchauffer. Si le lot passe
+                        // avant T-1 min, il sera simplement repris par un scan suivant.
+                        if (remaining > AUTOMATIC_BID_MAX_REMAINING_MS) continue;
+                        actionable.push(a);
+                    }
+
+                    if (actionable.length === 0) return 0;
+                    return await runHunterAutoBidPass(actionable, { pureValue: true });
+                })
+                .catch(e => {
+                    hunterHeadlessStats.lastActionError = String(e?.message || e || 'erreur');
+                    console.warn('[WikiMasters][hunter-headless] batch action error:', e);
+                    return 0;
+                })
+                .finally(() => {
+                    // Une ancienne génération ne doit pas toucher à la file neuve après OFF/ON.
+                    if (generation !== hunterHeadlessGeneration) return;
+                    for (const a of chunk) {
+                        if (a?.id) hunterHeadlessQueuedIds.delete(a.id);
+                    }
+                    hunterHeadlessActionPending = Math.max(0, hunterHeadlessActionPending - chunk.length);
+                });
+        }
+
+        return accepted.length;
     }
 
     function seedTrackedAuctionsForHotLane(auctions) {
@@ -14439,7 +14689,7 @@
             streamedCandidateCount += freshCandidates.length;
 
             if (freshCandidates.length > 0 && generation === hunterHeadlessGeneration) {
-                enqueueHunterHeadlessBatch(freshCandidates, generation);
+                enqueueHunterValuePrefilter(freshCandidates, generation);
             }
         };
 
@@ -14478,7 +14728,7 @@
 
         if (leftoverCandidates.length > 0 && generation === hunterHeadlessGeneration) {
             hunterHeadlessStats.lastCandidates += leftoverCandidates.length;
-            enqueueHunterHeadlessBatch(leftoverCandidates, generation);
+            enqueueHunterValuePrefilter(leftoverCandidates, generation);
         }
 
         // Replanifie une dernière fois la Hot Lane avec la vue dédupliquée complète.
@@ -14564,27 +14814,28 @@
         if (!hunterHeadlessActive) {
             hunterHeadlessActive = true;
             hunterHeadlessGeneration++;
+            resetHunterHeadlessActionQueue();
             fetchCurrentUser();
 
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome démarré · ` +
-                    `scan T-1m10 indépendant de l'analyse · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `scan T-1m10 · préfiltre valeur léger → 25 ventes seulement sur opportunités plausibles · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
 
-        // Watchdog : un ancien scan ne doit pas pouvoir condamner définitivement le bouton.
-        // Avec l'analyse désormais découplée, une pagination utile >30 s est anormale.
+        // Watchdog de secours : le scan a déjà son budget interne ; ce garde couvre seulement
+        // une requête réseau réellement pendue au-delà du budget + marge.
         if (
             hunterHeadlessScanInProgress &&
             hunterHeadlessScanStartedAt &&
-            Date.now() - hunterHeadlessScanStartedAt > 30_000
+            Date.now() - hunterHeadlessScanStartedAt > HUNTER_HEADLESS_SCAN_BUDGET_MS + 10_000
         ) {
             hunterHeadlessGeneration++;
             hunterHeadlessScanInProgress = false;
             hunterHeadlessScanStartedAt = 0;
-            hunterHeadlessStats.lastError = 'ancien scan >30 s abandonné puis relancé';
+            hunterHeadlessStats.lastError = 'ancien scan hors budget abandonné puis relancé';
         }
 
         // La Hot Lane ne dépend plus du Market Watcher.
@@ -14614,6 +14865,7 @@
         hunterHeadlessGeneration++;
         hunterHeadlessScanInProgress = false;
         hunterHeadlessScanStartedAt = 0;
+        resetHunterHeadlessActionQueue();
 
         if (hunterHeadlessTimeout) {
             clearTimeout(hunterHeadlessTimeout);
@@ -14652,8 +14904,27 @@
             scanBloqueDepuisMs: hunterHeadlessScanInProgress && hunterHeadlessScanStartedAt
                 ? Date.now() - hunterHeadlessScanStartedAt
                 : 0,
+            prefiltreValeur: true,
+            ratioPrefiltre: hunterCheapPrefilterRatio(),
+            prefiltreEnFile: hunterPrefilterQueue.length,
+            prefiltreIdsEnFile: hunterPrefilterQueuedIds.size,
+            workersPrefiltreActifs: hunterPrefilterWorkersRunning,
+            limitePrefiltre: HUNTER_PREFILTER_MAX_PENDING,
+            prefiltrePasses: hunterHeadlessStats.prefilterPassed,
+            prefiltreRejetPrix: hunterHeadlessStats.prefilterRejectedPrice,
+            prefiltreSansMoyenne: hunterHeadlessStats.prefilterRejectedNoSummary,
+            prefiltreErreurSummary: hunterHeadlessStats.prefilterDeferredError,
+            prefiltreCacheRecent: hunterHeadlessStats.prefilterRecentCacheHit,
+            prefiltreLplusDirect: hunterHeadlessStats.prefilterLplusBypass,
+            prefiltreEcartesFilePleine: hunterHeadlessStats.prefilterDropped,
             analysesEnFile: hunterHeadlessActionPending,
             idsAnalyseEnFile: hunterHeadlessQueuedIds.size,
+            limiteAnalysesEnFile: HUNTER_HEADLESS_MAX_PENDING,
+            workersAnalyse: HUNTER_HEADLESS_ACTION_LANES,
+            tailleLotAnalyse: HUNTER_HEADLESS_ACTION_CHUNK,
+            arretsBudgetScan: hunterHeadlessStats.scanBudgetStops,
+            candidatsEcartesFilePleine: hunterHeadlessStats.queueDropped,
+            expiresAvantAnalyse: hunterHeadlessStats.expiredBeforeAnalysis,
             erreurAnalyse: hunterHeadlessStats.lastActionError || null,
             hotLaneOn: hotLaneActive,
             serveurSynchronise: serverClockSynced,
