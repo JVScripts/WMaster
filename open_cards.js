@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0';
+    const WM_VERSION = '3.7.0-beta';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10339,7 +10339,7 @@
     //
     // On garde 30 s de marge : un scan qui arrive légèrement avant T-1m30 aura déjà
     // la carte au cycle suivant sans trou de découverte.
-    async function fetchHunterActionWindowAuctions(onProgress) {
+    async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
         const first = await fetchMarketPage(1);
         const total = Number(first?.total || 0);
         const totalPages = Math.max(
@@ -10362,6 +10362,7 @@
 
             pagesScanned++;
 
+            const pageUseful = [];
             let furthestRemaining = -Infinity;
             for (const a of rows) {
                 if (!a?.id || !a?.end_at) continue;
@@ -10384,6 +10385,17 @@
                     remaining <= cutoff
                 ) {
                     collected.push(a);
+                    pageUseful.push(a);
+                }
+            }
+
+            // 3.7.0-beta : transmet immédiatement les enchères de cette page au Hunter.
+            // La pagination continue sans attendre l'analyse des 15-25 ventes.
+            if (onBatch && pageUseful.length > 0) {
+                try {
+                    onBatch(pageUseful, pageNo, totalPages);
+                } catch (e) {
+                    console.warn('[WikiMasters][hunter-headless] page callback error:', e);
                 }
             }
 
@@ -14227,6 +14239,13 @@
     let hunterHeadlessActive = false;
     let hunterHeadlessTimeout = null;
     let hunterHeadlessScanInProgress = false;
+
+    // 3.7.0-beta : une seule file d'action série, sans workers supplémentaires.
+    // Chaque page peut être analysée dès son arrivée pendant que le scan des pages suivantes continue.
+    let hunterHeadlessPageActionChain = Promise.resolve();
+    const hunterHeadlessPageQueuedIds = new Set();
+    let hunterHeadlessPagePending = 0;
+
     const hunterHeadlessStats = {
         scans: 0,
         lastScanTs: 0,
@@ -14234,7 +14253,8 @@
         lastPagesScanned: 0,
         lastAuctionsInWindow: 0,
         lastCandidates: 0,
-        lastError: ''
+        lastError: '',
+        lastPageActionError: ''
     };
 
     function hunterHeadlessWanted() {
@@ -14251,6 +14271,41 @@
             autoBidSet.size > 0 ||
             snipeSet.size > 0
         );
+    }
+
+    function queueHunterPageCandidates(list) {
+        if (!hunterHeadlessWanted() || !Array.isArray(list) || list.length === 0) return 0;
+
+        // Ne lance que les enchères déjà dans la vraie fenêtre de mise T<=1m30.
+        // Les 30 s de marge restent uniquement une marge de découverte pour le scan suivant.
+        const fresh = list.filter(a =>
+            a?.id &&
+            automaticBidTimeAllowed(a) &&
+            !hunterHeadlessPageQueuedIds.has(a.id)
+        );
+        if (fresh.length === 0) return 0;
+
+        for (const a of fresh) hunterHeadlessPageQueuedIds.add(a.id);
+        hunterHeadlessPagePending += fresh.length;
+
+        hunterHeadlessPageActionChain = hunterHeadlessPageActionChain
+            .then(async () => {
+                if (!hunterHeadlessWanted()) return 0;
+                return await runHunterAutoBidPass(fresh);
+            })
+            .catch(e => {
+                hunterHeadlessStats.lastPageActionError = String(e?.message || e || 'erreur');
+                console.warn('[WikiMasters][hunter-headless] page action error:', e);
+                return 0;
+            })
+            .finally(() => {
+                for (const a of fresh) {
+                    if (a?.id) hunterHeadlessPageQueuedIds.delete(a.id);
+                }
+                hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - fresh.length);
+            });
+
+        return fresh.length;
     }
 
     function seedTrackedAuctionsForHotLane(auctions) {
@@ -14298,8 +14353,39 @@
         // Le solde conditionne les décisions de mise.
         await fetchBalance();
 
+        const seenCandidateIds = new Set();
+        let streamedCandidates = 0;
+
+        const processPageBatch = (batch) => {
+            if (!Array.isArray(batch) || batch.length === 0) return;
+
+            // Même protection self-bid, mais appliquée immédiatement sur la page reçue.
+            batch.forEach(a => {
+                if (iAmLeading(a)) {
+                    trackMyBid(a.id);
+                    rememberMyLeadingBid(
+                        a,
+                        a.current_bid ?? a.base_amount
+                    );
+                }
+            });
+
+            const candidates = getHunterDynamicCandidatePool(batch)
+                .filter(a => {
+                    if (!a?.id || seenCandidateIds.has(a.id)) return false;
+                    seenCandidateIds.add(a.id);
+                    return true;
+                });
+
+            streamedCandidates += candidates.length;
+            queueHunterPageCandidates(candidates);
+        };
+
         const result =
-            await fetchHunterActionWindowAuctions();
+            await fetchHunterActionWindowAuctions(
+                null,
+                processPageBatch
+            );
 
         const auctions =
             Array.isArray(result?.auctions)
@@ -14312,32 +14398,16 @@
 
         apiHealth.lastMarketScanTs = Date.now();
 
-        // Sécurité anti auto-surenchère identique au scan complet.
-        auctions.forEach(a => {
-            if (iAmLeading(a)) {
-                trackMyBid(a.id);
-                rememberMyLeadingBid(
-                    a,
-                    a.current_bid ?? a.base_amount
-                );
-            }
-        });
-
-        const hunterCandidates =
-            getHunterDynamicCandidatePool(auctions);
-
         hunterHeadlessStats.lastPagesScanned =
             Number(result?.pagesScanned || 0);
         hunterHeadlessStats.lastAuctionsInWindow =
             auctions.length;
         hunterHeadlessStats.lastCandidates =
-            hunterCandidates.length;
+            streamedCandidates;
 
-        if (hunterCandidates.length > 0) {
-            await runHunterAutoBidPass(
-                hunterCandidates
-            );
-        }
+        // Important : on N'ATTEND PAS hunterHeadlessPageActionChain ici.
+        // Le scan se termine dès que la pagination se termine ; les candidats des premières
+        // pages ont déjà commencé leur analyse pendant que les pages suivantes arrivent.
 
         // Important pour le mode Fourbe et les enchères déjà engagées :
         // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
@@ -14415,8 +14485,8 @@
 
             if (!silent) {
                 wmLog(
-                    `⚡ Hunter autonome démarré · ` +
-                    `scan léger T-2m00 · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `⚡ Hunter autonome 3.7.0-beta démarré · ` +
+                    `scan T-2m00 · traitement page par page · mises autorisées à T-1m30 · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -14471,6 +14541,10 @@
             marketWatcherOn: marketWatcherActive,
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
+            traitementPageParPage: true,
+            analysesPageEnFile: hunterHeadlessPagePending,
+            idsAnalysePageEnFile: hunterHeadlessPageQueuedIds.size,
+            erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,
             hotLaneOn: hotLaneActive,
             serveurSynchronise: serverClockSynced,
             decalageServeurMs: Math.round(serverClockOffset),
