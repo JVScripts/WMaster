@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.6.29';
+    const WM_VERSION = '3.6.30';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -14282,6 +14282,17 @@
     let hunterHeadlessActive = false;
     let hunterHeadlessTimeout = null;
     let hunterHeadlessScanInProgress = false;
+    let hunterHeadlessScanStartedAt = 0;
+    let hunterHeadlessGeneration = 0;
+
+    // v3.6.30 — le scan marketplace et l'analyse économique sont deux files distinctes.
+    // Un gros lot (ex. plusieurs centaines d'enchères à T<1 min) ne doit jamais garder
+    // hunterHeadlessScanInProgress=true pendant toute l'analyse Recent Market, sinon le
+    // bouton Hunter paraît ON mais aucun nouveau GET /api/marketplace n'est lancé.
+    let hunterHeadlessActionChain = Promise.resolve();
+    const hunterHeadlessQueuedIds = new Set();
+    let hunterHeadlessActionPending = 0;
+
     const hunterHeadlessStats = {
         scans: 0,
         lastScanTs: 0,
@@ -14289,7 +14300,8 @@
         lastPagesScanned: 0,
         lastAuctionsInWindow: 0,
         lastCandidates: 0,
-        lastError: ''
+        lastError: '',
+        lastActionError: ''
     };
 
     function hunterHeadlessWanted() {
@@ -14306,6 +14318,42 @@
             autoBidSet.size > 0 ||
             snipeSet.size > 0
         );
+    }
+
+    function enqueueHunterHeadlessBatch(batch, generation = hunterHeadlessGeneration) {
+        if (!Array.isArray(batch) || batch.length === 0) return 0;
+
+        const queued = batch
+            .filter(a => {
+                if (!a?.id || hunterHeadlessQueuedIds.has(a.id)) return false;
+                hunterHeadlessQueuedIds.add(a.id);
+                return true;
+            })
+            .sort((a, b) => new Date(a?.end_at || 0).getTime() - new Date(b?.end_at || 0).getTime());
+
+        if (queued.length === 0) return 0;
+
+        hunterHeadlessActionPending += queued.length;
+
+        hunterHeadlessActionChain = hunterHeadlessActionChain
+            .then(async () => {
+                // Un OFF/ON du Hunter invalide immédiatement toute l'ancienne file.
+                if (generation !== hunterHeadlessGeneration || !hunterHeadlessWanted()) return 0;
+                return await runHunterAutoBidPass(queued, { pureValue: true });
+            })
+            .catch(e => {
+                hunterHeadlessStats.lastActionError = String(e?.message || e || 'erreur');
+                console.warn('[WikiMasters][hunter-headless] batch action error:', e);
+                return 0;
+            })
+            .finally(() => {
+                for (const a of queued) {
+                    if (a?.id) hunterHeadlessQueuedIds.delete(a.id);
+                }
+                hunterHeadlessActionPending = Math.max(0, hunterHeadlessActionPending - queued.length);
+            });
+
+        return queued.length;
     }
 
     function seedTrackedAuctionsForHotLane(auctions) {
@@ -14336,8 +14384,8 @@
         return seeded;
     }
 
-    async function checkHunterHeadlessMarketplace() {
-        if (!hunterHeadlessWanted()) return;
+    async function checkHunterHeadlessMarketplace(generation = hunterHeadlessGeneration) {
+        if (!hunterHeadlessWanted() || generation !== hunterHeadlessGeneration) return;
 
         if (!navigator.onLine) {
             hunterHeadlessStats.lastError = 'hors ligne';
@@ -14357,7 +14405,6 @@
         // pendant que la file d'analyse Hunter traite page 1, puis les pages suivantes.
         const seenCandidateIds = new Set();
         let streamedCandidateCount = 0;
-        let hunterActionChain = Promise.resolve();
 
         const processHunterBatch = (batch) => {
             if (!Array.isArray(batch) || batch.length === 0) return;
@@ -14391,12 +14438,8 @@
 
             streamedCandidateCount += freshCandidates.length;
 
-            if (freshCandidates.length > 0) {
-                hunterActionChain = hunterActionChain
-                    .then(() => runHunterAutoBidPass(freshCandidates, { pureValue: true }))
-                    .catch(e => {
-                        console.warn('[WikiMasters][hunter-headless] batch action error:', e);
-                    });
+            if (freshCandidates.length > 0 && generation === hunterHeadlessGeneration) {
+                enqueueHunterHeadlessBatch(freshCandidates, generation);
             }
         };
 
@@ -14424,17 +14467,18 @@
         hunterHeadlessStats.lastCandidates =
             streamedCandidateCount;
 
-        // Le scan n'attend plus pour COMMENCER à agir ; on attend seulement ici que
-        // les actions déjà déclenchées finissent avant de planifier le cycle suivant.
-        await hunterActionChain;
+        // v3.6.30 : CRITIQUE — ne jamais attendre ici la file d'analyse Hunter.
+        // Le cycle de scan doit se terminer dès que la pagination utile est finie afin
+        // de conserver un vrai scan toutes les ~10 s, même si le Recent Market de
+        // centaines de cartes continue d'être analysé en arrière-plan.
 
         // Filet de sécurité pour une enchère dédupliquée différemment entre deux pages.
         const leftoverCandidates =
             auctions.filter(a => a?.id && !seenCandidateIds.has(a.id));
 
-        if (leftoverCandidates.length > 0) {
+        if (leftoverCandidates.length > 0 && generation === hunterHeadlessGeneration) {
             hunterHeadlessStats.lastCandidates += leftoverCandidates.length;
-            await runHunterAutoBidPass(leftoverCandidates, { pureValue: true });
+            enqueueHunterHeadlessBatch(leftoverCandidates, generation);
         }
 
         // Replanifie une dernière fois la Hot Lane avec la vue dédupliquée complète.
@@ -14447,8 +14491,9 @@
         }
     }
 
-    async function runHunterHeadlessLoop() {
+    async function runHunterHeadlessLoop(generation = hunterHeadlessGeneration) {
         if (
+            generation !== hunterHeadlessGeneration ||
             !hunterHeadlessWanted() ||
             hunterHeadlessScanInProgress
         ) {
@@ -14457,28 +14502,42 @@
 
         hunterHeadlessActive = true;
         hunterHeadlessScanInProgress = true;
-        const startedAt = Date.now();
+        hunterHeadlessScanStartedAt = Date.now();
+        const startedAt = hunterHeadlessScanStartedAt;
 
         try {
-            await checkHunterHeadlessMarketplace();
-            hunterHeadlessStats.scans++;
-            hunterHeadlessStats.lastScanTs = Date.now();
-            hunterHeadlessStats.lastError = '';
+            await checkHunterHeadlessMarketplace(generation);
+            if (generation === hunterHeadlessGeneration) {
+                hunterHeadlessStats.scans++;
+                hunterHeadlessStats.lastScanTs = Date.now();
+                hunterHeadlessStats.lastError = '';
+            }
         } catch (e) {
-            hunterHeadlessStats.lastError =
-                String(e?.message || e || 'erreur');
+            if (generation === hunterHeadlessGeneration) {
+                hunterHeadlessStats.lastError =
+                    String(e?.message || e || 'erreur');
+            }
             console.warn(
                 '[WikiMasters][hunter-headless] scan error:',
                 e
             );
         } finally {
-            hunterHeadlessStats.lastDurationMs =
-                Date.now() - startedAt;
-            hunterHeadlessScanInProgress = false;
+            // Une ancienne génération ne doit jamais libérer le verrou d'un nouveau scan.
+            if (generation === hunterHeadlessGeneration) {
+                hunterHeadlessStats.lastDurationMs =
+                    Date.now() - startedAt;
+                hunterHeadlessScanInProgress = false;
+                hunterHeadlessScanStartedAt = 0;
+            }
         }
 
-        if (!hunterHeadlessWanted()) {
-            hunterHeadlessActive = false;
+        if (
+            generation !== hunterHeadlessGeneration ||
+            !hunterHeadlessWanted()
+        ) {
+            if (generation === hunterHeadlessGeneration) {
+                hunterHeadlessActive = false;
+            }
             return;
         }
 
@@ -14489,7 +14548,7 @@
         );
 
         hunterHeadlessTimeout = setTimeout(
-            runHunterHeadlessLoop,
+            () => runHunterHeadlessLoop(generation),
             wait
         );
     }
@@ -14504,21 +14563,35 @@
 
         if (!hunterHeadlessActive) {
             hunterHeadlessActive = true;
+            hunterHeadlessGeneration++;
             fetchCurrentUser();
 
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome démarré · ` +
-                    `scan léger T-1m10 · traitement par page · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `scan T-1m10 indépendant de l'analyse · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
+        }
+
+        // Watchdog : un ancien scan ne doit pas pouvoir condamner définitivement le bouton.
+        // Avec l'analyse désormais découplée, une pagination utile >30 s est anormale.
+        if (
+            hunterHeadlessScanInProgress &&
+            hunterHeadlessScanStartedAt &&
+            Date.now() - hunterHeadlessScanStartedAt > 30_000
+        ) {
+            hunterHeadlessGeneration++;
+            hunterHeadlessScanInProgress = false;
+            hunterHeadlessScanStartedAt = 0;
+            hunterHeadlessStats.lastError = 'ancien scan >30 s abandonné puis relancé';
         }
 
         // La Hot Lane ne dépend plus du Market Watcher.
         startHotLane();
 
         if (!hunterHeadlessScanInProgress) {
-            runHunterHeadlessLoop();
+            runHunterHeadlessLoop(hunterHeadlessGeneration);
         }
 
         paintHunterAggro();
@@ -14531,9 +14604,16 @@
     } = {}) {
         const wasActive =
             hunterHeadlessActive ||
-            !!hunterHeadlessTimeout;
+            !!hunterHeadlessTimeout ||
+            hunterHeadlessScanInProgress;
 
         hunterHeadlessActive = false;
+
+        // Invalide le scan et toutes les analyses déjà en file. Les Promises réseau déjà
+        // parties peuvent finir, mais leurs résultats ne déclenchent plus de mise.
+        hunterHeadlessGeneration++;
+        hunterHeadlessScanInProgress = false;
+        hunterHeadlessScanStartedAt = 0;
 
         if (hunterHeadlessTimeout) {
             clearTimeout(hunterHeadlessTimeout);
@@ -14569,6 +14649,12 @@
             marketWatcherOn: marketWatcherActive,
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
+            scanBloqueDepuisMs: hunterHeadlessScanInProgress && hunterHeadlessScanStartedAt
+                ? Date.now() - hunterHeadlessScanStartedAt
+                : 0,
+            analysesEnFile: hunterHeadlessActionPending,
+            idsAnalyseEnFile: hunterHeadlessQueuedIds.size,
+            erreurAnalyse: hunterHeadlessStats.lastActionError || null,
             hotLaneOn: hotLaneActive,
             serveurSynchronise: serverClockSynced,
             decalageServeurMs: Math.round(serverClockOffset),
