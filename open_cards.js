@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0-beta4';
+    const WM_VERSION = '3.7.0-beta5';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -199,9 +199,12 @@
     // Si end_at remonte au-dessus de 1 min 30 après une extension serveur, les ripostes
     // auto-bid se remettent en pause jusqu'à repasser à <= 1 min 30.
     const AUTOMATIC_BID_MAX_REMAINING_MS = 90 * 1000;
-    // 3.7.0-beta3 — le scan découvre jusqu'à T-2m00, préchauffe le Recent Market
-    // entre T-2m00 et T-1m30, puis priorise la file de mise selon le temps réellement disponible.
-    const HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS = 8 * 1000;
+    // 3.7.0-beta5 — avec ~7 s observés par POST sur le serveur, une mise initiale Hunter
+    // ne part plus si l'enchère a <=12 s restantes, même si son historique est déjà en cache.
+    // La Hot Lane et ses ripostes restent inchangées.
+    const HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS = 12 * 1000;
+    const HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS = 20 * 1000;
+    const HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS = 60 * 1000;
     const HUNTER_HEADLESS_ACTION_BATCH_SIZE = 4;
 
     function automaticBidRemainingMs(auction) {
@@ -11473,6 +11476,16 @@
 
                 let { auction, decision, amount, isDynamic } = prepared;
 
+                // beta5 : la file a pu attendre pendant la prélecture / analyse du batch.
+                // Recontrôle donc la marge sur l'état FRAIS juste avant le tout premier POST.
+                // Ne s'applique qu'à la mise initiale Hunter ; la logique Hot Lane / retry reste inchangée.
+                const initialRemainingMs = automaticBidRemainingMs(auction);
+                if (!Number.isFinite(initialRemainingMs) ||
+                    initialRemainingMs <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS) {
+                    hunterHeadlessStats.actionTooLate++;
+                    continue;
+                }
+
                 // Verrou carte+rareté pris au dernier moment : une autre passe Hunter ne peut
                 // pas acheter le même exemplaire logique pendant que ce POST est en vol.
                 hunterCardLockKey = acquireHunterCardRarityBidLock(auction);
@@ -14397,7 +14410,7 @@
         prewarmQueued: 0,
         prewarmDone: 0,
         prewarmError: 0,
-        actionTooLateNoWarm: 0
+        actionTooLate: 0
     };
 
     function hunterHeadlessWanted() {
@@ -14496,17 +14509,36 @@
     }
 
     function hunterPageActionPriority(a, b) {
+        const aRemaining = automaticBidRemainingMs(a);
+        const bRemaining = automaticBidRemainingMs(b);
+
+        // beta5 : priorité par vraie marge d'action observée.
+        // 1) 20-60 s : zone idéale pour absorber lecture + POST (+ éventuel retry)
+        // 2) 60-90 s : encore très confortable
+        // 3) 12-20 s : urgent mais encore jouable
+        // 4) <=12 s / invalide : sera écarté par la boucle d'action
+        const rank = remaining => {
+            if (!Number.isFinite(remaining)) return 4;
+            if (remaining >= HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS &&
+                remaining <= HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS) return 0;
+            if (remaining > HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS &&
+                remaining <= AUTOMATIC_BID_MAX_REMAINING_MS) return 1;
+            if (remaining > HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS &&
+                remaining < HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS) return 2;
+            return 3;
+        };
+
+        const aRank = rank(aRemaining);
+        const bRank = rank(bRemaining);
+        if (aRank !== bRank) return aRank - bRank;
+
+        // Dans une même fenêtre, un historique déjà prêt passe d'abord.
         const aReady = hunterRecentCacheReady(a);
         const bReady = hunterRecentCacheReady(b);
         if (aReady !== bReady) return aReady ? -1 : 1;
 
-        const aRemaining = automaticBidRemainingMs(a);
-        const bRemaining = automaticBidRemainingMs(b);
-
-        // Historique déjà prêt : traite l'enchère la plus urgente d'abord.
-        if (aReady && bReady) return aRemaining - bRemaining;
-        // Historique pas encore prêt : garde le plus de marge réseau possible.
-        return bRemaining - aRemaining;
+        // Puis l'enchère la plus proche de la fin, tant qu'elle reste dans une zone viable.
+        return aRemaining - bRemaining;
     }
 
     async function runHunterPageActionQueue() {
@@ -14529,10 +14561,11 @@
                         continue;
                     }
 
-                    // Une enchère quasi terminée sans historique préchauffé est abandonnée :
-                    // lancer 15-25 ventes maintenant augmenterait surtout les POST arrivés après la fin.
-                    if (remaining <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS && !hunterRecentCacheReady(a)) {
-                        hunterHeadlessStats.actionTooLateNoWarm++;
+                    // beta5 : sous 12 s, on n'envoie plus de mise initiale Hunter, cache ou pas cache.
+                    // Les mesures beta4 montrent ~7 s par POST ; garder cette marge évite de gaspiller
+                    // une requête sur une enchère susceptible d'être finie avant la réponse serveur.
+                    if (remaining <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS) {
+                        hunterHeadlessStats.actionTooLate++;
                         hunterHeadlessPageQueuedIds.delete(a.id);
                         hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - 1);
                         continue;
@@ -14831,8 +14864,9 @@
             prechauffagesLances: hunterHeadlessStats.prewarmQueued,
             prechauffagesTermines: hunterHeadlessStats.prewarmDone,
             erreursPrechauffage: hunterHeadlessStats.prewarmError,
-            abandonsTropTardSansCache: hunterHeadlessStats.actionTooLateNoWarm,
-            seuilAbandonSansCacheMs: HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS,
+            abandonsTropTardInitial: hunterHeadlessStats.actionTooLate,
+            seuilMiseInitialeHunterMs: HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS,
+            prioriteHunter: '20-60s > 60-90s > 12-20s',
             erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,
             hotLaneOn: hotLaneActive,
             serveurSynchronise: serverClockSynced,
