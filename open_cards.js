@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.0-beta7';
+    const WM_VERSION = '3.7.0-beta8';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10612,6 +10612,7 @@
         postsEnded: 0,
         postsOtherFailed: 0,
         retriesAttempted: 0,
+        retriesTooLate: 0,
         networkErrors: 0,
         lastPost: null
     };
@@ -11503,11 +11504,25 @@
                     if (serverMinimum !== null) {
                         const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
                         if (retryPrepared && retryPrepared.amount !== amount) {
-                            auction = retryPrepared.auction;
-                            decision = retryPrepared.decision;
-                            amount = retryPrepared.amount;
-                            isDynamic = retryPrepared.isDynamic;
-                            attempt = await postHunterBid(auction, amount, decision, 2);
+                            const retryRemainingMs = automaticBidRemainingMs(retryPrepared.auction);
+
+                            // beta8 : le retry obéit au même garde-fou temporel que la mise initiale.
+                            // Un POST #1 lent peut consommer plusieurs secondes ; ne pas lancer un
+                            // POST #2 quand il ne reste déjà plus assez de marge pour la réponse serveur.
+                            if (!Number.isFinite(retryRemainingMs) ||
+                                retryRemainingMs <= HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS) {
+                                hunterBidDiagStats.retriesTooLate++;
+                                wmLog(
+                                    `↪️ Hunter retry abandonné (trop tard) : <b>${htmlEsc(retryPrepared.auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
+                                    `reste ${hunterBidDiagRemainingLabel(retryRemainingMs)} · seuil ${Math.round(HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS / 1000)}s`
+                                );
+                            } else {
+                                auction = retryPrepared.auction;
+                                decision = retryPrepared.decision;
+                                amount = retryPrepared.amount;
+                                isDynamic = retryPrepared.isDynamic;
+                                attempt = await postHunterBid(auction, amount, decision, 2);
+                            }
                         } else {
                             const currentCap = Number(decision?.cap);
                             const retryReason =
@@ -11756,7 +11771,7 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 200;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 250;
     const AUTOBID_RESPONSE_DELAY_MAX_MS = 350;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
@@ -15033,6 +15048,7 @@
             postsHunterTerminesSession: hunterBidDiagStats.postsEnded,
             postsHunterAutresEchecsSession: hunterBidDiagStats.postsOtherFailed,
             retriesHunterSession: hunterBidDiagStats.retriesAttempted,
+            retriesAbandonnesTropTard: hunterBidDiagStats.retriesTooLate,
             erreursReseauHunterSession: hunterBidDiagStats.networkErrors,
             dernierPostHunter: hunterBidDiagStats.lastPost
                 ? { ...hunterBidDiagStats.lastPost }
