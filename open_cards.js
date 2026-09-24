@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.4';
+    const WM_VERSION = '3.8.0';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11828,7 +11828,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 350;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 500;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 750;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14726,9 +14726,9 @@
 
             if (!silent) {
                 wmLog(
-                    `⚡ Hunter autonome v3.7.1 démarré · ` +
+                    `⚡ Hunter autonome v3.8.0 stable-prod démarré · ` +
                     `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · ` +
-                    `fenêtre T-2m00 · mises autorisées à T-1m30 · priorité Hot Lane ≤20s · ` +
+                    `fenêtre T-2m00 · mises autorisées à T-1m30 · Hot Lane prioritaire ≤20s · ` +
                     `Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
@@ -14778,6 +14778,7 @@
     window.wmHunterEngineDiag = function () {
         const result = {
             version: WM_VERSION,
+            profil: 'stable-prod',
             hunterOn: autoSnipeEnabled,
             mode: getSetting('autoSnipeMode'),
             source: hunterDynamicSource,
