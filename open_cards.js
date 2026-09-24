@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.1-LAG-MAX2';
+    const WM_VERSION = '3.8.2-LAG-MAX2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3920,7 +3920,7 @@
         rec.listPrice = priceInfo.price;
         saveFlipLedger();
 
-        const ui = await sellCardViaUI(
+        let ui = await sellCardViaUI(
             rec.cardId,
             rec.title,
             rec.rarity,
@@ -3931,11 +3931,43 @@
 
         if (!flipLedger.includes(rec)) return { ok: false, reason: 'supprime_manuellement' };
 
+        // vFLIP-HIDDEN : si la source de vérité /api/my-collection confirme la carte
+        // mais que React refuse de la rendre, on ne laisse plus le flip bloqué.
+        if (
+            !ui?.ok &&
+            ui?.reason === 'card_hidden_in_collection_dom' &&
+            ui?.apiUserCardId
+        ) {
+            const apiUserCardId = ui.apiUserCardId;
+            const apiCardId = ui.apiCardId || rec.cardId;
+
+            // Le ledger doit suivre l'exemplaire réellement confirmé par l'API.
+            rec.userCardId = apiUserCardId;
+            if (apiCardId && apiCardId !== rec.cardId) {
+                rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
+                rec.cardId = apiCardId;
+            }
+            saveFlipLedger();
+
+            ui = await trySellFlipViaTargetedApi(
+                rec,
+                priceInfo.price,
+                duration,
+                apiUserCardId,
+                apiCardId
+            );
+        }
+
         if (!ui?.ok) {
             const reasonMap = {
                 wrong_page: 'reste sur /collection pour permettre la vente via l’interface',
                 card_not_found: 'carte introuvable dans la collection',
                 card_hidden_in_collection_dom: 'carte présente dans la collection API mais masquée/non résolue dans l’interface Collection',
+                targeted_api_refused: 'fallback exemplaire ciblé refusé par le serveur',
+                targeted_api_wrong_instance: 'fallback ciblé annulé : le serveur n’a pas consommé l’exemplaire demandé',
+                targeted_api_card_mismatch: 'fallback ciblé annulé : card_id de l’annonce créée incohérent',
+                targeted_api_network: 'fallback ciblé : erreur réseau',
+                targeted_api_not_owned: 'fallback ciblé : exemplaire non retrouvé comme possédé',
                 no_search_input: 'barre de recherche collection introuvable',
                 no_sell_button: 'bouton "Mettre aux enchères" introuvable',
                 no_launch_button: 'bouton "Lancer l’enchère" introuvable',
@@ -3951,6 +3983,9 @@
 
         rec.status = 'listed';
         rec.saleAuctionId = ui.auctionId || null;
+        if (ui?.via === 'targeted_api') {
+            wmLog(`🔄 Flip Seller : <b>${rec.title}</b> réinjectée dans le cycle normal en statut <b>listed</b>.`);
+        }
         rec.listPrice = Number.isFinite(Number(ui.actualPrice))
             ? Number(ui.actualPrice)
             : priceInfo.price;
@@ -11891,8 +11926,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 550;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 850;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 4000;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 7000;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -16607,6 +16642,235 @@
         return Math.round((end - start) / 60000);
     }
 
+    async function resetCollectionUiForFlip() {
+        if (!location.pathname.startsWith('/collection')) return false;
+
+        const root = document.querySelector('main') || document.body;
+        let changed = 0;
+
+        // Ferme d'abord un éventuel modal de carte/vente : il peut masquer la grille.
+        try { closeAuctionSellModal(); } catch (e) { }
+
+        // Recherche native.
+        const search = findCollectionSearchInput();
+        if (search && String(search.value || '') !== '') {
+            setReactInputValue(search, '');
+            changed++;
+        }
+
+        // Tous les filtres de rareté actifs connus.
+        for (const ctrl of collectionRarityFilterControls()) {
+            if (!ctrl?.el || !rarityControlIsActive(ctrl)) continue;
+            try {
+                ctrl.el.click();
+                changed++;
+                await new Promise(r => setTimeout(r, 60));
+            } catch (e) { }
+        }
+
+        // Filtres natifs supplémentaires (tags / options) exposés comme checkbox.
+        // On exclut tout ce qui appartient à WMaster ou à un tile de carte.
+        for (const input of root.querySelectorAll('input[type="checkbox"]:checked')) {
+            if (!input || input.offsetParent === null) continue;
+            if (input.closest('[id^="wm-"]')) continue;
+            if (input.closest('.cursor-pointer')) continue;
+            try {
+                input.click();
+                changed++;
+                await new Promise(r => setTimeout(r, 40));
+            } catch (e) { }
+        }
+
+        // Si le site fournit un vrai bouton de reset des filtres, utilise-le.
+        const resetBtn = [...root.querySelectorAll('button,[role="button"]')]
+            .find(el => {
+                if (!el || el.offsetParent === null) return false;
+                if (el.closest('[id^="wm-"]') || el.closest('.cursor-pointer')) return false;
+                const t = normalizeCollectionMatchText(el.textContent);
+                return /^(reinitialiser|reinitialiser les filtres|effacer les filtres|reset filters)$/.test(t);
+            });
+        if (resetBtn) {
+            try {
+                resetBtn.click();
+                changed++;
+            } catch (e) { }
+        }
+
+        await new Promise(r => setTimeout(r, 700));
+        return changed > 0;
+    }
+
+    // Fallback exceptionnel : l'API collection confirme l'exemplaire mais React refuse
+    // toujours de le rendre. On cible alors l'exemplaire physique avec user_card_id.
+    // La vente n'est acceptée qu'après vérification que CET user_card_id a quitté la collection.
+    async function trySellFlipViaTargetedApi(rec, price, duration, apiUserCardId = null, apiCardId = null) {
+        if (!rec) return { ok: false, reason: 'targeted_api_invalid_record' };
+
+        const targetUserCardId = String(apiUserCardId || rec.userCardId || '').trim();
+        if (!targetUserCardId) {
+            return { ok: false, reason: 'targeted_api_no_user_card_id' };
+        }
+
+        const ownedBefore = await verifyOwnedFlipUserCardId(targetUserCardId).catch(() => null);
+        if (!ownedBefore?.id) {
+            return { ok: false, reason: 'targeted_api_not_owned' };
+        }
+
+        const targetCardId =
+            apiCardId ||
+            ownedBefore.card_id ||
+            ownedBefore._flipMeta?.cardId ||
+            rec.cardId ||
+            null;
+
+        if (!targetCardId) {
+            return { ok: false, reason: 'targeted_api_no_card_id' };
+        }
+
+        const requestedPrice = Math.max(1, Math.round(Number(price) || 0));
+        const requestedDuration = Number(duration);
+        let res = null;
+        let data = {};
+
+        wmLog(
+            `🧩 Flip Seller : <b>${rec.title}</b> invisible dans React → ` +
+            `fallback ciblé exemplaire <span style="color:#fbbf24;">${targetUserCardId.slice(0, 8)}…</span>.`
+        );
+
+        try {
+            // Utilise le fetch natif mémorisé si disponible, sinon le fetch courant.
+            // Le payload ajoute explicitement user_card_id à celui de l'UI.
+            const fetchFn =
+                (typeof window.wmOriginalFetch === 'function')
+                    ? window.wmOriginalFetch
+                    : window.fetch;
+
+            res = await fetchFn.call(
+                window,
+                "https://www.wiki-masters.com/api/marketplace",
+                {
+                    method: "POST",
+                    credentials: "include",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        card_id: targetCardId,
+                        base_amount: requestedPrice,
+                        duration_minutes: requestedDuration,
+                        user_card_id: targetUserCardId
+                    })
+                }
+            );
+            data = await res.json().catch(() => ({}));
+        } catch (e) {
+            return {
+                ok: false,
+                reason: 'targeted_api_network',
+                error: String(e?.message || e || 'erreur réseau')
+            };
+        }
+
+        if (!res?.ok) {
+            return {
+                ok: false,
+                reason: 'targeted_api_refused',
+                status: res?.status || 0,
+                error: data?.error || data?.message || `HTTP ${res?.status || '?'}`
+            };
+        }
+
+        let auctionId = data?.auction_id || data?.id || null;
+
+        // Si la réponse n'expose pas l'id, laisse un peu de temps à l'index marketplace
+        // puis tente de rattacher l'annonce comme le reste du Flip Seller.
+        if (!auctionId) {
+            await new Promise(r => setTimeout(r, 900));
+            const probe = await findActiveSellerAuctionForFlipSameOrigin({
+                ...rec,
+                cardId: targetCardId,
+                listPrice: requestedPrice,
+                lastListAttemptAt: Date.now()
+            }).catch(() => null);
+            if (probe?.match?.id && !probe?.ambiguous) {
+                auctionId = probe.match.id;
+            }
+        }
+
+        // Vérification de sécurité : le site doit avoir consommé exactement l'exemplaire ciblé.
+        // Le snapshot est invalidé pour ne jamais valider sur un cache antérieur au POST.
+        await new Promise(r => setTimeout(r, 1200));
+        invalidateFlipOwnedCollectionSnapshot();
+        const stillOwned = await verifyOwnedFlipUserCardId(targetUserCardId).catch(() => null);
+
+        if (stillOwned?.id) {
+            // Le serveur a accepté le POST mais n'a pas consommé l'exemplaire demandé.
+            // Si une annonce a été créée, on l'annule immédiatement.
+            if (auctionId) {
+                await cancelSale(auctionId, rec.title, null).catch(() => null);
+                invalidateFlipOwnedCollectionSnapshot();
+            }
+
+            wmLog(
+                `🚫 Flip Seller : fallback ciblé annulé pour <b>${rec.title}</b> — ` +
+                `l'exemplaire ${targetUserCardId.slice(0, 8)}… est toujours dans la collection.`
+            );
+
+            return {
+                ok: false,
+                reason: 'targeted_api_wrong_instance',
+                auctionId: auctionId || null
+            };
+        }
+
+        // Contrôle léger de l'annonce quand l'id est disponible.
+        let actualPrice = requestedPrice;
+        let actualDurationMin = requestedDuration;
+        let anomaly = null;
+
+        if (auctionId) {
+            const row = await fetchCreatedAuctionForVerification(auctionId).catch(() => null);
+            if (row) {
+                const serverCardId = row.card_id || row.card?.id || null;
+                const serverPrice = Number(row.listing_base_amount ?? row.base_amount);
+                const serverDuration = actualAuctionDurationMinutes(row);
+
+                if (serverCardId && serverCardId !== targetCardId) {
+                    await cancelSale(auctionId, rec.title, row.end_at || null).catch(() => null);
+                    return {
+                        ok: false,
+                        reason: 'targeted_api_card_mismatch',
+                        auctionId
+                    };
+                }
+
+                if (Number.isFinite(serverPrice)) actualPrice = serverPrice;
+                if (Number.isFinite(serverDuration)) actualDurationMin = serverDuration;
+
+                if (
+                    (Number.isFinite(serverPrice) && serverPrice !== requestedPrice) ||
+                    (Number.isFinite(serverDuration) && Math.abs(serverDuration - requestedDuration) > 1)
+                ) {
+                    anomaly =
+                        `listing ciblé créé avec paramètres serveur différents ` +
+                        `(prix ${actualPrice}/${requestedPrice}, durée ${actualDurationMin}/${requestedDuration})`;
+                }
+            }
+        }
+
+        wmLog(
+            `✅ Flip Seller : fallback ciblé réussi → <b>${rec.title}</b> ` +
+            `(${targetUserCardId.slice(0, 8)}…) mise en vente${auctionId ? ` · ${String(auctionId).slice(0, 8)}…` : ''}.`
+        );
+
+        return {
+            ok: true,
+            auctionId: auctionId || null,
+            actualPrice,
+            actualDurationMin,
+            anomaly,
+            via: 'targeted_api'
+        };
+    }
+
     async function sellCardViaUI(cardId, title, rarity, price, duration, userCardId = null) {
         if (!(await ensureOnCollectionPage())) return { ok: false, reason: 'wrong_page' };
 
@@ -16622,7 +16886,7 @@
         }
         if (!searchInput) return { ok: false, reason: 'no_search_input' };
 
-        const normalizedSellRarity = normalizeRarityCode(rarity);
+        let normalizedSellRarity = normalizeRarityCode(rarity);
         let variantFilterConfirmed = false;
 
         // L/L+ partagent le même card_id. On essaie donc d'abord de faire isoler la variante
@@ -16689,20 +16953,64 @@
             } catch (e) { }
 
             if (apiMatch) {
-                wmLog(
-                    `⚠️ Flip Seller : <b>${title}</b> présente dans /api/my-collection ` +
-                    `(${String(apiMatch.userCardId || '?').slice(0, 8)}…, ${apiMatch.rarity || '?'}) ` +
-                    `mais aucun tile Collection correspondant n'est visible dans le DOM.`
-                );
-                return {
-                    ok: false,
-                    reason: 'card_hidden_in_collection_dom',
-                    apiUserCardId: apiMatch.userCardId || null,
-                    apiCardId: apiMatch.cardId || null
-                };
-            }
+                // L'API est la source de vérité : recale immédiatement les métadonnées locales.
+                userCardId = apiMatch.userCardId || userCardId;
+                cardId = apiMatch.cardId || cardId;
+                if (apiMatch.rarity) {
+                    normalizedSellRarity =
+                        normalizeRarityCode(apiMatch.rarity) ||
+                        normalizedSellRarity;
+                }
 
-            return { ok: false, reason: 'card_not_found' };
+                wmLog(
+                    `🧹 Flip Seller : <b>${title}</b> existe dans l'API mais pas dans la grille → ` +
+                    `reset des filtres Collection et nouvelle tentative.`
+                );
+
+                await resetCollectionUiForFlip().catch(() => false);
+
+                // Les clics de reset peuvent rerender tout le composant : reprends l'input.
+                searchInput = findCollectionSearchInput() || await waitForCollectionReady(5000);
+                variantFilterConfirmed = false;
+
+                if (variantRequiresShinyMetadata(normalizedSellRarity)) {
+                    variantFilterConfirmed =
+                        await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+                }
+
+                if (searchInput) {
+                    setReactInputValue(searchInput, title);
+                    for (let i = 0; i < 24 && !tile; i++) {
+                        await new Promise(r => setTimeout(r, 250));
+                        tile = findCollectionTileByTitleAndRarity(
+                            title,
+                            normalizedSellRarity,
+                            userCardId,
+                            variantFilterConfirmed,
+                            cardId
+                        );
+                    }
+                }
+
+                if (tile) {
+                    wmLog(
+                        `✅ Flip Seller : <b>${title}</b> révélée après reset des filtres Collection.`
+                    );
+                } else {
+                    wmLog(
+                        `⚠️ Flip Seller : <b>${title}</b> toujours invisible dans React malgré le reset · ` +
+                        `fallback ciblé user_card_id autorisé.`
+                    );
+                    return {
+                        ok: false,
+                        reason: 'card_hidden_in_collection_dom',
+                        apiUserCardId: apiMatch.userCardId || null,
+                        apiCardId: apiMatch.cardId || null
+                    };
+                }
+            } else {
+                return { ok: false, reason: 'card_not_found' };
+            }
         }
 
         tile.click();
