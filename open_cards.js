@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.0-LAG-MAX';
+    const WM_VERSION = '3.8.1-LAG-MAX2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10707,6 +10707,14 @@
         );
     }
 
+    // Premier POST seul : une fois la carte prévalidée, on n'exige plus la marge
+    // POST + retry. On garde seulement de quoi faire relecture fraîche + 1 POST.
+    function hunterLagFirstPostRunwayMs() {
+        const p95 = hunterLagPostP95Ms();
+        if (!Number.isFinite(p95)) return 11_000;
+        return Math.max(11_000, Math.min(25_000, Math.round(p95 + 2_500)));
+    }
+
     // Retry : un seul POST supplémentaire doit encore pouvoir rentrer.
     function hunterLagRetryRunwayMs() {
         const p95 = hunterLagPostP95Ms();
@@ -11596,7 +11604,7 @@
                 // Ne s'applique qu'à la mise initiale Hunter ; la logique Hot Lane / retry reste inchangée.
                 const initialRemainingMs = automaticBidRemainingMs(auction);
                 if (!Number.isFinite(initialRemainingMs) ||
-                    initialRemainingMs <= hunterLagInitialRunwayMs()) {
+                    initialRemainingMs <= hunterLagFirstPostRunwayMs()) {
                     hunterHeadlessStats.actionTooLate++;
                     continue;
                 }
@@ -11883,8 +11891,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 200;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 750;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 550;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 850;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14657,7 +14665,7 @@
         if (!hunterHeadlessFastCandidateAllowed(a)) return false;
 
         const remaining = automaticBidRemainingMs(a);
-        if (!Number.isFinite(remaining) || remaining <= hunterLagInitialRunwayMs()) {
+        if (!Number.isFinite(remaining) || remaining <= hunterLagFirstPostRunwayMs()) {
             hunterHeadlessStats.preanalysisTooLate++;
             return false;
         }
@@ -14772,7 +14780,7 @@
 
             const remaining = automaticBidRemainingMs(a);
             if (!Number.isFinite(remaining) ||
-                remaining <= hunterLagInitialRunwayMs() ||
+                remaining <= hunterLagFirstPostRunwayMs() ||
                 remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
                 continue;
             }
@@ -14781,8 +14789,8 @@
             const rarity = globalAuctionRarity(a);
             if (!cardId || !rarity) continue;
 
-            // Si l'historique est déjà ultra-frais, la carte peut passer directement
-            // dans la file de mise sans refaire de réseau.
+            // Si l'historique est déjà ultra-frais, on peut tenter un POST même dans la
+            // zone "single-shot" où il n'y a plus assez de marge pour garantir un retry.
             const freshForBid = getCachedRecentMarket(
                 cardId,
                 rarity,
@@ -14790,6 +14798,12 @@
             );
             if (freshForBid?.ok) {
                 queuePreparedHunterAction(a);
+                continue;
+            }
+
+            // Pas de cache ultra-frais : une NOUVELLE préanalyse réseau n'est lancée
+            // que s'il reste la marge complète POST + retry.
+            if (remaining <= hunterLagInitialRunwayMs()) {
                 continue;
             }
 
@@ -14817,28 +14831,35 @@
     }
 
     function hunterPageActionPriority(a, b) {
-        const aRemaining = automaticBidRemainingMs(a);
-        const bRemaining = automaticBidRemainingMs(b);
+        const ar = automaticBidRemainingMs(a);
+        const br = automaticBidRemainingMs(b);
+        const firstPost = hunterLagFirstPostRunwayMs();
+        const full = hunterLagInitialRunwayMs();
 
-        // beta5 : priorité par vraie marge d'action observée.
-        // 1) 20-60 s : zone idéale pour absorber lecture + POST (+ éventuel retry)
-        // 2) 60-90 s : encore très confortable
-        // 3) 12-20 s : urgent mais encore jouable
-        // 4) <=12 s / invalide : sera écarté par la boucle d'action
-        const rank = remaining => hunterLagPriorityRank(remaining);
+        const rank = remaining => {
+            if (!Number.isFinite(remaining) || remaining <= firstPost) return 4;
 
-        const aRank = rank(aRemaining);
-        const bRank = rank(bRemaining);
+            // Une carte DÉJÀ prévalidée qui a perdu sa marge de retry passe devant :
+            // c'est maintenant ou jamais pour sauver le premier POST.
+            if (remaining <= full) return 0;
+
+            // Puis la zone idéale.
+            if (remaining <= 60_000) return 1;
+
+            // Puis le confortable 60-90 s.
+            if (remaining <= AUTOMATIC_BID_MAX_REMAINING_MS) return 2;
+
+            return 3;
+        };
+
+        const aRank = rank(ar);
+        const bRank = rank(br);
         if (aRank !== bRank) return aRank - bRank;
 
-        // Dans une même fenêtre, un historique déjà prêt passe d'abord.
-        const aReady = hunterRecentCacheReady(a);
-        const bReady = hunterRecentCacheReady(b);
-        if (aReady !== bReady) return aReady ? -1 : 1;
-
-        // Puis l'enchère la plus proche de la fin, tant qu'elle reste dans une zone viable.
-        return aRemaining - bRemaining;
+        // Dans la même zone : échéance la plus proche d'abord.
+        return ar - br;
     }
+
 
     async function runHunterPageActionQueue() {
         if (hunterHeadlessPageWorkerRunning) return;
@@ -14860,10 +14881,10 @@
                         continue;
                     }
 
-                    // beta5 : sous 12 s, on n'envoie plus de mise initiale Hunter, cache ou pas cache.
-                    // Les mesures beta4 montrent ~7 s par POST ; garder cette marge évite de gaspiller
-                    // une requête sur une enchère susceptible d'être finie avant la réponse serveur.
-                    if (remaining <= hunterLagInitialRunwayMs()) {
+                    // v3.8.1-LAG-MAX2 : une carte déjà prévalidée n'a besoin que de la
+                    // marge pour UN premier POST. La marge complète reste utilisée en amont
+                    // pour décider si ça vaut encore le coup de lancer une préanalyse lourde.
+                    if (remaining <= hunterLagFirstPostRunwayMs()) {
                         hunterHeadlessStats.actionTooLate++;
                         hunterHeadlessPageQueuedIds.delete(a.id);
                         hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - 1);
@@ -15093,7 +15114,7 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `scan streaming ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST prioritaire/sérialisé · marge adaptative T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s (p95 réseau) · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `scan streaming ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST prioritaire/sérialisé · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · marge p95 réseau · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -15142,7 +15163,7 @@
     window.wmHunterEngineDiag = function () {
         const result = {
             version: WM_VERSION,
-            profil: 'lag-max',
+            profil: 'lag-max2',
             hunterOn: autoSnipeEnabled,
             mode: getSetting('autoSnipeMode'),
             source: hunterDynamicSource,
@@ -15165,7 +15186,8 @@
             abandonsPendantPreanalyse: hunterHeadlessStats.preanalysisTooLate,
             erreursPreanalyse: hunterHeadlessStats.prewarmError,
             abandonsTropTardInitial: hunterHeadlessStats.actionTooLate,
-            seuilMiseInitialeHunterMs: hunterLagInitialRunwayMs(),
+            seuilPreanalyseConfortMs: hunterLagInitialRunwayMs(),
+            seuilPremierPostHunterMs: hunterLagFirstPostRunwayMs(),
             seuilRetryHunterMs: hunterLagRetryRunwayMs(),
             postHunterP95Ms: hunterLagPostP95Ms(),
             postsHunterEnVol: hunterLagPostInFlight,
