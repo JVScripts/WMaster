@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.3-STABLE-PROD';
+    const WM_VERSION = '3.8.4-STABLE-PROD';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5445,7 +5445,7 @@
             regimeShift: `baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}% · hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}% · bascule pondérée par confiance des 5 dernières`,
             filtreExtremes: `15 ventes minimum · jusqu’à ${RECENT_MARKET_LIMIT} analysées · trim adaptatif 2/3 extrêmes par côté · extrêmes plafonnés dans la série temporelle`,
             recencyDecay: RECENT_RECENCY_DECAY,
-            recentHunterPct: '69% si réf H <800 · 72% si 800–1000 · 75% si >1000',
+            recentHunterPct: '69% si réf H <1000 · 72% si 1000–3000 · 75% si >3000',
             hunterPurchaseSafetyFloorPct: Math.round(HUNTER_PURCHASE_SAFETY_FLOOR * 100),
             hunterPurchaseExitModel: `achat = réf H (Trend/consensus/rupture) × sortie prévue × sécurité structurelle adaptative × ratio dynamique 69/72/75% selon réf H`,
             hunterLiquidity: `dernière vente <= 48h · rythme effectif (silence actuel inclus) global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
@@ -8168,11 +8168,11 @@
     // Hunter Trend dynamique — le niveau de risque accepté augmente avec la réf H marché.
     // Le choix de tranche se fait sur hunterMarketReference (Trend/consensus H réellement
     // validé), puis le ratio s'applique comme avant à la référence achat déjà sécurisée.
-    const HUNTER_DYNAMIC_RATIO_LOW_MAX = 800;
-    const HUNTER_DYNAMIC_RATIO_MID_MAX = 1000;
-    const HUNTER_DYNAMIC_RATIO_LOW = 0.69;   // réf H < 800
-    const HUNTER_DYNAMIC_RATIO_MID = 0.72;   // 800 <= réf H <= 1000
-    const HUNTER_DYNAMIC_RATIO_HIGH = 0.75;  // réf H > 1000
+    const HUNTER_DYNAMIC_RATIO_LOW_MAX = 1000;
+    const HUNTER_DYNAMIC_RATIO_MID_MAX = 3000;
+    const HUNTER_DYNAMIC_RATIO_LOW = 0.69;   // réf H < 1000
+    const HUNTER_DYNAMIC_RATIO_MID = 0.72;   // 1000 <= réf H <= 3000
+    const HUNTER_DYNAMIC_RATIO_HIGH = 0.75;  // réf H > 3000
 
     function hunterTrendDynamicRatio(marketReference) {
         const ref = Number(marketReference);
@@ -8185,9 +8185,9 @@
     function hunterTrendDynamicRatioBand(marketReference) {
         const ref = Number(marketReference);
         if (!Number.isFinite(ref) || ref <= 0) return 'réf H invalide';
-        if (ref < HUNTER_DYNAMIC_RATIO_LOW_MAX) return '<800 → 69%';
-        if (ref <= HUNTER_DYNAMIC_RATIO_MID_MAX) return '800–1000 → 72%';
-        return '>1000 → 75%';
+        if (ref < HUNTER_DYNAMIC_RATIO_LOW_MAX) return '<1000 → 69%';
+        if (ref <= HUNTER_DYNAMIC_RATIO_MID_MAX) return '1000–3000 → 72%';
+        return '>3000 → 75%';
     }
 
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
@@ -21991,7 +21991,7 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v4 (15 min · jusqu’à 25 ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part de la <b>sortie Flip prévue</b> (1er listing - urgence), applique la sécurité achat-only, puis un ratio Hunter <b>dynamique selon la réf H</b> : <b>69% sous 800</b>, <b>72% de 800 à 1000</b>, <b>75% au-dessus de 1000</b>. Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part de la <b>sortie Flip prévue</b> (1er listing - urgence), applique la sécurité achat-only, puis un ratio Hunter <b>dynamique selon la réf H</b> : <b>69% jusqu’à 999</b>, <b>72% de 1000 à 3000</b>, <b>75% au-dessus de 3000</b>. Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Délai humanisé avant une mise (ms). Plus bas = mises plus rapides mais moins « humaines ». <b>0 = instantané</b>. Ignoré quand l'enchère se termine bientôt (snipe toujours instantané).</div>
@@ -22788,7 +22788,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? `🎯 Hunter en mode <b>Trend-Aware v4 dynamique</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} · 69% <800 · 72% 800–1000 · 75% >1000)`
+                        ? `🎯 Hunter en mode <b>Trend-Aware v4 dynamique</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} · 69% <1000 · 72% 1000–3000 · 75% >3000)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
 
                     if (autoSnipeEnabled) {
