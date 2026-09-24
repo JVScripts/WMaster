@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.5-LAG-MAX2';
+    const WM_VERSION = '3.8.6-LAG-MAX2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10749,6 +10749,8 @@
     // v3.8.0-LAG-MAX — voie réseau prioritaire aux POST Hunter.
     // Le serveur dégradé peut prendre 7–10 s pour répondre : la marge n'est donc plus fixe.
     let hunterLagPostInFlight = 0;
+    // 1 POST initial + 2 retries max, strictement sérialisés.
+    const HUNTER_MAX_POSTS_PER_CANDIDATE = 3;
 
     function hunterLagRecordPostElapsed(ms) {
         const n = Number(ms);
@@ -11688,47 +11690,51 @@
                 hunterCardLockKey = acquireHunterCardRarityBidLock(auction);
                 if (!hunterCardLockKey) continue;
 
-                let attempt = await postHunterBid(auction, amount, decision, 1);
+                let attemptNo = 1;
+                let attempt = await postHunterBid(auction, amount, decision, attemptNo);
 
-                // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
-                // notre relecture et le POST, le serveur renvoie son minimum actuel. On relit
-                // encore l'enchère, vérifie self-bid / T-1m30 / plafond, puis retente UNE fois.
-                if (!attempt.res.ok) {
+                // Jusqu'à 3 POST au total : initial + 2 retries.
+                // Chaque retry repasse par une relecture fraîche et recalcule le cap Hunter.
+                while (!attempt.res.ok && attemptNo < HUNTER_MAX_POSTS_PER_CANDIDATE) {
                     const serverMinimum = minimumFromTooLowError(attempt.data);
-                    if (serverMinimum !== null) {
-                        const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
-                        if (retryPrepared && retryPrepared.amount !== amount) {
-                            const retryRemainingMs = automaticBidRemainingMs(retryPrepared.auction);
+                    if (serverMinimum === null) break;
 
-                            // beta8 : le retry obéit au même garde-fou temporel que la mise initiale.
-                            // Un POST #1 lent peut consommer plusieurs secondes ; ne pas lancer un
-                            // POST #2 quand il ne reste déjà plus assez de marge pour la réponse serveur.
-                            if (!Number.isFinite(retryRemainingMs) ||
-                                retryRemainingMs <= hunterLagRetryRunwayMs()) {
-                                hunterBidDiagStats.retriesTooLate++;
-                                wmLog(
-                                    `↪️ Hunter retry abandonné (trop tard) : <b>${htmlEsc(retryPrepared.auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
-                                    `reste ${hunterBidDiagRemainingLabel(retryRemainingMs)} · seuil ${Math.round(hunterLagRetryRunwayMs() / 1000)}s`
-                                );
-                            } else {
-                                auction = retryPrepared.auction;
-                                decision = retryPrepared.decision;
-                                amount = retryPrepared.amount;
-                                isDynamic = retryPrepared.isDynamic;
-                                attempt = await postHunterBid(auction, amount, decision, 2);
-                            }
-                        } else {
-                            const currentCap = Number(decision?.cap);
-                            const retryReason =
-                                Number.isFinite(currentCap) && serverMinimum > currentCap
-                                    ? `minimum serveur ${serverMinimum} 💰 > plafond ${Math.round(currentCap)} 💰`
-                                    : 'revalidation fraîche refusée ou montant inchangé';
-                            wmLog(
-                                `↪️ Hunter retry abandonné : <b>${htmlEsc(auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
-                                `${htmlEsc(retryReason)}`
-                            );
-                        }
+                    const previousAmount = amount;
+                    const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
+
+                    if (!retryPrepared || retryPrepared.amount === previousAmount) {
+                        const currentCap = Number(decision?.cap);
+                        const retryReason =
+                            Number.isFinite(currentCap) && serverMinimum > currentCap
+                                ? `minimum serveur ${serverMinimum} 💰 > plafond ${Math.round(currentCap)} 💰`
+                                : 'revalidation fraîche refusée ou montant inchangé';
+                        wmLog(
+                            `↪️ Hunter retry abandonné : <b>${htmlEsc(auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
+                            `${htmlEsc(retryReason)}`
+                        );
+                        break;
                     }
+
+                    const retryRemainingMs = automaticBidRemainingMs(retryPrepared.auction);
+                    if (!Number.isFinite(retryRemainingMs) ||
+                        retryRemainingMs <= hunterLagRetryRunwayMs()) {
+                        hunterBidDiagStats.retriesTooLate++;
+                        wmLog(
+                            `↪️ Hunter retry #${attemptNo + 1} abandonné (trop tard) : ` +
+                            `<b>${htmlEsc(retryPrepared.auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
+                            `reste ${hunterBidDiagRemainingLabel(retryRemainingMs)} · ` +
+                            `seuil ${Math.round(hunterLagRetryRunwayMs() / 1000)}s`
+                        );
+                        break;
+                    }
+
+                    auction = retryPrepared.auction;
+                    decision = retryPrepared.decision;
+                    amount = retryPrepared.amount;
+                    isDynamic = retryPrepared.isDynamic;
+                    attemptNo++;
+
+                    attempt = await postHunterBid(auction, amount, decision, attemptNo);
                 }
 
                 const title = auction.card?.wikipedia_title || seed.card?.wikipedia_title || '?';
@@ -11966,7 +11972,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 300;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 750;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 350;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -15265,6 +15271,7 @@
             seuilRetryHunterMs: hunterLagRetryRunwayMs(),
             postHunterP95Ms: hunterLagPostP95Ms(),
             postsHunterEnVol: hunterLagPostInFlight,
+            maxPostsHunterParCandidat: HUNTER_MAX_POSTS_PER_CANDIDATE,
             prioritePreanalyse: '20-60s > 60-90s > runway-20s',
             prioriteHunter: '20-60s > 60-90s > runway-20s',
             erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,

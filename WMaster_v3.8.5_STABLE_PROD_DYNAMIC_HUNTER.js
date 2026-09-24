@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.4-STABLE-PROD';
+    const WM_VERSION = '3.8.5-STABLE-PROD';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11451,6 +11451,9 @@
         return 'decisionOther';
     }
 
+    // 1 POST initial + 2 retries max, strictement sérialisés.
+    const HUNTER_MAX_POSTS_PER_CANDIDATE = 3;
+
     // Auto-bid Hunter (mise initiale selon le mode fixe/dynamique) sur une LISTE d'enchères.
     // Mutualisé entre le scan (nouvelles annonces) ET l'activation du Hunter (annonces déjà
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
@@ -11641,26 +11644,29 @@
                     continue;
                 }
 
+                let attemptNo = 1;
                 hunterDecisionStats.postAttempts++;
                 let attempt = await postHunterBid(auction.id, amount);
 
-                // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
-                // notre relecture et le POST, le serveur renvoie son minimum actuel. On relit
-                // encore l'enchère, vérifie self-bid / T-1m30 / plafond, puis retente UNE fois.
-                if (!attempt.res.ok) {
+                // Jusqu'à 3 POST au total : initial + 2 retries.
+                // Chaque retry repasse par la revalidation fraîche complète.
+                while (!attempt.res.ok && attemptNo < HUNTER_MAX_POSTS_PER_CANDIDATE) {
                     const serverMinimum = minimumFromTooLowError(attempt.data);
-                    if (serverMinimum !== null) {
-                        const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
-                        if (retryPrepared && retryPrepared.amount !== amount) {
-                            auction = retryPrepared.auction;
-                            decision = retryPrepared.decision;
-                            amount = retryPrepared.amount;
-                            isDynamic = retryPrepared.isDynamic;
-                            hunterDecisionStats.postRetriesTooLow++;
-                            hunterDecisionStats.postAttempts++;
-                            attempt = await postHunterBid(auction.id, amount);
-                        }
-                    }
+                    if (serverMinimum === null) break;
+
+                    const previousAmount = amount;
+                    const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
+                    if (!retryPrepared || retryPrepared.amount === previousAmount) break;
+
+                    auction = retryPrepared.auction;
+                    decision = retryPrepared.decision;
+                    amount = retryPrepared.amount;
+                    isDynamic = retryPrepared.isDynamic;
+
+                    attemptNo++;
+                    hunterDecisionStats.postRetriesTooLow++;
+                    hunterDecisionStats.postAttempts++;
+                    attempt = await postHunterBid(auction.id, amount);
                 }
 
                 const title = auction.card?.wikipedia_title || seed.card?.wikipedia_title || '?';
