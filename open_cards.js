@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.3-LAG-MAX2';
+    const WM_VERSION = '3.8.4-LAG-MAX2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -5202,8 +5202,9 @@
             blocage = 'référence achat Trend-Aware v4 invalide';
         }
 
-        const ratio = ref ? hunterRatioForReferenceKind(ref.kind) : null;
-        const cap = ref ? dynamicHunterCapFromReference(ref.value, ref.kind) : null;
+        const ratio = ref ? hunterRatioForReferenceKind(ref.kind, ref.marketReference) : null;
+        const cap = ref ? dynamicHunterCapFromReference(ref.value, ref.kind, ref.marketReference) : null;
+        const ratioBand = ref ? hunterTrendDynamicRatioBand(ref.marketReference) : null;
 
         const result = {
             version: WM_VERSION,
@@ -5234,6 +5235,9 @@
             consensusCourtCoherent: recent?.hunterShortCoherent === true,
             hausseConsensusAcceptee: recent?.hunterUpwardConsensusConfirmed === true,
             referenceMarcheHunter: Number.isFinite(Number(recent?.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
+            ratioHunterDynamiquePct: Number.isFinite(Number(ratio)) ? Math.round(Number(ratio) * 100) : null,
+            trancheRatioHunter: ratioBand,
+            plafondHunterDynamique: Number.isFinite(Number(cap)) ? Number(cap) : null,
             moyennePondereeRecence: Number.isFinite(Number(recent?.recencyWeightedAverage))
                 ? Math.round(Number(recent.recencyWeightedAverage) * 10) / 10
                 : null,
@@ -5440,9 +5444,9 @@
             regimeShift: `baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}% · hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}% · bascule pondérée par confiance des 5 dernières`,
             filtreExtremes: `15 ventes minimum · jusqu’à ${RECENT_MARKET_LIMIT} analysées · trim adaptatif 2/3 extrêmes par côté · extrêmes plafonnés dans la série temporelle`,
             recencyDecay: RECENT_RECENCY_DECAY,
-            recentHunterPct: Math.round(getSetting('autoSnipeRecentRatio') * 100),
+            recentHunterPct: '69% si réf H <800 · 72% si 800–1000 · 75% si >1000',
             hunterPurchaseSafetyFloorPct: Math.round(HUNTER_PURCHASE_SAFETY_FLOOR * 100),
-            hunterPurchaseExitModel: `achat = réf H (Trend/consensus/rupture) × sortie prévue × sécurité structurelle adaptative × ratio Hunter`,
+            hunterPurchaseExitModel: `achat = réf H (Trend/consensus/rupture) × sortie prévue × sécurité structurelle adaptative × ratio dynamique 69/72/75% selon réf H`,
             hunterLiquidity: `dernière vente <= 48h · rythme effectif (silence actuel inclus) global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
             recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} ET structure H non chaotique ET liquidité effective · rupture baissière = garde H5`,
             hunterFallbackAchat: 'aucun',
@@ -8159,6 +8163,32 @@
     //
     // Il n'existe plus aucun fallback d'achat sur la moyenne WM.
     const HUNTER_RECENT_MIN_MARKET_REFERENCE = 790;
+
+    // Hunter Trend dynamique — le niveau de risque accepté augmente avec la réf H marché.
+    // Le choix de tranche se fait sur hunterMarketReference (Trend/consensus H réellement
+    // validé), puis le ratio s'applique comme avant à la référence achat déjà sécurisée.
+    const HUNTER_DYNAMIC_RATIO_LOW_MAX = 800;
+    const HUNTER_DYNAMIC_RATIO_MID_MAX = 1000;
+    const HUNTER_DYNAMIC_RATIO_LOW = 0.69;   // réf H < 800
+    const HUNTER_DYNAMIC_RATIO_MID = 0.72;   // 800 <= réf H <= 1000
+    const HUNTER_DYNAMIC_RATIO_HIGH = 0.75;  // réf H > 1000
+
+    function hunterTrendDynamicRatio(marketReference) {
+        const ref = Number(marketReference);
+        if (!Number.isFinite(ref) || ref <= 0) return 0;
+        if (ref < HUNTER_DYNAMIC_RATIO_LOW_MAX) return HUNTER_DYNAMIC_RATIO_LOW;
+        if (ref <= HUNTER_DYNAMIC_RATIO_MID_MAX) return HUNTER_DYNAMIC_RATIO_MID;
+        return HUNTER_DYNAMIC_RATIO_HIGH;
+    }
+
+    function hunterTrendDynamicRatioBand(marketReference) {
+        const ref = Number(marketReference);
+        if (!Number.isFinite(ref) || ref <= 0) return 'réf H invalide';
+        if (ref < HUNTER_DYNAMIC_RATIO_LOW_MAX) return '<800 → 69%';
+        if (ref <= HUNTER_DYNAMIC_RATIO_MID_MAX) return '800–1000 → 72%';
+        return '>1000 → 75%';
+    }
+
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
@@ -8174,14 +8204,19 @@
         return Number.isFinite(v) && v > HUNTER_RECENT_MIN_MARKET_REFERENCE;
     }
 
-    function hunterRatioForReferenceKind(kind) {
+    function hunterRatioForReferenceKind(kind, marketReference = null) {
         // Fail-safe : toute source autre que Recent Market vaut 0.
         if (kind !== 'recent_market') return 0;
-        return Number(getSetting('autoSnipeRecentRatio'));
+        return hunterTrendDynamicRatio(marketReference);
     }
 
-    function dynamicHunterCapFromReference(reference, kind = 'recent_market') {
+    function dynamicHunterCapFromReference(
+        reference,
+        kind = 'recent_market',
+        marketReference = null
+    ) {
         const ref = Number(reference);
+        const marketRef = Number(marketReference);
 
         // v3.5.3 — le seuil >790 porte sur la RÉFÉRENCE MARCHÉ HUNTER réellement utilisée
         // (min(Trend, consensus H), sauf hausse récente confirmée). La référence d'achat
@@ -8189,10 +8224,12 @@
         if (
             kind !== 'recent_market' ||
             !Number.isFinite(ref) ||
-            ref <= 0
+            ref <= 0 ||
+            !Number.isFinite(marketRef) ||
+            marketRef <= 0
         ) return 0;
 
-        const ratio = hunterRatioForReferenceKind(kind);
+        const ratio = hunterRatioForReferenceKind(kind, marketRef);
         if (!Number.isFinite(ratio) || ratio <= 0) return 0;
 
         const raw = ref * ratio;
@@ -8220,6 +8257,7 @@
 
         return {
             value: Number(recent.hunterReference),
+            marketReference: Number(recent.hunterMarketReference),
             fairValue: Number(recent.marketReference),
             kind: 'recent_market',
             label: 'Trend-Aware v4',
@@ -8432,7 +8470,7 @@
 
         dynamicOfficialAverageBlockLogged.delete(auction.id);
 
-        const freshCap = dynamicHunterCapFromReference(ref.value, ref.kind);
+        const freshCap = dynamicHunterCapFromReference(ref.value, ref.kind, ref.marketReference);
         if (freshCap > 0) {
             const oldCap = getAutoBidMax(auction.id);
             if (oldCap !== freshCap) setAutoBidMax(auction.id, freshCap);
@@ -8447,7 +8485,7 @@
 
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.4.2 :
-    //   prix actuel <= ratio × valeur Trend-Aware,
+    //   prix actuel <= ratio dynamique (69/72/75 selon réf H) × référence achat sécurisée,
     //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et référence marché Hunter STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
@@ -8493,8 +8531,8 @@
                 };
             }
 
-            const ratio = hunterRatioForReferenceKind(ref.kind);
-            const threshold = dynamicHunterCapFromReference(ref.value, ref.kind);
+            const ratio = hunterRatioForReferenceKind(ref.kind, ref.marketReference);
+            const threshold = dynamicHunterCapFromReference(ref.value, ref.kind, ref.marketReference);
             const pct = Math.round(ratio * 100);
             const trend =
                 Number.isFinite(ref?.trendPct)
@@ -8505,7 +8543,8 @@
             const exitPct = Number(ref.expectedExitPct);
             const safety = Number(ref.hunterPurchaseSafetyFactor || ref.hunterRiskFactor);
             const src =
-                `${ref.salesCount} ventes · juste ${Math.round(ref.fairValue)} · ` +
+                `${ref.salesCount} ventes · réf H ${Math.round(ref.marketReference)} · ratio ${pct}% · ` +
+                `juste ${Math.round(ref.fairValue)} · ` +
                 `sortie Flip ${Number.isFinite(exitRef) ? Math.round(exitRef) : '—'} ` +
                 `(${Number.isFinite(exitPct) ? Math.round(exitPct) : '—'}%) · ` +
                 `achat sécurisé ${Math.round(ref.value)} (${Number.isFinite(safety) ? Math.round(safety * 100) : '—'}%) · ` +
@@ -11417,12 +11456,11 @@
         // sinon « Hunter ≤30💰 ON » promet une mise immédiate qui n'aura jamais lieu.
         const suffix = (enabled && hunterAggressive) ? ' · 🕵️ fourbe' : '';
         if (mode === 'adaptive') {
-            const recentPct = Math.round(Number(getSetting('autoSnipeRecentRatio')) * 100);
             const engine =
                 (!marketWatcherActive && enabled)
                     ? ' · autonome'
                     : '';
-            return `⚡ Hunter Trend ${recentPct}% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
+            return `⚡ Hunter Trend 69/72/75% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -11927,7 +11965,7 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 500;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 300;
     const AUTOBID_RESPONSE_DELAY_MAX_MS = 750;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
@@ -19387,7 +19425,7 @@
                 hunterRecentReferenceAllowed(recent.hunterMarketReference) &&
                 Number.isFinite(Number(recent.hunterReference)) &&
                 Number(recent.hunterReference) > 0
-                ? dynamicHunterCapFromReference(recent.hunterReference, 'recent_market')
+                ? dynamicHunterCapFromReference(recent.hunterReference, 'recent_market', recent.hunterMarketReference)
                 : null;
 
         return {
@@ -19419,6 +19457,10 @@
             consensusCourtCoherent: recent.hunterShortCoherent === true,
             hausseConsensusAcceptee: recent.hunterUpwardConsensusConfirmed === true,
             referenceMarcheHunter: Number.isFinite(Number(recent.hunterMarketReference)) ? Math.round(Number(recent.hunterMarketReference) * 10) / 10 : null,
+            ratioHunterDynamiquePct: Number.isFinite(Number(recent.hunterMarketReference))
+                ? Math.round(hunterTrendDynamicRatio(recent.hunterMarketReference) * 100)
+                : null,
+            trancheRatioHunter: hunterTrendDynamicRatioBand(recent.hunterMarketReference),
             moyennePondereeRecence: weightedRounded,
             borneBassePlafonnement: recent.lowerBound ?? null,
             borneHautePlafonnement: recent.upperBound ?? null,
@@ -22340,8 +22382,7 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v4 (15 min · jusqu’à 25 ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part maintenant de la <b>sortie Flip prévue</b> (1er listing - urgence), puis applique une sécurité achat-only et enfin le ratio Hunter (70% par défaut). Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
-                    <input id="wm-set-autosnipe-recent-ratio" type="number" min="1" max="200" step="1" class="wm-input">
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part de la <b>sortie Flip prévue</b> (1er listing - urgence), applique la sécurité achat-only, puis un ratio Hunter <b>dynamique selon la réf H</b> : <b>69% sous 800</b>, <b>72% de 800 à 1000</b>, <b>75% au-dessus de 1000</b>. Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Délai humanisé avant une mise (ms). Plus bas = mises plus rapides mais moins « humaines ». <b>0 = instantané</b>. Ignoré quand l'enchère se termine bientôt (snipe toujours instantané).</div>
@@ -23125,10 +23166,8 @@
             const recentRatioRow = autoSnipeRecentRatioInput;
             if (mode === 'adaptive') {
                 fixedRow.style.opacity = '0.4';
-                if (recentRatioRow) recentRatioRow.style.opacity = '1';
             } else {
                 fixedRow.style.opacity = '1';
-                if (recentRatioRow) recentRatioRow.style.opacity = '0.4';
             }
         }
         applySnipeModeUI();
@@ -23140,7 +23179,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? `🎯 Hunter en mode <b>Trend-Aware v4</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE}, tendance ${RECENT_TREND_START_PCT}→${RECENT_TREND_FULL_PCT}%)`
+                        ? `🎯 Hunter en mode <b>Trend-Aware v4 dynamique</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} · 69% <800 · 72% 800–1000 · 75% >1000)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
 
                     if (autoSnipeEnabled) {
@@ -23156,21 +23195,6 @@
                 }
             };
         });
-
-        // Ratio Hunter Recent Market — seule source d'achat en mode dynamique.
-        if (autoSnipeRecentRatioInput) {
-            autoSnipeRecentRatioInput.onchange = () => {
-                let pct = parseInt(autoSnipeRecentRatioInput.value, 10);
-                if (!Number.isFinite(pct) || pct < 1) pct = 70;
-                if (pct > 200) pct = 200;
-                autoSnipeRecentRatioInput.value = pct;
-                setSetting('autoSnipeRecentRatio', pct / 100);
-                wmLog(
-                    `🎯 Hunter Recent Market : plafond à <b>${pct}%</b> de la référence achat ` +
-                    `si la référence marché Hunter est <b>&gt; ${HUNTER_RECENT_MIN_MARKET_REFERENCE}</b>`
-                );
-            };
-        }
 
         // Délai humanisé avant une mise
         if (bidDelayInput) bidDelayInput.onchange = () => {
