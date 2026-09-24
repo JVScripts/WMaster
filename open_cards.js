@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.6-LAG-MAX2';
+    const WM_VERSION = '3.8.7-LAG-MAX2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -1754,18 +1754,120 @@
         return flipLedger.find(x => x && x.userCardId === id && x.status !== 'sold') || null;
     }
 
-    function upsertFlipWin(w, candidate) {
+    function flipTitleKnown(value) {
+        const t = String(value || '').trim();
+        return !!t && t !== '?';
+    }
+
+    const flipTitleByCardIdCache = new Map();
+
+    async function resolveFlipTitleByCardId(cardId) {
+        const id = String(cardId || '').trim();
+        if (!id) return null;
+
+        if (flipTitleByCardIdCache.has(id)) {
+            return flipTitleByCardIdCache.get(id) || null;
+        }
+
+        const rows = await supabaseSelect(
+            `cards?id=eq.${encodeURIComponent(id)}&select=wikipedia_title&limit=1`
+        ).catch(() => null);
+
+        const title =
+            Array.isArray(rows) && flipTitleKnown(rows[0]?.wikipedia_title)
+                ? String(rows[0].wikipedia_title).trim()
+                : null;
+
+        // Cache seulement une vraie résolution. Un échec réseau doit pouvoir être retenté.
+        if (title) flipTitleByCardIdCache.set(id, title);
+        return title;
+    }
+
+    async function repairUnknownFlipRecordTitle(rec, { persist = false, log = false } = {}) {
+        if (!rec || flipTitleKnown(rec.title)) return false;
+
+        const cardId = rec.cardId || rec.purchaseCardId || null;
+        if (!cardId) return false;
+
+        const title = await resolveFlipTitleByCardId(cardId);
+        if (!flipTitleKnown(title)) return false;
+
+        const before = rec.title || '?';
+        rec.title = title;
+
+        if (persist) saveFlipLedger();
+        if (log) {
+            wmLog(
+                `🧭 Flip Seller : titre réparé <b>${htmlEsc(before)}</b> → ` +
+                `<b>${htmlEsc(title)}</b>.`
+            );
+        }
+        return true;
+    }
+
+    async function repairUnknownFlipTitles() {
+        const targets = flipLedger.filter(
+            rec => rec && !flipTitleKnown(rec.title) && (rec.cardId || rec.purchaseCardId)
+        );
+        if (targets.length === 0) return 0;
+
+        let repaired = 0;
+        for (const rec of targets.slice(0, 50)) {
+            if (await repairUnknownFlipRecordTitle(rec, { persist: false, log: true }).catch(() => false)) {
+                repaired++;
+            }
+        }
+
+        if (repaired > 0) saveFlipLedger();
+        return repaired;
+    }
+
+    async function upsertFlipWin(w, candidate) {
         let rec = flipRecordByAuctionId(w.id);
         const buyPrice = Number(w.final_price ?? w.current_bid ?? candidate?.lastAutoBid ?? 0);
         const boughtAt = w.settled_at ? new Date(w.settled_at).getTime()
             : w.end_at ? new Date(w.end_at).getTime() : Date.now();
         const winShiny = entityShinyFlag(w) ?? normalizeShinyFlag(candidate?.isShiny);
         const winRarity = effectiveRarityFromEntity(w, candidate?.rarity || '', winShiny);
+
+        const resolvedCardId =
+            w.card?.id ||
+            w.card_id ||
+            candidate?.cardId ||
+            rec?.cardId ||
+            rec?.purchaseCardId ||
+            null;
+
+        let resolvedTitle =
+            flipTitleKnown(w.card?.wikipedia_title)
+                ? String(w.card.wikipedia_title).trim()
+                : flipTitleKnown(candidate?.title)
+                    ? String(candidate.title).trim()
+                    : flipTitleKnown(rec?.title)
+                        ? String(rec.title).trim()
+                        : null;
+
+        // La lecture auctions par ID exact ne joint pas la table cards. Si la candidate
+        // persistée n'a plus son titre, on le réhydrate par card_id AVANT d'écrire le ledger.
+        if (!resolvedTitle && resolvedCardId) {
+            resolvedTitle = await resolveFlipTitleByCardId(resolvedCardId).catch(() => null);
+        }
+
+        // Répare aussi la candidate persistée tant qu'elle existe, afin qu'une seconde voie
+        // de réconciliation dans un autre onglet ne recrée pas immédiatement un "?".
+        if (candidate && resolvedTitle && !flipTitleKnown(candidate.title)) {
+            candidate.title = resolvedTitle;
+            if (!candidate.cardId && resolvedCardId) candidate.cardId = resolvedCardId;
+            candidate.updatedAt = Date.now();
+            if (w?.id) autoFlipCandidates.set(w.id, candidate);
+            saveAutoFlipCandidates();
+        }
+
         if (!rec) {
             rec = {
                 auctionId: w.id,
-                cardId: w.card?.id || w.card_id || candidate?.cardId || null,
-                title: w.card?.wikipedia_title || candidate?.title || '?',
+                cardId: resolvedCardId,
+                title: resolvedTitle || '?',
                 rarity: winRarity,
                 isShiny: winShiny,
                 buyPrice: Number.isFinite(buyPrice) ? buyPrice : 0,
@@ -1802,14 +1904,10 @@
             flipLedger.push(rec);
         } else {
             if (Number.isFinite(buyPrice) && buyPrice > 0) rec.buyPrice = buyPrice;
-            rec.cardId = rec.cardId || w.card?.id || w.card_id || candidate?.cardId || null;
+            rec.cardId = rec.cardId || resolvedCardId || null;
 
-            const betterTitle =
-                w.card?.wikipedia_title ||
-                candidate?.title ||
-                null;
-            if (!rec.title || rec.title === '?') {
-                rec.title = betterTitle || '?';
+            if (!flipTitleKnown(rec.title) && resolvedTitle) {
+                rec.title = resolvedTitle;
             }
 
             const betterRarity = winRarity;
@@ -1818,7 +1916,7 @@
             if (rec.rarity) rec.rarity = effectiveRarity(rec.rarity, rec.isShiny);
 
             rec.source = rec.source || candidate?.source || 'wmaster_bid';
-            rec.purchaseCardId = rec.purchaseCardId || rec.cardId || w.card?.id || w.card_id || candidate?.cardId || null;
+            rec.purchaseCardId = rec.purchaseCardId || rec.cardId || resolvedCardId || null;
             rec.purchaseRarity = rec.purchaseRarity || rec.rarity || betterRarity;
             if (rec.purchaseIsShiny == null && winShiny !== null) rec.purchaseIsShiny = winShiny;
             if (rec.purchaseRarity) rec.purchaseRarity = effectiveRarity(rec.purchaseRarity, rec.purchaseIsShiny);
@@ -2113,6 +2211,13 @@
     function applyFlipVariantMeta(rec, meta) {
         if (!rec || !meta) return false;
         let changed = false;
+
+        const metaTitle = String(meta.title || '').trim();
+        if (!flipTitleKnown(rec.title) && flipTitleKnown(metaTitle)) {
+            rec.title = metaTitle;
+            changed = true;
+        }
+
         const shiny = normalizeShinyFlag(meta.isShiny);
         const rr = normalizeRarityCode(meta.rarity);
         if (shiny !== null && rec.isShiny !== shiny) { rec.isShiny = shiny; changed = true; }
@@ -2460,9 +2565,10 @@
                 rec.purchaseCardId = rec.purchaseCardId || rec.cardId || null;
                 const old = rec.cardId;
                 rec.cardId = best.cardId;
-                applyFlipVariantMeta(rec, best);
                 wmLog(`🔄 Flip Seller : card_id actualisé pour <b>${rec.title}</b>${old ? ` (${String(old).slice(0, 8)}… → ${String(best.cardId).slice(0, 8)}…)` : ''}.`);
             }
+            // Même si le card_id n'a pas changé, la collection peut enfin fournir le vrai titre.
+            applyFlipVariantMeta(rec, best);
 
             const authoritative = await resolveAuthoritativeFlipUserCardId(rec, best.userCardId);
             if (authoritative) {
@@ -2857,7 +2963,7 @@
                         }
                     };
 
-                    const rec = upsertFlipWin(syntheticWin, candidate);
+                    const rec = await upsertFlipWin(syntheticWin, candidate);
 
                     // On tente immédiatement le tag, mais le ledger existe AVANT ce réseau.
                     await tagFlipRecord(rec).catch(() => false);
@@ -2920,7 +3026,7 @@
             const finalPrice = Number(w.final_price);
             if (!Number.isFinite(finalPrice) || finalPrice <= 0) continue;
 
-            const rec = upsertFlipWin(w, candidate);
+            const rec = await upsertFlipWin(w, candidate);
 
             // En cas de propagation lente de /my-collection, le record reste pending_tag,
             // mais il est DÉJÀ durablement visible dans le Flip Seller.
@@ -2936,6 +3042,12 @@
         return processed;
     }
 
+
+    // Répare aussi les anciens records déjà persistés avec title="?".
+    // Délai léger pour laisser l'auth/session du site se stabiliser au chargement.
+    setTimeout(() => {
+        repairUnknownFlipTitles().catch(() => 0);
+    }, 2500);
 
     // Tant qu'une mise automatique n'a pas encore été résolue gagnée/perdue,
     // on relit ses auction_id toutes les 15 s. Une perte est purgée, une victoire entre
@@ -4881,6 +4993,16 @@
 
     // v3.0.2 — diagnostic des victoires DB qui ne figurent pas dans le Flip Seller.
     // Ne modifie rien.
+    window.wmRepairUnknownFlipTitles = async function () {
+        const before = flipLedger.filter(r => r && !flipTitleKnown(r.title)).length;
+        const repaired = await repairUnknownFlipTitles().catch(() => 0);
+        const after = flipLedger.filter(r => r && !flipTitleKnown(r.title)).length;
+        const result = { version: WM_VERSION, inconnusAvant: before, reparés: repaired, inconnusApres: after };
+        console.table(result);
+        renderFlipHistory();
+        return result;
+    };
+
     window.wmFlipMissingWins = async function (limit = 50) {
         const lim = Math.max(1, Math.min(200, Number(limit) || 50));
         const won = await fetchWonFromDb(lim).catch(() => null);
@@ -4982,7 +5104,7 @@
                     lastAutoBid: finalPrice
                 };
 
-            rec = upsertFlipWin(w, candidate);
+            rec = await upsertFlipWin(w, candidate);
         }
 
         await tagFlipRecord(rec).catch(() => false);
@@ -11972,7 +12094,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 300;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 350;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 700;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
