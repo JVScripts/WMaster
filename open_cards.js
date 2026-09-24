@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.1';
+    const WM_VERSION = '3.7.3';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -3882,6 +3882,24 @@
             }
         }
 
+        // v3.7.3 — avant d'ouvrir la Collection, recale une dernière fois l'exemplaire
+        // sur /api/my-collection. C'est particulièrement important pour les lignes ajoutées
+        // manuellement au Flip Seller ou récupérées après coup : leur card_id/user_card_id
+        // peut venir d'un ancien état de l'enchère.
+        const authoritativeOwnedId = await resolveAuthoritativeFlipUserCardId(
+            rec,
+            rec.userCardId || null
+        ).catch(() => null);
+
+        if (authoritativeOwnedId && authoritativeOwnedId !== rec.userCardId) {
+            wmLog(
+                `🧭 Flip Seller : exemplaire recalé avant vente → <b>${rec.title}</b> · ` +
+                `${String(rec.userCardId || '?').slice(0, 8)}… → ${String(authoritativeOwnedId).slice(0, 8)}…`
+            );
+            rec.userCardId = authoritativeOwnedId;
+            saveFlipLedger();
+        }
+
         const priceInfo = await resolveFlipSellPrice(rec);
         if (!priceInfo?.eligibleForSale || !Number.isFinite(Number(priceInfo?.price)) || Number(priceInfo.price) <= 0) {
             const count = Number(priceInfo?.recentMarketCount || 0);
@@ -3918,6 +3936,7 @@
             const reasonMap = {
                 wrong_page: 'reste sur /collection pour permettre la vente via l’interface',
                 card_not_found: 'carte introuvable dans la collection',
+                card_hidden_in_collection_dom: 'carte présente dans la collection API mais masquée/non résolue dans l’interface Collection',
                 no_search_input: 'barre de recherche collection introuvable',
                 no_sell_button: 'bouton "Mettre aux enchères" introuvable',
                 no_launch_button: 'bouton "Lancer l’enchère" introuvable',
@@ -11236,11 +11255,89 @@
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
     }
 
+    // v3.7.2 — diagnostic Hunter uniquement. Aucune règle d'achat n'est modifiée.
+    const hunterDecisionStats = {
+        passes: 0,
+        candidatesSeen: 0,
+        candidatesUnique: new Set(),
+        rejected: {
+            targetedHunter: 0,
+            priorityKeyword: 0,
+            fourbe: 0,
+            alreadyAutoBid: 0,
+            timeWindow: 0,
+            selfState: 0,
+            ownedDuplicate: 0,
+            duplicateExposure: 0,
+            historyInsufficient: 0,
+            marketIntegrity: 0,
+            referenceTooLow: 0,
+            liquidity: 0,
+            referenceUnavailable: 0,
+            priceAboveCap: 0,
+            decisionOther: 0,
+            lowBalance: 0,
+            bidLocked: 0,
+            freshFetch: 0,
+            freshTimeWindow: 0,
+            freshSelfState: 0,
+            freshOwnedDuplicate: 0,
+            freshDuplicateExposure: 0,
+            freshReference: 0,
+            freshDecision: 0,
+            freshCap: 0,
+            cardLock: 0
+        },
+        snapshotEligible: 0,
+        postAttempts: 0,
+        postAccepted: 0,
+        postFailed: 0,
+        postRetriesTooLow: 0,
+        lastDecisionRejects: []
+    };
+
+    function hunterDiagRememberReject(seed, kind, reason = '') {
+        if (hunterDecisionStats.rejected[kind] !== undefined) {
+            hunterDecisionStats.rejected[kind]++;
+        }
+        const title = seed?.card?.wikipedia_title || '?';
+        const rarity = globalAuctionRarity(seed) || '';
+        const remaining = automaticBidRemainingMs(seed);
+        hunterDecisionStats.lastDecisionRejects.push({
+            title,
+            rarity,
+            kind,
+            reason: String(reason || ''),
+            bid: Number(seed?.current_bid ?? seed?.base_amount ?? 0),
+            remainingSec: Number.isFinite(remaining) ? Math.round(remaining / 1000) : null
+        });
+        if (hunterDecisionStats.lastDecisionRejects.length > 8) {
+            hunterDecisionStats.lastDecisionRejects.shift();
+        }
+    }
+
+    function hunterDiagDecisionRejectKind(reason) {
+        const r = String(reason || '');
+        if (/historique insuffisant/i.test(r)) return 'historyInsufficient';
+        if (/historique en attente/i.test(r)) return 'marketIntegrity';
+        if (/référence marché Hunter/i.test(r)) return 'referenceTooLow';
+        if (/liquidité insuffisante/i.test(r)) return 'liquidity';
+        if (/référence Recent Market indisponible/i.test(r)) return 'referenceUnavailable';
+        if (/^>\s*\d+%/i.test(r)) return 'priceAboveCap';
+        return 'decisionOther';
+    }
+
     // Auto-bid Hunter (mise initiale selon le mode fixe/dynamique) sur une LISTE d'enchères.
     // Mutualisé entre le scan (nouvelles annonces) ET l'activation du Hunter (annonces déjà
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
     async function runHunterAutoBidPass(list) {
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
+
+        hunterDecisionStats.passes++;
+        hunterDecisionStats.candidatesSeen += list.length;
+        for (const a of list) {
+            if (a?.id) hunterDecisionStats.candidatesUnique.add(a.id);
+        }
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
             await preloadRecentMarketForHunter(list).catch(() => { });
@@ -11264,15 +11361,28 @@
                 }
             } catch (e) {
                 // Si la lecture fraîche échoue, on ne prend PAS le risque de bidder sur l'état ancien.
+                hunterDiagRememberReject(seed, 'freshFetch', 'relecture enchère impossible');
                 return null;
             }
 
-            if (!automaticBidTimeAllowed(fresh)) return null;
-            if (iAmLeading(fresh) || autoBidBlockedByUncertainSelfState(fresh)) return null;
+            if (!automaticBidTimeAllowed(fresh)) {
+                hunterDiagRememberReject(fresh, 'freshTimeWindow', 'hors fenêtre T<=90s après relecture');
+                return null;
+            }
+            if (iAmLeading(fresh) || autoBidBlockedByUncertainSelfState(fresh)) {
+                hunterDiagRememberReject(fresh, 'freshSelfState', 'déjà leader / état utilisateur incertain');
+                return null;
+            }
 
             const listingRarity = globalAuctionRarity(fresh);
-            if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) return null;
-            if (hunterDuplicateExposureState(fresh).blocked) return null;
+            if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) {
+                hunterDiagRememberReject(fresh, 'freshOwnedDuplicate', 'doublon déjà possédé');
+                return null;
+            }
+            if (hunterDuplicateExposureState(fresh).blocked) {
+                hunterDiagRememberReject(fresh, 'freshDuplicateExposure', 'exposition carte+rareté déjà active');
+                return null;
+            }
 
             if (getSetting('autoSnipeMode') === 'adaptive' || isDynamicHunterAuction(fresh)) {
                 const freshRef = await ensureFreshHunterReference(
@@ -11280,11 +11390,17 @@
                     Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                 );
                 // Fail-safe : impossible de vérifier la référence achat v3 fraîche => aucune mise.
-                if (!freshRef) return null;
+                if (!freshRef) {
+                    hunterDiagRememberReject(fresh, 'freshReference', 'référence Hunter fraîche indisponible');
+                    return null;
+                }
             }
 
             const decision = shouldAutoSnipe(fresh);
-            if (!decision.snipe) return null;
+            if (!decision.snipe) {
+                hunterDiagRememberReject(fresh, 'freshDecision', decision.reason || 'décision refusée après relecture');
+                return null;
+            }
 
             let amount = minNextBid(fresh);
             if (Number.isFinite(serverMinimum) && serverMinimum > amount) {
@@ -11297,7 +11413,10 @@
             const isDynamic = mode === 'adaptive' || isDynamicHunterAuction(fresh);
             if (isDynamic) {
                 const cap = Number(decision.cap);
-                if (!Number.isFinite(cap) || cap <= 0 || amount > cap) return null;
+                if (!Number.isFinite(cap) || cap <= 0 || amount > cap) {
+                    hunterDiagRememberReject(fresh, 'freshCap', `mise ${amount} > cap ${Number.isFinite(cap) ? cap : '—'}`);
+                    return null;
+                }
             }
 
             return { auction: fresh, decision, amount, isDynamic };
@@ -11328,22 +11447,56 @@
 
         for (const seed of list) {
             if (!seed || !seed.id) continue;
-            if (matchedHunterEntry(seed.card)) continue;
-            if (hasPriorityKeyword(seed.card)) continue;
-            if (snipeSet.has(seed.id) || hasFourbeKeyword(seed.card)) continue;
-            if (autoBidSet.has(seed.id)) continue;
+            if (matchedHunterEntry(seed.card)) {
+                hunterDiagRememberReject(seed, 'targetedHunter', 'géré par Chasseur ciblé');
+                continue;
+            }
+            if (hasPriorityKeyword(seed.card)) {
+                hunterDiagRememberReject(seed, 'priorityKeyword', 'géré par mot-clé prioritaire');
+                continue;
+            }
+            if (snipeSet.has(seed.id) || hasFourbeKeyword(seed.card)) {
+                hunterDiagRememberReject(seed, 'fourbe', 'déjà géré par Fourbe');
+                continue;
+            }
+            if (autoBidSet.has(seed.id)) {
+                hunterDiagRememberReject(seed, 'alreadyAutoBid', 'auto-bid déjà armé');
+                continue;
+            }
 
             // Filtres rapides sur le snapshot du scan : évitent une relecture serveur inutile.
-            if (!automaticBidTimeAllowed(seed)) continue;
-            if (iAmLeading(seed) || autoBidBlockedByUncertainSelfState(seed)) continue;
+            if (!automaticBidTimeAllowed(seed)) {
+                hunterDiagRememberReject(seed, 'timeWindow', 'hors fenêtre T<=90s');
+                continue;
+            }
+            if (iAmLeading(seed) || autoBidBlockedByUncertainSelfState(seed)) {
+                hunterDiagRememberReject(seed, 'selfState', 'déjà leader / état utilisateur incertain');
+                continue;
+            }
             const seedRarity = globalAuctionRarity(seed);
-            if (isOwnedDuplicate(seed.card?.id ?? seed.card_id, seedRarity)) continue;
-            if (hunterDuplicateExposureState(seed).blocked) continue;
+            if (isOwnedDuplicate(seed.card?.id ?? seed.card_id, seedRarity)) {
+                hunterDiagRememberReject(seed, 'ownedDuplicate', 'doublon déjà possédé');
+                continue;
+            }
+            if (hunterDuplicateExposureState(seed).blocked) {
+                hunterDiagRememberReject(seed, 'duplicateExposure', 'exposition carte+rareté déjà active');
+                continue;
+            }
             const seedDecision = shouldAutoSnipe(seed);
-            if (!seedDecision.snipe) continue;
-            if (wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) continue;
-            if (bidLockSet.has(seed.id)) continue;
+            if (!seedDecision.snipe) {
+                hunterDiagRememberReject(seed, hunterDiagDecisionRejectKind(seedDecision.reason), seedDecision.reason);
+                continue;
+            }
+            if (wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) {
+                hunterDiagRememberReject(seed, 'lowBalance', `solde ${wikibidousBalance}`);
+                continue;
+            }
+            if (bidLockSet.has(seed.id)) {
+                hunterDiagRememberReject(seed, 'bidLocked', 'enchère déjà en traitement');
+                continue;
+            }
 
+            hunterDecisionStats.snapshotEligible++;
             bidLockSet.add(seed.id);
             let hunterCardLockKey = null;
 
@@ -11359,8 +11512,12 @@
                 // Verrou carte+rareté pris au dernier moment : une autre passe Hunter ne peut
                 // pas acheter le même exemplaire logique pendant que ce POST est en vol.
                 hunterCardLockKey = acquireHunterCardRarityBidLock(auction);
-                if (!hunterCardLockKey) continue;
+                if (!hunterCardLockKey) {
+                    hunterDiagRememberReject(auction, 'cardLock', 'verrou carte+rareté déjà pris');
+                    continue;
+                }
 
+                hunterDecisionStats.postAttempts++;
                 let attempt = await postHunterBid(auction.id, amount);
 
                 // 2) Une seule course supplémentaire est tolérée : si quelqu'un a bid entre
@@ -11375,6 +11532,8 @@
                             decision = retryPrepared.decision;
                             amount = retryPrepared.amount;
                             isDynamic = retryPrepared.isDynamic;
+                            hunterDecisionStats.postRetriesTooLow++;
+                            hunterDecisionStats.postAttempts++;
                             attempt = await postHunterBid(auction.id, amount);
                         }
                     }
@@ -11384,6 +11543,7 @@
                 const rar = globalAuctionRarity(auction) || globalAuctionRarity(seed) || '';
 
                 if (attempt.res.ok) {
+                    hunterDecisionStats.postAccepted++;
                     if (isDynamic) {
                         setAutoBidMax(auction.id, decision.cap);
                         autoBidSet.add(auction.id);
@@ -11416,12 +11576,15 @@
                         sendToDiscord(`🤖 Auto-bid place : **${title}** a **${amount} coins**`, 5763719, 'market');
                     }
                 } else {
+                    hunterDecisionStats.postFailed++;
                     const error = attempt.data?.error || attempt.data?.message || 'erreur';
                     wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${error}`);
                     sendToDiscord(`⚠️ Auto-bid echoue : **${title}** - ${error}`, 15548997, 'market');
                 }
             } catch (e) {
                 // Aucun auto-bid n'est armé si la mise initiale n'a pas abouti.
+                hunterDecisionStats.postFailed++;
+                hunterDiagRememberReject(seed, 'decisionOther', `exception: ${e?.message || e || 'inconnue'}`);
             } finally {
                 releaseHunterCardRarityBidLock(hunterCardLockKey);
                 bidLockSet.delete(seed.id);
@@ -11614,8 +11777,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 750;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 1888;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 150;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 350;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14592,6 +14755,27 @@
                 hunterHeadlessStats.lastAuctionsInWindow,
             candidatesHunter:
                 hunterHeadlessStats.lastCandidates,
+            hunterPassesSession:
+                hunterDecisionStats.passes,
+            candidatsVusSession:
+                hunterDecisionStats.candidatesSeen,
+            candidatsUniquesSession:
+                hunterDecisionStats.candidatesUnique.size,
+            eligiblesSnapshotSession:
+                hunterDecisionStats.snapshotEligible,
+            postsHunterSession:
+                hunterDecisionStats.postAttempts,
+            postsHunterAcceptesSession:
+                hunterDecisionStats.postAccepted,
+            postsHunterEchouesSession:
+                hunterDecisionStats.postFailed,
+            retriesMiseTropBasseSession:
+                hunterDecisionStats.postRetriesTooLow,
+            rejetsHunterSession: {
+                ...hunterDecisionStats.rejected
+            },
+            derniersRejetsHunter:
+                hunterDecisionStats.lastDecisionRejects.slice(),
             mesMises: myBidsSet.size,
             autoBidArmes: autoBidSet.size,
             fourbesArmes: snipeSet.size,
@@ -15475,51 +15659,132 @@
         return [...document.querySelectorAll('button')].find(b => b.textContent.trim() === text) || null;
     }
 
-    function findCollectionTileByTitleAndRarity(title, rarity, userCardId = null, variantFilterConfirmed = false) {
-        const leaves = [...document.querySelectorAll('*')]
-            .filter(el => el.children.length === 0 && el.textContent.trim() === title);
+    function normalizeCollectionMatchText(value) {
+        return String(value || '')
+            .normalize('NFKD')
+            .replace(/\p{M}/gu, '')
+            .replace(/[’‘`´]/g, "'")
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLocaleLowerCase('fr-FR');
+    }
 
-        const tiles = [];
-        for (const leaf of leaves) {
-            let candidate = leaf;
-            while (candidate && !candidate.classList.contains('cursor-pointer')) {
-                candidate = candidate.parentElement;
+    function collectionTileHasExactId(tile, id, kind = 'user') {
+        const wanted = String(id || '').trim();
+        if (!tile || !wanted) return false;
+
+        const attrs = kind === 'card'
+            ? ['data-card-id', 'data-cardid', 'data-id', 'value', 'href']
+            : ['data-user-card-id', 'data-usercard-id', 'data-usercardid', 'data-id', 'value', 'href'];
+
+        for (const el of [tile, ...tile.querySelectorAll('*')]) {
+            for (const attr of attrs) {
+                const v = String(el.getAttribute?.(attr) || '');
+                if (v === wanted) return true;
+
+                // href/data peuvent contenir l'UUID au milieu d'une URL/chaîne.
+                if ((attr === 'href' || attr.startsWith('data-')) && v.includes(wanted)) return true;
             }
-            if (candidate && !tiles.includes(candidate)) tiles.push(candidate);
         }
 
-        if (tiles.length === 0) return null;
+        // Dernier secours pour les apps React qui injectent les ids dans des props sérialisées.
+        return String(tile.outerHTML || '').includes(wanted);
+    }
 
-        // Si l'UI expose l'id d'exemplaire dans un attribut, c'est le signal le plus fort.
-        // Cela évite surtout de confondre une L normale et sa variante L+ du même card_id.
-        const wantedUserCardId = String(userCardId || '').trim();
-        if (wantedUserCardId) {
-            const exactIdTile = tiles.find(tile => {
-                if (String(tile.outerHTML || '').includes(wantedUserCardId)) return true;
-                for (const el of [tile, ...tile.querySelectorAll('*')]) {
-                    for (const attr of ['data-user-card-id', 'data-usercard-id', 'data-id', 'value']) {
-                        if (String(el.getAttribute?.(attr) || '') === wantedUserCardId) return true;
-                    }
-                }
-                return false;
-            });
-            if (exactIdTile) return exactIdTile;
-        }
-
+    function collectionTileRarityMatches(tile, rarity) {
         const rr = normalizeRarityCode(rarity);
-        if (!rr) return tiles[0];
+        if (!rr) return true;
 
         const escaped = rr.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const token = new RegExp(`(^|[^A-Z])${escaped}([^A-Z]|$)`, 'i');
-        const matched = tiles.find(t => token.test(String(t.textContent || '').toUpperCase()));
-        if (matched) return matched;
+        return token.test(String(tile?.textContent || '').toUpperCase());
+    }
 
-        // L et L+ ont le même card_id : ne JAMAIS choisir arbitrairement le premier tile si
-        // l'interface ne nous permet pas de prouver la variante demandée.
+    function findCollectionTileByTitleAndRarity(
+        title,
+        rarity,
+        userCardId = null,
+        variantFilterConfirmed = false,
+        cardId = null
+    ) {
+        const rr = normalizeRarityCode(rarity);
+        const wantedUserCardId = String(userCardId || '').trim();
+        const wantedCardId = String(cardId || '').trim();
+        const wantedTitleNorm = normalizeCollectionMatchText(title);
+
+        // Tous les tiles visibles. On ne dépend plus du fait que le titre soit rendu dans
+        // un nœud feuille avec exactement la même chaîne.
+        const allTiles = [...document.querySelectorAll('.cursor-pointer')]
+            .filter(tile => tile && tile.isConnected && tile.offsetParent !== null);
+
+        // 1) user_card_id exact : signal autoritaire. Avant v3.7.3, on ne cherchait cet id
+        // QU'APRÈS avoir trouvé un titre DOM strictement égal, ce qui produisait de faux
+        // "carte introuvable" alors que l'exemplaire était bien rendu par React.
+        if (wantedUserCardId) {
+            const exactUserTile = allTiles.find(tile =>
+                collectionTileHasExactId(tile, wantedUserCardId, 'user')
+            );
+            if (exactUserTile) return exactUserTile;
+        }
+
+        // 2) card_id : utile si le user_card_id n'est pas exposé dans le DOM.
+        // On garde la protection de variante L/L+ : si plusieurs exemplaires partagent le
+        // card_id et que la rareté n'est pas prouvée, on ne choisit jamais arbitrairement.
+        if (wantedCardId) {
+            let idTiles = allTiles.filter(tile =>
+                collectionTileHasExactId(tile, wantedCardId, 'card')
+            );
+
+            if (rr) {
+                const byRarity = idTiles.filter(tile =>
+                    collectionTileRarityMatches(tile, rr)
+                );
+                if (byRarity.length > 0) idTiles = byRarity;
+            }
+
+            if (wantedTitleNorm) {
+                const byTitle = idTiles.filter(tile =>
+                    normalizeCollectionMatchText(tile.textContent).includes(wantedTitleNorm)
+                );
+                if (byTitle.length > 0) idTiles = byTitle;
+            }
+
+            if (idTiles.length === 1) return idTiles[0];
+            if (
+                idTiles.length > 1 &&
+                (!variantRequiresShinyMetadata(rr) || variantFilterConfirmed)
+            ) {
+                return idTiles[0];
+            }
+        }
+
+        // 3) Titre normalisé. Accepte espaces multiples, apostrophes typographiques,
+        // accents sous forme Unicode différente et wrappers React autour du texte.
+        const titleTiles = [];
+        if (wantedTitleNorm) {
+            for (const tile of allTiles) {
+                const tileText = normalizeCollectionMatchText(tile.textContent);
+                if (!tileText || !tileText.includes(wantedTitleNorm)) continue;
+                if (!titleTiles.includes(tile)) titleTiles.push(tile);
+            }
+        }
+
+        if (titleTiles.length === 0) return null;
+
+        if (!rr) return titleTiles[0];
+
+        const rarityTiles = titleTiles.filter(tile =>
+            collectionTileRarityMatches(tile, rr)
+        );
+        if (rarityTiles.length > 0) return rarityTiles[0];
+
+        // L et L+ ont le même card_id : ne jamais prendre le premier résultat sans preuve
+        // de variante si le filtre natif n'a pas été confirmé.
         if (variantRequiresShinyMetadata(rr) && !variantFilterConfirmed) return null;
 
-        return tiles[0];
+        return titleTiles[0];
     }
+
 
     // Sondage périodique de l'API directe : le contournement DOM est lent et dépend d'une
     // barre de recherche peu fiable côté site — si wiki-masters corrige un jour le bug serveur
@@ -15911,7 +16176,11 @@
         for (let i = 0; i < 20 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
             tile = findCollectionTileByTitleAndRarity(
-                title, normalizedSellRarity, userCardId, variantFilterConfirmed
+                title,
+                normalizedSellRarity,
+                userCardId,
+                variantFilterConfirmed,
+                cardId
             );
         }
 
@@ -15928,13 +16197,54 @@
                 for (let i = 0; i < 20 && !tile; i++) {
                     await new Promise(r => setTimeout(r, 250));
                     tile = findCollectionTileByTitleAndRarity(
-                        title, normalizedSellRarity, userCardId, variantFilterConfirmed
+                        title,
+                        normalizedSellRarity,
+                        userCardId,
+                        variantFilterConfirmed,
+                        cardId
                     );
                 }
             }
         }
 
-        if (!tile) return { ok: false, reason: 'card_not_found' };
+        if (!tile) {
+            // Diagnostic ciblé : distingue "la carte n'est vraiment pas possédée" de
+            // "l'API la voit mais le DOM Collection la masque / la rend autrement".
+            let apiMatch = null;
+            try {
+                const owned = await fetchFlipOwnedCollectionSnapshot(true);
+                const titleNorm = normalizeCollectionMatchText(title);
+                apiMatch = Array.isArray(owned)
+                    ? owned.find(m => {
+                        if (!m) return false;
+                        if (userCardId && m.userCardId === userCardId) return true;
+                        const sameCard = cardId && m.cardId === cardId;
+                        const sameTitle = titleNorm &&
+                            normalizeCollectionMatchText(m.title) === titleNorm;
+                        const sameRarity = !normalizedSellRarity ||
+                            !m.rarity ||
+                            normalizeRarityCode(m.rarity) === normalizedSellRarity;
+                        return (sameCard || sameTitle) && sameRarity;
+                    })
+                    : null;
+            } catch (e) { }
+
+            if (apiMatch) {
+                wmLog(
+                    `⚠️ Flip Seller : <b>${title}</b> présente dans /api/my-collection ` +
+                    `(${String(apiMatch.userCardId || '?').slice(0, 8)}…, ${apiMatch.rarity || '?'}) ` +
+                    `mais aucun tile Collection correspondant n'est visible dans le DOM.`
+                );
+                return {
+                    ok: false,
+                    reason: 'card_hidden_in_collection_dom',
+                    apiUserCardId: apiMatch.userCardId || null,
+                    apiCardId: apiMatch.cardId || null
+                };
+            }
+
+            return { ok: false, reason: 'card_not_found' };
+        }
 
         tile.click();
         await new Promise(r => setTimeout(r, 600));
