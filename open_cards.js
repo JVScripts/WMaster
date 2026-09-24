@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.7.3';
+    const WM_VERSION = '3.7.4';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10367,15 +10367,29 @@
     // la carte au cycle suivant sans trou de découverte.
     async function fetchHunterActionWindowAuctions(onProgress) {
         const first = await fetchMarketPage(1);
-        const total = Number(first?.total || 0);
-        const totalPages = Math.max(
-            1,
-            Math.ceil(total / MARKET_PAGE_LIMIT)
-        );
-        const maxPageThisScan = Math.min(
-            totalPages,
-            HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
-        );
+        const firstRows = Array.isArray(first?.auctions)
+            ? first.auctions
+            : [];
+
+        const rawTotal = Number(first?.total);
+        const reportedTotalPages =
+            Number.isFinite(rawTotal) && rawTotal > 0
+                ? Math.max(1, Math.ceil(rawTotal / MARKET_PAGE_LIMIT))
+                : null;
+
+        // v3.7.4 — sur certaines réponses marketplace, `total` vaut seulement la taille
+        // de la page courante (souvent exactement 50). Une page pleine + total <= taille
+        // de page est donc AMBIGUË : ne surtout pas conclure qu'il n'existe qu'une page.
+        const totalLooksReliable =
+            Number.isFinite(rawTotal) &&
+            rawTotal > firstRows.length;
+
+        const maxPageThisScan = totalLooksReliable
+            ? Math.min(
+                Math.max(1, reportedTotalPages || 1),
+                HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
+            )
+            : HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
 
         const cutoff =
             AUTOMATIC_BID_MAX_REMAINING_MS +
@@ -10384,15 +10398,23 @@
         const collected = [];
         let pagesScanned = 0;
         let boundaryReached = false;
+        let naturalEndReached = false;
+        let lastPageRows = firstRows.length;
 
         const consumePage = (data, pageNo) => {
             const rows = Array.isArray(data?.auctions)
                 ? data.auctions
                 : [];
 
+            lastPageRows = rows.length;
             pagesScanned++;
 
+            if (rows.length === 0) {
+                naturalEndReached = true;
+            }
+
             let furthestRemaining = -Infinity;
+
             for (const a of rows) {
                 if (!a?.id || !a?.end_at) continue;
 
@@ -10402,15 +10424,16 @@
 
                 if (!Number.isFinite(remaining)) continue;
 
-                furthestRemaining =
-                    Math.max(
-                        furthestRemaining,
-                        remaining
-                    );
+                furthestRemaining = Math.max(
+                    furthestRemaining,
+                    remaining
+                );
 
+                // IMPORTANT : la grâce de 5 s n'a de sens que pour les enchères DÉJÀ
+                // suivies par la Hot Lane (extension de end_at possible).
+                // Une NOUVELLE candidate Hunter doit encore être vivante.
                 if (
-                    remaining >
-                    -MARKET_TIMER_SYNC_GRACE_MS &&
+                    remaining > 0 &&
                     remaining <= cutoff
                 ) {
                     collected.push(a);
@@ -10420,32 +10443,40 @@
             if (onProgress) {
                 onProgress(
                     pageNo,
-                    totalPages,
+                    reportedTotalPages || maxPageThisScan,
                     collected.length
                 );
             }
 
-            // Marketplace triée ending_soon : dès qu'une page contient déjà une enchère
-            // au-delà de T-2m00, les pages suivantes n'apportent rien au Hunter immédiat.
+            // Marketplace triée ending_soon : dès qu'une page traverse T-2m00,
+            // les suivantes ne sont plus utiles au Hunter immédiat.
             if (
                 Number.isFinite(furthestRemaining) &&
                 furthestRemaining > cutoff
             ) {
                 boundaryReached = true;
             }
+
+            // Page courte = fin naturelle fiable, même si `total` est mauvais.
+            if (rows.length < MARKET_PAGE_LIMIT) {
+                naturalEndReached = true;
+            }
         };
 
         consumePage(first, 1);
 
         for (
-            let start = 2;
-            start <= maxPageThisScan && !boundaryReached;
-            start += HUNTER_HEADLESS_PAGE_CONCURRENCY
+            let startPage = 2;
+            startPage <= maxPageThisScan &&
+            !boundaryReached &&
+            !naturalEndReached;
+            startPage += HUNTER_HEADLESS_PAGE_CONCURRENCY
         ) {
             const pages = [];
+
             for (
-                let p = start;
-                p < start + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
+                let p = startPage;
+                p < startPage + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
                 p <= maxPageThisScan;
                 p++
             ) {
@@ -10453,42 +10484,61 @@
             }
 
             const results = await Promise.all(
-                pages.map(
-                    p => fetchMarketPage(p)
-                        .catch(() => ({ auctions: [] }))
-                )
+                pages.map(async p => {
+                    try {
+                        return await fetchMarketPage(p);
+                    } catch (e) {
+                        // Une page en erreur ne prouve PAS la fin de pagination.
+                        return null;
+                    }
+                })
             );
 
             for (let i = 0; i < results.length; i++) {
-                consumePage(results[i], pages[i]);
-                if (boundaryReached) break;
+                const data = results[i];
+                if (!data) continue;
+
+                consumePage(data, pages[i]);
+
+                if (boundaryReached || naturalEndReached) {
+                    break;
+                }
             }
 
-            if (!boundaryReached) {
+            if (!boundaryReached && !naturalEndReached) {
                 await new Promise(r => setTimeout(r, 50));
             }
         }
 
-        // Déduplication : le tri évolue pendant la pagination.
+        // Déduplication : le tri ending_soon bouge pendant la pagination.
         const seen = new Set();
         const auctions = [];
+
         for (const a of collected) {
             if (!a?.id || seen.has(a.id)) continue;
             seen.add(a.id);
             auctions.push(a);
         }
 
+        const pageCapReached =
+            !boundaryReached &&
+            !naturalEndReached &&
+            pagesScanned >= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
+
         return {
             auctions,
-            total,
-            totalPages,
+            total: Number.isFinite(rawTotal) ? rawTotal : 0,
+            totalPages: reportedTotalPages || null,
             pagesScanned,
             cutoffMs: cutoff,
             maxPageThisScan,
             boundaryReached,
-            pageCapReached:
-                totalPages > maxPageThisScan &&
-                !boundaryReached
+            naturalEndReached,
+            pageCapReached,
+            totalLooksReliable,
+            firstPageFull: firstRows.length >= MARKET_PAGE_LIMIT,
+            firstPageCount: firstRows.length,
+            lastPageRows
         };
     }
 
@@ -11777,8 +11827,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 150;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 350;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 350;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 500;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14416,6 +14466,9 @@
         pageCapStops: 0,
         hotLanePrioritySkips: 0,
         lastPageCapReached: false,
+        lastReportedTotal: null,
+        lastTotalReliable: null,
+        lastFirstPageFull: null,
         lastStopReason: '',
         lastError: ''
     };
@@ -14553,12 +14606,20 @@
             hunterCandidates.length;
         hunterHeadlessStats.lastPageCapReached =
             result?.pageCapReached === true;
+        hunterHeadlessStats.lastReportedTotal =
+            Number.isFinite(Number(result?.total)) ? Number(result.total) : null;
+        hunterHeadlessStats.lastTotalReliable =
+            result?.totalLooksReliable === true;
+        hunterHeadlessStats.lastFirstPageFull =
+            result?.firstPageFull === true;
         hunterHeadlessStats.lastStopReason =
             result?.boundaryReached
                 ? 'frontière T-2m atteinte'
                 : result?.pageCapReached
                     ? `limite ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages`
-                    : 'fin marketplace';
+                    : result?.naturalEndReached
+                        ? 'fin marketplace'
+                        : 'scan terminé';
 
         if (result?.pageCapReached) {
             hunterHeadlessStats.pageCapStops++;
@@ -14747,6 +14808,12 @@
                 hunterHeadlessStats.pageCapStops,
             dernierArretLimitePages:
                 hunterHeadlessStats.lastPageCapReached,
+            totalMarketplaceDernierScan:
+                hunterHeadlessStats.lastReportedTotal ?? null,
+            totalMarketplaceFiable:
+                hunterHeadlessStats.lastTotalReliable ?? null,
+            premierePagePleine:
+                hunterHeadlessStats.lastFirstPageFull ?? null,
             skipsPrioriteHotLane:
                 hunterHeadlessStats.hotLanePrioritySkips,
             raisonArretDernierScan:
