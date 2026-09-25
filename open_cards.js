@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.13-LAG-ROLLING-DB';
+    const WM_VERSION = '3.8.15-LAG-ROLLING-DB';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -8383,9 +8383,9 @@
     // validé), puis le ratio s'applique comme avant à la référence achat déjà sécurisée.
     const HUNTER_DYNAMIC_RATIO_LOW_MAX = 1000;
     const HUNTER_DYNAMIC_RATIO_MID_MAX = 3000;
-    const HUNTER_DYNAMIC_RATIO_LOW = 0.69;   // réf H < 1000
-    const HUNTER_DYNAMIC_RATIO_MID = 0.72;   // 1000 <= réf H <= 3000
-    const HUNTER_DYNAMIC_RATIO_HIGH = 0.75;  // réf H > 3000
+    const HUNTER_DYNAMIC_RATIO_LOW = 0.67;   // réf H < 1000
+    const HUNTER_DYNAMIC_RATIO_MID = 0.69;   // 1000 <= réf H <= 3000
+    const HUNTER_DYNAMIC_RATIO_HIGH = 0.71;  // réf H > 3000
 
     function hunterTrendDynamicRatio(marketReference) {
         const ref = Number(marketReference);
@@ -12331,7 +12331,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 1271;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 1974;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2487;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -17111,6 +17111,8 @@
             userCardId: userCardId || null,
             cardId: cardId || null,
             candidatsStricts: candidates.length,
+            titresExactsVisibles: collectionTitleLeaves(title)
+                .filter(el => collectionElementVisible(el)).length,
             premiersTextes: candidates.slice(0, 5).map(el =>
                 String(el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
             )
@@ -17119,6 +17121,158 @@
         console.log('[WMaster][Flip DOM match]', result);
         return result;
     };
+
+    async function openCollectionCardByExactVisibleTitle(
+        title,
+        rarity,
+        userCardId = null,
+        variantFilterConfirmed = false,
+        cardId = null
+    ) {
+        const wanted = normalizeCollectionMatchText(title);
+        const rr = normalizeRarityCode(rarity);
+        if (!wanted) return { ok: false, reason: 'no_exact_title' };
+
+        // collectionTitleLeaves() utilise uniquement l'égalité exacte.
+        const leaves = collectionTitleLeaves(title)
+            .filter(el => collectionElementVisible(el));
+
+        if (leaves.length === 0) {
+            return { ok: false, reason: 'no_exact_title' };
+        }
+
+        const attempts = [];
+
+        for (const leaf of leaves) {
+            let cur = leaf;
+            let best = null;
+            let exactUser = false;
+            let exactCard = false;
+            let raritySeen = false;
+            let hasMedia = false;
+
+            for (let depth = 0; cur && depth < 12; depth++, cur = cur.parentElement) {
+                if (!collectionElementVisible(cur)) continue;
+
+                if (userCardId && collectionTileHasExactId(cur, userCardId, 'user')) {
+                    exactUser = true;
+                }
+                if (cardId && collectionTileHasExactId(cur, cardId, 'card')) {
+                    exactCard = true;
+                }
+                if (collectionTileRarityMatches(cur, rr)) {
+                    raritySeen = true;
+                }
+                if (collectionElementHasCardMedia(cur)) {
+                    hasMedia = true;
+                }
+
+                let clickable = false;
+                try {
+                    clickable =
+                        !!cur.matches?.('button,a,[role="button"],[tabindex]') ||
+                        !!cur.classList?.contains('cursor-pointer') ||
+                        window.getComputedStyle(cur).cursor === 'pointer';
+                } catch (e) { }
+
+                if (clickable && !best) best = cur;
+
+                if (hasMedia && collectionTileHasExactTitle(cur, title)) {
+                    if (!best) best = cur;
+                    break;
+                }
+
+                const rect = cur.getBoundingClientRect?.();
+                if (rect && (rect.width > 900 || rect.height > 1100)) break;
+            }
+
+            // Pour L/L+, ne clique pas une variante ambiguë.
+            if (
+                variantRequiresShinyMetadata(rr) &&
+                !variantFilterConfirmed &&
+                !exactUser &&
+                !raritySeen
+            ) {
+                continue;
+            }
+
+            const target = best || leaf;
+            let score = 0;
+            if (exactUser) score += 10000;
+            if (exactCard) score += 4000;
+            if (raritySeen) score += 500;
+            if (hasMedia) score += 300;
+            if (target !== leaf) score += 100;
+
+            attempts.push({ leaf, target, score });
+        }
+
+        attempts.sort((a, b) => b.score - a.score);
+
+        for (let i = 0; i < attempts.length; i++) {
+            const { leaf, target } = attempts[i];
+
+            try {
+                target.scrollIntoView({ block: 'center', inline: 'center' });
+            } catch (e) { }
+
+            // 1) Le texte exact lui-même : le clic bubble généralement jusqu'au composant React.
+            try {
+                leaf.click();
+            } catch (e) {
+                try {
+                    leaf.dispatchEvent(new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    }));
+                } catch (e2) { }
+            }
+
+            let btn = await waitForButtonByText('Mettre aux enchères', 1800);
+            if (btn) {
+                return {
+                    ok: true,
+                    tile: target,
+                    sellBtn: btn,
+                    attempt: i + 1,
+                    via: 'exact_title_leaf'
+                };
+            }
+
+            // 2) Si le listener est porté par l'ancêtre carte/cliquable.
+            if (target !== leaf) {
+                try {
+                    target.click();
+                } catch (e) {
+                    try {
+                        target.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window
+                        }));
+                    } catch (e2) { }
+                }
+
+                btn = await waitForButtonByText('Mettre aux enchères', 2200);
+                if (btn) {
+                    return {
+                        ok: true,
+                        tile: target,
+                        sellBtn: btn,
+                        attempt: i + 1,
+                        via: 'exact_title_ancestor'
+                    };
+                }
+            }
+        }
+
+        return {
+            ok: false,
+            reason: 'exact_title_click_failed',
+            exactTitleLeaves: leaves.length
+        };
+    }
 
     async function waitForButtonByText(text, timeoutMs = 8000) {
         const started = Date.now();
@@ -17170,7 +17324,7 @@
             // Clic sur le texte du titre en priorité : le click bubble vers le composant React
             // sans risquer de toucher l'étoile/favori de la carte.
             const wanted = normalizeCollectionMatchText(title);
-            const titleTarget = [...tile.querySelectorAll('span,p,h1,h2,h3,h4,h5,h6,div')]
+            const titleTarget = [...tile.querySelectorAll('a,span,p,strong,b,em,figcaption,h1,h2,h3,h4,h5,h6,button,div')]
                 .find(el =>
                     collectionElementVisible(el) &&
                     normalizeCollectionMatchText(el.textContent) === wanted
@@ -17858,6 +18012,7 @@
         setReactInputValue(searchInput, title);
 
         let tile = null;
+        let opened = null;
         for (let i = 0; i < 20 && !tile; i++) {
             await new Promise(r => setTimeout(r, 250));
             tile = findCollectionTileByTitleAndRarity(
@@ -17893,6 +18048,26 @@
         }
 
         if (!tile) {
+            // Résultat visible mais wrapper React non reconnu (ex. Colisée [UR]).
+            // On clique uniquement un TITRE EXACT visible : jamais de sous-chaîne.
+            opened = await openCollectionCardByExactVisibleTitle(
+                title,
+                normalizedSellRarity,
+                userCardId,
+                variantFilterConfirmed,
+                cardId
+            );
+
+            if (opened?.ok) {
+                tile = opened.tile || null;
+                wmLog(
+                    `✅ Flip Seller : <b>${title}</b> reconnue via titre exact visible ` +
+                    `(${opened.via || 'fallback DOM'}).`
+                );
+            }
+        }
+
+        if (!tile && !opened?.ok) {
             let apiMatch = null;
             try {
                 const owned = await fetchFlipOwnedCollectionSnapshot(true);
@@ -17973,14 +18148,16 @@
             }
         }
 
-        const opened = await openCollectionCardRobust(
-            tile,
-            title,
-            normalizedSellRarity,
-            userCardId,
-            variantFilterConfirmed,
-            cardId
-        );
+        if (!opened?.ok) {
+            opened = await openCollectionCardRobust(
+                tile,
+                title,
+                normalizedSellRarity,
+                userCardId,
+                variantFilterConfirmed,
+                cardId
+            );
+        }
 
         if (!opened?.ok) {
             // La carte peut être parfaitement visible (comme Désiré Doué) mais le composant
