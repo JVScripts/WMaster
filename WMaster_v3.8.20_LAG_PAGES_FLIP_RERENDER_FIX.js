@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.19-LAG-PAGES';
+    const WM_VERSION = '3.8.20-LAG-PAGES';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4168,6 +4168,7 @@
                 targeted_api_network: 'fallback ciblé : erreur réseau',
                 targeted_api_not_owned: 'fallback ciblé : exemplaire non retrouvé comme possédé',
                 no_search_input: 'barre de recherche collection introuvable',
+                no_search_input_after_filter: 'barre de recherche remplacée par React après filtre rareté',
                 no_sell_button: 'bouton "Mettre aux enchères" introuvable',
                 card_click_did_not_open: 'carte visible mais fiche Collection non ouverte après clic',
                 ui_listing_card_mismatch: 'vente UI annulée : le serveur a créé une annonce pour une autre carte/rareté',
@@ -12194,8 +12195,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1271;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2745;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1274;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2874;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -16900,6 +16901,24 @@
         return candidates.map(x => x.el);
     }
 
+    window.wmFlipSearchDiag = function () {
+        const input = findCollectionSearchInput();
+        const result = {
+            version: WM_VERSION,
+            path: location.pathname,
+            inputTrouve: !!input,
+            inputConnecte: !!input?.isConnected,
+            valeurRecherche: input?.value ?? null,
+            filtresRarete: collectionRarityFilterControls().map(c => ({
+                rarity: c.rarity,
+                active: rarityControlIsActive(c)
+            }))
+        };
+        console.table(result.filtresRarete);
+        console.log('[WMaster][Flip Search]', result);
+        return result;
+    };
+
     window.wmFlipDomMatchDiag = function (title, rarity = '', userCardId = null, cardId = null) {
         const candidates = findCollectionCardCandidatesByTitleAndRarity(
             title,
@@ -18098,8 +18117,23 @@
         // L/L+ partagent le même card_id. On essaie donc d'abord de faire isoler la variante
         // par le filtre natif de la Collection avant de cliquer un tile portant le même titre.
         if (variantRequiresShinyMetadata(normalizedSellRarity)) {
-            variantFilterConfirmed = await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+            variantFilterConfirmed =
+                await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+
+            // IMPORTANT : cliquer un filtre de rareté rerender fréquemment la Collection.
+            // L'ancien input React devient alors stale/déconnecté. Il faut impérativement
+            // reprendre la vraie barre AVANT d'écrire le titre.
+            searchInput =
+                findCollectionSearchInput() ||
+                await waitForCollectionReady(5000);
         }
+
+        if (!searchInput || !searchInput.isConnected) {
+            searchInput =
+                findCollectionSearchInput() ||
+                await waitForCollectionReady(5000);
+        }
+        if (!searchInput) return { ok: false, reason: 'no_search_input_after_filter' };
 
         setReactInputValue(searchInput, title);
 
@@ -18119,22 +18153,38 @@
         // Retour d'invendu / rareté non encore filtrée : le filtre peut être nécessaire pour
         // faire apparaître immédiatement la bonne variante dans la collection.
         if (!tile && normalizedSellRarity && !variantFilterConfirmed) {
-            const filtered = await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
-            if (filtered) {
-                variantFilterConfirmed = true;
+            const filtered =
+                await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+
+            // Le clic peut avoir réellement filtré même si l'état actif n'est pas
+            // lisible par le DOM. Dans tous les cas, React a pu remplacer l'input.
+            variantFilterConfirmed = filtered === true;
+            searchInput =
+                findCollectionSearchInput() ||
+                await waitForCollectionReady(5000);
+
+            if (searchInput) {
                 setReactInputValue(searchInput, '');
                 await new Promise(r => setTimeout(r, 180));
-                setReactInputValue(searchInput, title);
 
-                for (let i = 0; i < 20 && !tile; i++) {
-                    await new Promise(r => setTimeout(r, 250));
-                    tile = findCollectionTileByTitleAndRarity(
-                        title,
-                        normalizedSellRarity,
-                        userCardId,
-                        variantFilterConfirmed,
-                        cardId
-                    );
+                // Le clear lui-même peut aussi rerender.
+                searchInput =
+                    findCollectionSearchInput() ||
+                    await waitForCollectionReady(5000);
+
+                if (searchInput) {
+                    setReactInputValue(searchInput, title);
+
+                    for (let i = 0; i < 20 && !tile; i++) {
+                        await new Promise(r => setTimeout(r, 250));
+                        tile = findCollectionTileByTitleAndRarity(
+                            title,
+                            normalizedSellRarity,
+                            userCardId,
+                            variantFilterConfirmed,
+                            cardId
+                        );
+                    }
                 }
             }
         }
@@ -18196,17 +18246,45 @@
 
                 await resetCollectionUiForFlip().catch(() => false);
 
-                // Les clics de reset peuvent rerender tout le composant : reprends l'input.
-                searchInput = findCollectionSearchInput() || await waitForCollectionReady(5000);
+                // Les clics de reset rerender le composant.
                 variantFilterConfirmed = false;
+
+                searchInput =
+                    findCollectionSearchInput() ||
+                    await waitForCollectionReady(5000);
 
                 if (variantRequiresShinyMetadata(normalizedSellRarity)) {
                     variantFilterConfirmed =
                         await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+
+                    // Le filtre de rareté rerender à nouveau : l'input pris juste avant
+                    // est potentiellement stale. Reprise obligatoire après le filtre.
+                    searchInput =
+                        findCollectionSearchInput() ||
+                        await waitForCollectionReady(5000);
                 }
 
-                if (searchInput) {
+                if (searchInput && searchInput.isConnected) {
                     setReactInputValue(searchInput, title);
+
+                    // Donne à React le temps de refléter la recherche dans la vraie grille.
+                    await new Promise(r => setTimeout(r, 250));
+
+                    // Si le set de l'input a lui-même déclenché un rerender, récupère encore
+                    // une fois la vraie barre et réapplique le titre seulement si nécessaire.
+                    let liveSearch =
+                        findCollectionSearchInput() ||
+                        searchInput;
+
+                    if (
+                        liveSearch &&
+                        normalizeCollectionMatchText(liveSearch.value) !==
+                        normalizeCollectionMatchText(title)
+                    ) {
+                        setReactInputValue(liveSearch, title);
+                        await new Promise(r => setTimeout(r, 180));
+                    }
+
                     for (let i = 0; i < 24 && !tile; i++) {
                         await new Promise(r => setTimeout(r, 250));
                         tile = findCollectionTileByTitleAndRarity(
@@ -18224,16 +18302,39 @@
                         `✅ Flip Seller : <b>${title}</b> révélée après reset des filtres Collection.`
                     );
                 } else {
-                    wmLog(
-                        `⚠️ Flip Seller : <b>${title}</b> toujours invisible dans React malgré le reset · ` +
-                        `fallback ciblé user_card_id autorisé.`
-                    );
-                    return {
-                        ok: false,
-                        reason: 'card_hidden_in_collection_dom',
-                        apiUserCardId: apiMatch.userCardId || null,
-                        apiCardId: apiMatch.cardId || null
-                    };
+                    // Dernière tentative DOM sur l'état ACTUEL de la grille.
+                    // Très important pour les cas où le reset/filtre laisse une seule carte
+                    // exacte visible mais où le wrapper n'est pas reconnu par le matcher.
+                    const exactAfterReset =
+                        await openCollectionCardByExactVisibleTitle(
+                            title,
+                            normalizedSellRarity,
+                            userCardId,
+                            variantFilterConfirmed,
+                            cardId
+                        );
+
+                    if (exactAfterReset?.ok) {
+                        opened = exactAfterReset;
+                        tile = exactAfterReset.tile || null;
+
+                        wmLog(
+                            `✅ Flip Seller : <b>${title}</b> ouverte après rerender/reset ` +
+                            `(${exactAfterReset.via || 'exact'}).`
+                        );
+                    } else {
+                        wmLog(
+                            `⚠️ Flip Seller : <b>${title}</b> toujours non ouvrable après ` +
+                            `reset + recherche fraîche + clic exact.`
+                        );
+
+                        return {
+                            ok: false,
+                            reason: 'card_hidden_in_collection_dom',
+                            apiUserCardId: apiMatch.userCardId || null,
+                            apiCardId: apiMatch.cardId || null
+                        };
+                    }
                 }
             } else {
                 return { ok: false, reason: 'card_not_found' };
