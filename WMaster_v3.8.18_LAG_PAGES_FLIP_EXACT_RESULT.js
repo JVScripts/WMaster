@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.17-LAG-PAGES';
+    const WM_VERSION = '3.8.18-LAG-PAGES';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -12194,8 +12194,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1271;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2478;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1287;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2467;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -16918,6 +16918,11 @@
             candidatsStricts: candidates.length,
             titresExactsVisibles: collectionTitleLeaves(title)
                 .filter(el => collectionElementVisible(el)).length,
+            filtreRareteActif: (() => {
+                const rr = normalizeRarityCode(rarity);
+                const ctrl = collectionRarityFilterControls().find(c => c.rarity === rr);
+                return ctrl ? rarityControlIsActive(ctrl) : null;
+            })(),
             premiersTextes: candidates.slice(0, 5).map(el =>
                 String(el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
             )
@@ -17059,7 +17064,7 @@
                     } catch (e2) { }
                 }
 
-                btn = await waitForButtonByText('Mettre aux enchères', 2200);
+                btn = await waitForButtonByText('Mettre aux enchères', 1800);
                 if (btn) {
                     return {
                         ok: true,
@@ -17067,6 +17072,38 @@
                         sellBtn: btn,
                         attempt: i + 1,
                         via: 'exact_title_ancestor'
+                    };
+                }
+            }
+
+            // 3) Certaines cartes React n'écoutent que le bloc image/media.
+            // On ne cherche ce média QUE dans le wrapper déjà validé par titre exact,
+            // donc aucun risque de cliquer "Condition des femmes en Suède".
+            const media =
+                target?.querySelector?.('img,picture') ||
+                null;
+
+            if (media && collectionElementVisible(media)) {
+                try {
+                    media.click();
+                } catch (e) {
+                    try {
+                        media.dispatchEvent(new MouseEvent('click', {
+                            bubbles: true,
+                            cancelable: true,
+                            view: window
+                        }));
+                    } catch (e2) { }
+                }
+
+                btn = await waitForButtonByText('Mettre aux enchères', 2200);
+                if (btn) {
+                    return {
+                        ok: true,
+                        tile: target,
+                        sellBtn: btn,
+                        attempt: i + 1,
+                        via: 'exact_title_media'
                     };
                 }
             }
@@ -17347,7 +17384,11 @@
             target.el.click();
             await new Promise(r => setTimeout(r, 600));
         }
-        return true;
+
+        // Ne jamais prétendre que la variante est filtrée si l'UI n'expose pas
+        // réellement l'état actif. Le matcher DOM contrôlera alors lui-même
+        // le badge de rareté visible sur la carte exacte.
+        return rarityControlIsActive(target);
     }
 
 
@@ -17962,6 +18003,29 @@
                 variantFilterConfirmed,
                 cardId
             );
+        }
+
+        // v3.8.18 : une tuile peut être détectée mais son wrapper n'est pas forcément
+        // le vrai listener React. Dans ce cas on retente TOUJOURS par le titre exact visible.
+        // C'est le cas typique "Suède" : la recherche fuzzy affiche 12 cartes contenant
+        // "Suède", mais une seule possède le titre EXACT "Suède".
+        if (!opened?.ok) {
+            const exactOpened = await openCollectionCardByExactVisibleTitle(
+                title,
+                normalizedSellRarity,
+                userCardId,
+                variantFilterConfirmed,
+                cardId
+            );
+
+            if (exactOpened?.ok) {
+                opened = exactOpened;
+                tile = exactOpened.tile || tile;
+                wmLog(
+                    `✅ Flip Seller : <b>${title}</b> ouverte via résultat exact visible ` +
+                    `(${exactOpened.via || 'exact'}).`
+                );
+            }
         }
 
         if (!opened?.ok) {
