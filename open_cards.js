@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.7-LAG-MAX2';
+    const WM_VERSION = '3.8.8-LAG-MAX2';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -2754,7 +2754,7 @@
         rec.nextTagRetryAt = Date.now() + delays[Math.min(n - 1, delays.length - 1)];
     }
 
-    async function tagFlipRecord(rec) {
+    async function tagFlipRecordUnlocked(rec) {
         if (!rec || rec.status === 'sold' || rec.status === 'listed' || !flipLedger.includes(rec)) return false;
 
         rec.tagRetryCount = Math.max(0, Number(rec.tagRetryCount) || 0) + 1;
@@ -2878,6 +2878,90 @@
         wmLog(`💸 Auto-achat prêt à revendre : <b>${rec.title}</b> [${rec.rarity}] · achat <b>${Number(rec.buyPrice).toLocaleString('fr-FR')} 💰</b> · tag <b>vente</b> posé.`);
         return true;
     }
+
+
+    // Anti-spam / anti-double-tag :
+    // Plusieurs chemins peuvent déclencher le tag du même Flip au même instant
+    // (victoire immédiate, retryPendingFlipTags, boucle 15s, autre onglet Wiki-Masters).
+    // Le verrou est basé en priorité sur auctionId, donc il reste stable même si userCardId
+    // est résolu pendant l'opération.
+    const flipTagInFlightKeys = new Set();
+    let flipTagConcurrentSkips = 0;
+
+    function flipTagConcurrencyKey(rec) {
+        if (!rec) return '';
+        const identity =
+            rec.auctionId ||
+            rec.userCardId ||
+            flipLedgerRecordKey(rec) ||
+            '';
+        return identity ? `wmaster:flip-tag:${String(identity)}` : '';
+    }
+
+    async function tagFlipRecord(rec) {
+        if (!rec || rec.status === 'sold' || rec.status === 'listed' || !flipLedger.includes(rec)) {
+            return false;
+        }
+
+        const key = flipTagConcurrencyKey(rec);
+        if (!key) return await tagFlipRecordUnlocked(rec);
+
+        // Protection intra-onglet immédiate.
+        if (flipTagInFlightKeys.has(key)) {
+            flipTagConcurrentSkips++;
+            return false;
+        }
+
+        flipTagInFlightKeys.add(key);
+        try {
+            // Web Locks = verrou exclusif inter-onglets pour la même origine.
+            // `ifAvailable` évite d'empiler une deuxième opération : si un autre onglet
+            // traite déjà cette carte, on laisse simplement le premier finir.
+            if (navigator?.locks?.request) {
+                return await navigator.locks.request(
+                    key,
+                    { mode: 'exclusive', ifAvailable: true },
+                    async lock => {
+                        if (!lock) {
+                            flipTagConcurrentSkips++;
+                            return false;
+                        }
+
+                        // Un autre onglet peut avoir terminé juste avant l'acquisition du verrou.
+                        syncFlipLedgerFromStorage(false);
+                        const current = rec.auctionId
+                            ? flipRecordByAuctionId(rec.auctionId)
+                            : rec;
+
+                        if (!current || current.status === 'sold' || current.status === 'listed') {
+                            return false;
+                        }
+                        if (current.status === 'tagged' && current.userCardId) {
+                            return true;
+                        }
+
+                        return await tagFlipRecordUnlocked(current);
+                    }
+                );
+            }
+
+            // Fallback vieux navigateur : au moins aucun doublon dans cet onglet.
+            return await tagFlipRecordUnlocked(rec);
+        } finally {
+            flipTagInFlightKeys.delete(key);
+        }
+    }
+
+    window.wmFlipTagLockDiag = function () {
+        const result = {
+            version: WM_VERSION,
+            tagsEnCoursCetOnglet: flipTagInFlightKeys.size,
+            doublonsTagBloquesSession: flipTagConcurrentSkips,
+            webLocksDisponibles: !!navigator?.locks?.request
+        };
+        console.table(result);
+        return result;
+    };
 
 
     let autoFlipWinReconcilePromise = null;
