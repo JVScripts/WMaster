@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.13-STABLE-PROD';
+    const WM_VERSION = '3.8.17-STABLE-PROD';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4166,6 +4166,8 @@
                 targeted_api_network: 'fallback ciblé : erreur réseau',
                 targeted_api_not_owned: 'fallback ciblé : exemplaire non retrouvé comme possédé',
                 no_search_input: 'barre de recherche collection introuvable',
+                no_search_input_after_filter: 'barre de recherche remplacée par React après filtre rareté',
+                collection_still_busy: 'Collection encore en chargement / grille non cliquable',
                 no_sell_button: 'bouton "Mettre aux enchères" introuvable',
                 card_click_did_not_open: 'carte visible mais fiche Collection non ouverte après clic',
                 ui_listing_card_mismatch: 'vente UI annulée : le serveur a créé une annonce pour une autre carte/rareté',
@@ -16056,6 +16058,24 @@
         return token.test(String(tile?.textContent || '').toUpperCase());
     }
 
+    function collectionElementHasDirectExactTitleText(el, title) {
+        const wanted = normalizeCollectionMatchText(title);
+        if (!el || !wanted) return false;
+
+        // Cas React fréquent : le titre est un Text node direct du wrapper tandis que
+        // la rareté est dans un enfant séparé. Exemple visuel :
+        //   <div>Suède <span>L</span></div>
+        // el.textContent vaut alors "Suède L", mais le Text node direct vaut bien "Suède".
+        for (const node of el.childNodes || []) {
+            if (node?.nodeType !== Node.TEXT_NODE) continue;
+            if (normalizeCollectionMatchText(node.nodeValue || '') === wanted) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     function collectionTileHasExactTitle(tile, title) {
         const wanted = normalizeCollectionMatchText(title);
         if (!tile || !wanted) return false;
@@ -16063,7 +16083,10 @@
         const matchesExact = value =>
             normalizeCollectionMatchText(value) === wanted;
 
-        if (matchesExact(tile.textContent)) {
+        if (
+            matchesExact(tile.textContent) ||
+            collectionElementHasDirectExactTitleText(tile, title)
+        ) {
             return true;
         }
 
@@ -16083,6 +16106,7 @@
             if (el !== tile && !collectionElementVisible(el)) continue;
 
             if (matchesExact(el.textContent)) return true;
+            if (collectionElementHasDirectExactTitleText(el, title)) return true;
             if (matchesExact(el.getAttribute?.('data-title') || '')) return true;
             if (matchesExact(el.getAttribute?.('title') || '')) return true;
             if (matchesExact(el.getAttribute?.('aria-label') || '')) return true;
@@ -16191,18 +16215,38 @@
         if (!wanted) return [];
 
         const out = [];
-        for (const el of document.querySelectorAll('a,span,p,strong,b,em,figcaption,h1,h2,h3,h4,h5,h6,button,div')) {
-            if (!collectionElementVisible(el)) continue;
-            const own = normalizeCollectionMatchText(el.textContent);
-            if (!own || own !== wanted) continue;
+        const seen = new Set();
 
-            // Ici le titre doit être EXACT : une recherche "Suède" ne doit jamais
-            // sélectionner "Condition des femmes en Suède".
-            const childContains = [...el.children].some(ch =>
-                normalizeCollectionMatchText(ch.textContent) === wanted
-            );
-            if (!childContains || el.children.length === 0) out.push(el);
+        const add = el => {
+            if (!el || seen.has(el) || !collectionElementVisible(el)) return;
+            seen.add(el);
+            out.push(el);
+        };
+
+        for (const el of document.querySelectorAll(
+            'a,span,p,strong,b,em,figcaption,h1,h2,h3,h4,h5,h6,button,div'
+        )) {
+            if (!collectionElementVisible(el)) continue;
+
+            const own = normalizeCollectionMatchText(el.textContent);
+
+            // Cas simple : le nœud entier contient exactement le titre.
+            if (own === wanted) {
+                const childExact = [...el.children].some(ch =>
+                    normalizeCollectionMatchText(ch.textContent) === wanted ||
+                    collectionElementHasDirectExactTitleText(ch, title)
+                );
+                if (!childExact || el.children.length === 0) add(el);
+                continue;
+            }
+
+            // Cas React important : titre en Text node direct + badge/icone en enfant.
+            // "Suède <span>L</span>" doit être reconnu comme titre exact "Suède".
+            if (collectionElementHasDirectExactTitleText(el, title)) {
+                add(el);
+            }
         }
+
         return out;
     }
 
@@ -16266,11 +16310,13 @@
             candidates.push({ el, score });
         };
 
-        // 1) Ancienne structure : si .cursor-pointer existe, elle reste un bon signal.
+        // 1) Ancienne structure : .cursor-pointer reste le meilleur wrapper React.
+        // IMPORTANT : on ne valide plus par simple substring. Le wrapper doit contenir
+        // une preuve de titre EXACT (élément exact ou Text node direct exact).
         for (const el of document.querySelectorAll('.cursor-pointer')) {
             if (!collectionElementVisible(el)) continue;
-            const txt = normalizeCollectionMatchText(el.textContent);
-            if (txt?.includes(wantedTitleNorm)) add(el, 300);
+            if (!collectionTileHasExactTitle(el, title)) continue;
+            add(el, 900);
         }
 
         // 2) Structure React actuelle : part du texte du titre et remonte vers le premier
@@ -16281,8 +16327,10 @@
             for (let depth = 0; cur && depth < 10; depth++, cur = cur.parentElement) {
                 if (!collectionPlausibleCardBox(cur)) continue;
 
-                const txt = normalizeCollectionMatchText(cur.textContent);
-                if (!txt?.includes(wantedTitleNorm)) continue;
+                // La feuille de départ prouve déjà le titre exact. Le wrapper parent
+                // peut contenir rareté, tags, boutons, etc. : on ne lui impose plus
+                // textContent === titre.
+                if (!collectionTileHasExactTitle(cur, title)) continue;
 
                 const hasMedia = collectionElementHasCardMedia(cur);
                 if (hasMedia && !mediaFound) {
@@ -16300,6 +16348,29 @@
         candidates.sort((a, b) => b.score - a.score);
         return candidates.map(x => x.el);
     }
+
+    window.wmFlipSearchDiag = function () {
+        const input = findCollectionSearchInput();
+        const result = {
+            version: WM_VERSION,
+            path: location.pathname,
+            inputTrouve: !!input,
+            inputConnecte: !!input?.isConnected,
+            valeurRecherche: input?.value ?? null,
+            collectionBusy: collectionResultsBusy(),
+            overlaysBusyVisibles: [...document.querySelectorAll('[aria-busy="true"]')]
+                .filter(el => collectionElementVisible(el)).length,
+            grillesPointerEventsNone: [...document.querySelectorAll('.pointer-events-none')]
+                .filter(el => collectionElementVisible(el)).length,
+            filtresRarete: collectionRarityFilterControls().map(c => ({
+                rarity: c.rarity,
+                active: rarityControlIsActive(c)
+            }))
+        };
+        console.table(result.filtresRarete);
+        console.log('[WMaster][Flip Search]', result);
+        return result;
+    };
 
     window.wmFlipDomMatchDiag = function (title, rarity = '', userCardId = null, cardId = null) {
         const candidates = findCollectionCardCandidatesByTitleAndRarity(
@@ -16319,11 +16390,18 @@
             candidatsStricts: candidates.length,
             titresExactsVisibles: collectionTitleLeaves(title)
                 .filter(el => collectionElementVisible(el)).length,
+            titresExactsTextNodeDirect: [...document.querySelectorAll('div,span,p,a,strong,b')]
+                .filter(el =>
+                    collectionElementVisible(el) &&
+                    collectionElementHasDirectExactTitleText(el, title)
+                ).length,
             filtreRareteActif: (() => {
                 const rr = normalizeRarityCode(rarity);
                 const ctrl = collectionRarityFilterControls().find(c => c.rarity === rr);
                 return ctrl ? rarityControlIsActive(ctrl) : null;
             })(),
+            carteVisibleUniqueTrouvee:
+                !!findSingleVisibleCollectionCardCandidate(title, rarity),
             premiersTextes: candidates.slice(0, 5).map(el =>
                 String(el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
             )
@@ -16333,6 +16411,179 @@
         return result;
     };
 
+    function dispatchCollectionPointerClick(el) {
+        if (!el || !collectionElementVisible(el)) return false;
+        if (collectionResultsBusy() || collectionElementInteractionBlocked(el)) {
+            return false;
+        }
+
+        try {
+            el.scrollIntoView({ block: 'center', inline: 'center' });
+        } catch (e) { }
+
+        const rect = el.getBoundingClientRect?.();
+        if (!rect || rect.width < 2 || rect.height < 2) return false;
+
+        const clientX = Math.max(
+            rect.left + 2,
+            Math.min(rect.right - 2, rect.left + rect.width * 0.5)
+        );
+        const clientY = Math.max(
+            rect.top + 2,
+            Math.min(rect.bottom - 2, rect.top + rect.height * 0.58)
+        );
+
+        // L'élément réellement sous le centre de la carte est souvent celui qui porte
+        // les handlers React/pointer, même si le wrapper trouvé par le bot ne les porte pas.
+        const hit = document.elementFromPoint?.(clientX, clientY) || el;
+
+        const targets = [];
+        for (const candidate of [hit, el]) {
+            if (candidate && !targets.includes(candidate)) targets.push(candidate);
+        }
+
+        for (const target of targets) {
+            try {
+                const pointerCommon = {
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    view: window,
+                    clientX,
+                    clientY,
+                    button: 0,
+                    buttons: 1,
+                    pointerId: 1,
+                    pointerType: 'mouse',
+                    isPrimary: true
+                };
+
+                if (typeof PointerEvent === 'function') {
+                    target.dispatchEvent(new PointerEvent('pointerover', pointerCommon));
+                    target.dispatchEvent(new PointerEvent('pointerenter', pointerCommon));
+                    target.dispatchEvent(new PointerEvent('pointerdown', pointerCommon));
+                }
+
+                target.dispatchEvent(new MouseEvent('mouseover', {
+                    bubbles: true, cancelable: true, composed: true, view: window,
+                    clientX, clientY, button: 0, buttons: 1
+                }));
+                target.dispatchEvent(new MouseEvent('mousemove', {
+                    bubbles: true, cancelable: true, composed: true, view: window,
+                    clientX, clientY, button: 0, buttons: 1
+                }));
+                target.dispatchEvent(new MouseEvent('mousedown', {
+                    bubbles: true, cancelable: true, composed: true, view: window,
+                    clientX, clientY, button: 0, buttons: 1
+                }));
+
+                if (typeof PointerEvent === 'function') {
+                    target.dispatchEvent(new PointerEvent('pointerup', {
+                        ...pointerCommon,
+                        buttons: 0
+                    }));
+                }
+
+                target.dispatchEvent(new MouseEvent('mouseup', {
+                    bubbles: true, cancelable: true, composed: true, view: window,
+                    clientX, clientY, button: 0, buttons: 0
+                }));
+                target.dispatchEvent(new MouseEvent('click', {
+                    bubbles: true, cancelable: true, composed: true, view: window,
+                    clientX, clientY, button: 0, buttons: 0
+                }));
+
+                try {
+                    HTMLElement.prototype.click.call(target);
+                } catch (e) { }
+            } catch (e) { }
+        }
+
+        return true;
+    }
+
+    function findSingleVisibleCollectionCardCandidate(title, rarity = '') {
+        const rr = normalizeRarityCode(rarity);
+        const exactTitle = normalizeCollectionMatchText(title);
+        const candidates = [];
+        const seen = new Set();
+
+        const addCandidate = el => {
+            if (!el || seen.has(el) || !collectionElementVisible(el)) return;
+
+            const r = el.getBoundingClientRect?.();
+            if (!r) return;
+
+            // Taille volontairement calée sur une carte de Collection, mais assez large
+            // pour les layouts responsive.
+            if (
+                r.width < 90 || r.height < 120 ||
+                r.width > 420 || r.height > 620
+            ) {
+                return;
+            }
+
+            if (!collectionElementHasCardMedia(el)) return;
+
+            const txt = normalizeCollectionMatchText(el.textContent);
+            if (!txt) return;
+
+            // Si le titre exact est directement identifiable, priorité absolue.
+            const exact =
+                collectionTileHasExactTitle(el, title) ||
+                txt === exactTitle;
+
+            // La rareté visible, lorsqu'elle existe, doit correspondre.
+            const rarityOk =
+                !rr ||
+                collectionTileRarityMatches(el, rr);
+
+            if (!rarityOk) return;
+
+            seen.add(el);
+            candidates.push({ el, exact, area: r.width * r.height });
+        };
+
+        // 1) Wrappers interactifs classiques.
+        for (const el of document.querySelectorAll(
+            '.cursor-pointer,[role="button"],button,a,[tabindex]'
+        )) {
+            addCandidate(el);
+        }
+
+        // 2) Remonte depuis les médias visibles pour les cartes sans classe interactive.
+        for (const media of document.querySelectorAll('img,picture')) {
+            if (!collectionElementVisible(media)) continue;
+            let cur = media.parentElement;
+            for (let depth = 0; cur && depth < 8; depth++, cur = cur.parentElement) {
+                addCandidate(cur);
+            }
+        }
+
+        const exacts = candidates.filter(c => c.exact);
+        if (exacts.length === 1) return exacts[0].el;
+
+        // Fallback ultra-prudent : UNE SEULE carte visuelle dans la Collection.
+        // C'est sûr dans le cas montré : après le filtrage, seule "Suède [L]" est affichée.
+        // S'il y en a plusieurs, on refuse de deviner.
+        const uniqueEls = [...new Set(candidates.map(c => c.el))]
+            .sort((a, b) => {
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                return (ra.width * ra.height) - (rb.width * rb.height);
+            });
+
+        // Élimine les wrappers imbriqués d'une même carte en gardant le plus petit
+        // composant qui contient le média.
+        const roots = [];
+        for (const el of uniqueEls) {
+            if (roots.some(r => r.contains(el) || el.contains(r))) continue;
+            roots.push(el);
+        }
+
+        return roots.length === 1 ? roots[0] : null;
+    }
+
     async function openCollectionCardByExactVisibleTitle(
         title,
         rarity,
@@ -16340,6 +16591,17 @@
         variantFilterConfirmed = false,
         cardId = null
     ) {
+        const interactive =
+            await waitForCollectionResultsInteractive(10000);
+
+        if (!interactive.ok) {
+            return {
+                ok: false,
+                reason: 'collection_still_busy',
+                waitedMs: interactive.waitedMs
+            };
+        }
+
         const wanted = normalizeCollectionMatchText(title);
         const rr = normalizeRarityCode(rarity);
         if (!wanted) return { ok: false, reason: 'no_exact_title' };
@@ -16349,7 +16611,31 @@
             .filter(el => collectionElementVisible(el));
 
         if (leaves.length === 0) {
-            return { ok: false, reason: 'no_exact_title' };
+            const soleVisibleCard =
+                findSingleVisibleCollectionCardCandidate(title, rr);
+
+            if (soleVisibleCard) {
+                dispatchCollectionPointerClick(soleVisibleCard);
+
+                const soleBtn =
+                    await waitForButtonByText('Mettre aux enchères', 2500);
+
+                if (soleBtn) {
+                    return {
+                        ok: true,
+                        tile: soleVisibleCard,
+                        sellBtn: soleBtn,
+                        attempt: 1,
+                        via: 'single_visible_card_pointer'
+                    };
+                }
+            }
+
+            return {
+                ok: false,
+                reason: 'no_exact_title',
+                soleVisibleCardFound: !!soleVisibleCard
+            };
         }
 
         const attempts = [];
@@ -16427,6 +16713,20 @@
                 target.scrollIntoView({ block: 'center', inline: 'center' });
             } catch (e) { }
 
+            // 0) Reproduit une vraie séquence pointer/mouse au centre du composant.
+            dispatchCollectionPointerClick(target);
+
+            let btn = await waitForButtonByText('Mettre aux enchères', 1800);
+            if (btn) {
+                return {
+                    ok: true,
+                    tile: target,
+                    sellBtn: btn,
+                    attempt: i + 1,
+                    via: 'exact_title_pointer'
+                };
+            }
+
             // 1) Le texte exact lui-même : le clic bubble généralement jusqu'au composant React.
             try {
                 leaf.click();
@@ -16440,7 +16740,7 @@
                 } catch (e2) { }
             }
 
-            let btn = await waitForButtonByText('Mettre aux enchères', 1800);
+            btn = await waitForButtonByText('Mettre aux enchères', 1800);
             if (btn) {
                 return {
                     ok: true,
@@ -16510,10 +16810,33 @@
             }
         }
 
+        // Dernier recours DOM : si la grille ne contient qu'UNE seule carte visuelle
+        // compatible avec la rareté recherchée, clique son bloc réel au centre.
+        const soleVisibleCard =
+            findSingleVisibleCollectionCardCandidate(title, rr);
+
+        if (soleVisibleCard) {
+            dispatchCollectionPointerClick(soleVisibleCard);
+
+            const soleBtn =
+                await waitForButtonByText('Mettre aux enchères', 2500);
+
+            if (soleBtn) {
+                return {
+                    ok: true,
+                    tile: soleVisibleCard,
+                    sellBtn: soleBtn,
+                    attempt: attempts.length + 1,
+                    via: 'single_visible_card_pointer'
+                };
+            }
+        }
+
         return {
             ok: false,
             reason: 'exact_title_click_failed',
-            exactTitleLeaves: leaves.length
+            exactTitleLeaves: leaves.length,
+            soleVisibleCardFound: !!soleVisibleCard
         };
     }
 
@@ -16535,6 +16858,17 @@
         variantFilterConfirmed = false,
         cardId = null
     ) {
+        const interactive =
+            await waitForCollectionResultsInteractive(10000);
+
+        if (!interactive.ok) {
+            return {
+                ok: false,
+                reason: 'collection_still_busy',
+                waitedMs: interactive.waitedMs
+            };
+        }
+
         const alternatives = findCollectionCardCandidatesByTitleAndRarity(
             title,
             rarity,
@@ -16570,11 +16904,39 @@
             const titleTarget = [...tile.querySelectorAll('a,span,p,strong,b,em,figcaption,h1,h2,h3,h4,h5,h6,button,div')]
                 .find(el =>
                     collectionElementVisible(el) &&
-                    normalizeCollectionMatchText(el.textContent) === wanted
+                    (
+                        normalizeCollectionMatchText(el.textContent) === wanted ||
+                        collectionElementHasDirectExactTitleText(el, title)
+                    )
                 );
 
-            const target = titleTarget || tile;
+            // Le wrapper .cursor-pointer de l'ancienne logique est prioritaire lorsqu'il
+            // contient bien le titre exact : c'est souvent lui qui porte le handler React.
+            const clickableWrapper =
+                tile.matches?.('.cursor-pointer')
+                    ? tile
+                    : tile.closest?.('.cursor-pointer');
+
+            const target =
+                (clickableWrapper &&
+                 collectionElementVisible(clickableWrapper) &&
+                 collectionTileHasExactTitle(clickableWrapper, title))
+                    ? clickableWrapper
+                    : (titleTarget || tile);
             try { target.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) { }
+
+            dispatchCollectionPointerClick(tile);
+
+            let pointerBtn = await waitForButtonByText('Mettre aux enchères', 1800);
+            if (pointerBtn) {
+                return {
+                    ok: true,
+                    tile,
+                    sellBtn: pointerBtn,
+                    attempt: i + 1,
+                    via: 'robust_tile_pointer'
+                };
+            }
 
             try {
                 target.click();
@@ -16675,6 +17037,85 @@
         ) || document.querySelector(
             'input[placeholder*="Rechercher par titre"]'
         );
+    }
+
+    function collectionResultsBusy() {
+        // Wiki-Masters affiche un overlay aria-busy et met la grille en
+        // pointer-events-none pendant le rafraîchissement de recherche/filtre.
+        // Les cartes peuvent déjà être dans le DOM à ce moment-là mais ne sont
+        // volontairement PAS cliquables par l'interface.
+        for (const el of document.querySelectorAll('[aria-busy="true"]')) {
+            if (collectionElementVisible(el)) return true;
+        }
+
+        for (const el of document.querySelectorAll('.pointer-events-none')) {
+            if (!collectionElementVisible(el)) continue;
+
+            // On ne bloque que sur une zone qui ressemble réellement à la grille Collection.
+            if (
+                el.querySelector?.('h3') ||
+                el.querySelector?.('img,picture') ||
+                el.closest?.('.scroll-mt-4')
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function collectionElementInteractionBlocked(el) {
+        if (!el) return true;
+
+        let cur = el;
+        for (let depth = 0; cur && depth < 12; depth++, cur = cur.parentElement) {
+            try {
+                const style = window.getComputedStyle(cur);
+                if (
+                    style.pointerEvents === 'none' ||
+                    style.display === 'none' ||
+                    style.visibility === 'hidden'
+                ) {
+                    return true;
+                }
+            } catch (e) { }
+
+            if (cur.getAttribute?.('aria-busy') === 'true') return true;
+        }
+
+        return false;
+    }
+
+    async function waitForCollectionResultsInteractive(timeoutMs = 10000) {
+        const started = Date.now();
+        let stableSince = 0;
+
+        while (Date.now() - started < timeoutMs) {
+            const busy = collectionResultsBusy();
+
+            if (!busy) {
+                if (!stableSince) stableSince = Date.now();
+
+                // Deux lectures stables pendant 180 ms évitent de cliquer entre deux
+                // rerenders React successifs.
+                if (Date.now() - stableSince >= 180) {
+                    return {
+                        ok: true,
+                        waitedMs: Date.now() - started
+                    };
+                }
+            } else {
+                stableSince = 0;
+            }
+
+            await new Promise(r => setTimeout(r, 90));
+        }
+
+        return {
+            ok: false,
+            waitedMs: Date.now() - started,
+            busy: collectionResultsBusy()
+        };
     }
 
     async function waitForCollectionReady(timeoutMs = 8000) {
@@ -17253,10 +17694,39 @@
         // L/L+ partagent le même card_id. On essaie donc d'abord de faire isoler la variante
         // par le filtre natif de la Collection avant de cliquer un tile portant le même titre.
         if (variantRequiresShinyMetadata(normalizedSellRarity)) {
-            variantFilterConfirmed = await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+            variantFilterConfirmed =
+                await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+
+            // IMPORTANT : cliquer un filtre de rareté rerender fréquemment la Collection.
+            // L'ancien input React devient alors stale/déconnecté. Il faut impérativement
+            // reprendre la vraie barre AVANT d'écrire le titre.
+            searchInput =
+                findCollectionSearchInput() ||
+                await waitForCollectionReady(5000);
         }
 
+        if (!searchInput || !searchInput.isConnected) {
+            searchInput =
+                findCollectionSearchInput() ||
+                await waitForCollectionReady(5000);
+        }
+        if (!searchInput) return { ok: false, reason: 'no_search_input_after_filter' };
+
         setReactInputValue(searchInput, title);
+
+        // CRITIQUE : la carte peut être présente dans le DOM alors que Wiki-Masters
+        // affiche encore l'overlay aria-busy et désactive la grille avec pointer-events-none.
+        // On attend la fin réelle du chargement avant de chercher/clicker.
+        const firstInteractive =
+            await waitForCollectionResultsInteractive(10000);
+
+        if (!firstInteractive.ok) {
+            return {
+                ok: false,
+                reason: 'collection_still_busy',
+                waitedMs: firstInteractive.waitedMs
+            };
+        }
 
         let tile = null;
         let opened = null;
@@ -17274,22 +17744,40 @@
         // Retour d'invendu / rareté non encore filtrée : le filtre peut être nécessaire pour
         // faire apparaître immédiatement la bonne variante dans la collection.
         if (!tile && normalizedSellRarity && !variantFilterConfirmed) {
-            const filtered = await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
-            if (filtered) {
-                variantFilterConfirmed = true;
+            const filtered =
+                await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+
+            // Le clic peut avoir réellement filtré même si l'état actif n'est pas
+            // lisible par le DOM. Dans tous les cas, React a pu remplacer l'input.
+            variantFilterConfirmed = filtered === true;
+            searchInput =
+                findCollectionSearchInput() ||
+                await waitForCollectionReady(5000);
+
+            if (searchInput) {
                 setReactInputValue(searchInput, '');
                 await new Promise(r => setTimeout(r, 180));
-                setReactInputValue(searchInput, title);
 
-                for (let i = 0; i < 20 && !tile; i++) {
-                    await new Promise(r => setTimeout(r, 250));
-                    tile = findCollectionTileByTitleAndRarity(
-                        title,
-                        normalizedSellRarity,
-                        userCardId,
-                        variantFilterConfirmed,
-                        cardId
-                    );
+                // Le clear lui-même peut aussi rerender.
+                searchInput =
+                    findCollectionSearchInput() ||
+                    await waitForCollectionReady(5000);
+
+                if (searchInput) {
+                    setReactInputValue(searchInput, title);
+
+                    await waitForCollectionResultsInteractive(10000);
+
+                    for (let i = 0; i < 20 && !tile; i++) {
+                        await new Promise(r => setTimeout(r, 250));
+                        tile = findCollectionTileByTitleAndRarity(
+                            title,
+                            normalizedSellRarity,
+                            userCardId,
+                            variantFilterConfirmed,
+                            cardId
+                        );
+                    }
                 }
             }
         }
@@ -17353,17 +17841,47 @@
 
                 await resetCollectionUiForFlip().catch(() => false);
 
-                // Les clics de reset peuvent rerender tout le composant : reprends l'input.
-                searchInput = findCollectionSearchInput() || await waitForCollectionReady(5000);
+                // Les clics de reset rerender le composant.
                 variantFilterConfirmed = false;
+
+                searchInput =
+                    findCollectionSearchInput() ||
+                    await waitForCollectionReady(5000);
 
                 if (variantRequiresShinyMetadata(normalizedSellRarity)) {
                     variantFilterConfirmed =
                         await activateCollectionRarityFilter(normalizedSellRarity).catch(() => false);
+
+                    // Le filtre de rareté rerender à nouveau : l'input pris juste avant
+                    // est potentiellement stale. Reprise obligatoire après le filtre.
+                    searchInput =
+                        findCollectionSearchInput() ||
+                        await waitForCollectionReady(5000);
                 }
 
-                if (searchInput) {
+                if (searchInput && searchInput.isConnected) {
                     setReactInputValue(searchInput, title);
+
+                    // Donne à React le temps de refléter la recherche dans la vraie grille.
+                    await new Promise(r => setTimeout(r, 250));
+
+                    // Si le set de l'input a lui-même déclenché un rerender, récupère encore
+                    // une fois la vraie barre et réapplique le titre seulement si nécessaire.
+                    let liveSearch =
+                        findCollectionSearchInput() ||
+                        searchInput;
+
+                    if (
+                        liveSearch &&
+                        normalizeCollectionMatchText(liveSearch.value) !==
+                            normalizeCollectionMatchText(title)
+                    ) {
+                        setReactInputValue(liveSearch, title);
+                        await new Promise(r => setTimeout(r, 180));
+                    }
+
+                    await waitForCollectionResultsInteractive(10000);
+
                     for (let i = 0; i < 24 && !tile; i++) {
                         await new Promise(r => setTimeout(r, 250));
                         tile = findCollectionTileByTitleAndRarity(
@@ -17381,16 +17899,42 @@
                         `✅ Flip Seller : <b>${title}</b> révélée après reset des filtres Collection.`
                     );
                 } else {
-                    wmLog(
-                        `⚠️ Flip Seller : <b>${title}</b> toujours invisible dans React malgré le reset · ` +
-                        `fallback ciblé user_card_id autorisé.`
-                    );
-                    return {
-                        ok: false,
-                        reason: 'card_hidden_in_collection_dom',
-                        apiUserCardId: apiMatch.userCardId || null,
-                        apiCardId: apiMatch.cardId || null
-                    };
+                    // Dernière tentative DOM sur l'état ACTUEL de la grille.
+                    // Très important pour les cas où le reset/filtre laisse une seule carte
+                    // exacte visible mais où le wrapper n'est pas reconnu par le matcher.
+                    const exactAfterReset =
+                        await openCollectionCardByExactVisibleTitle(
+                            title,
+                            normalizedSellRarity,
+                            userCardId,
+                            variantFilterConfirmed,
+                            cardId
+                        );
+
+                    if (exactAfterReset?.ok) {
+                        opened = exactAfterReset;
+                        tile = exactAfterReset.tile || null;
+
+                        wmLog(
+                            `✅ Flip Seller : <b>${title}</b> ouverte après rerender/reset ` +
+                            `(${exactAfterReset.via || 'exact'}).`
+                        );
+                    } else {
+                        wmLog(
+                            `⚠️ Flip Seller : <b>${title}</b> toujours non ouvrable après ` +
+                            `reset + recherche fraîche + clic exact · ` +
+                            `raison=${exactAfterReset?.reason || '?'} · ` +
+                            `titresExacts=${exactAfterReset?.exactTitleLeaves ?? '?'} · ` +
+                            `carteUnique=${exactAfterReset?.soleVisibleCardFound ?? '?'}.`
+                        );
+
+                        return {
+                            ok: false,
+                            reason: 'card_hidden_in_collection_dom',
+                            apiUserCardId: apiMatch.userCardId || null,
+                            apiCardId: apiMatch.cardId || null
+                        };
+                    }
                 }
             } else {
                 return { ok: false, reason: 'card_not_found' };
