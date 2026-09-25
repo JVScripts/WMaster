@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WMaster
 // @namespace    WmMaster bot
-// @version      3.8.11-LAG-DB-SNAPSHOT
+// @version      3.8.13-LAG-ROLLING-DB
 // @description  Pack Opener + stats, Market Watcher (auto-bid / snipe / wishlist), Trash Seller — pour wiki-masters.com
 // @author       Snizzle
 // @match        https://www.wiki-masters.com/*
@@ -11,5 +11,5 @@
 // @grant        none
 // @updateURL    https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.user.js
 // @downloadURL  https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.user.js
-// @require      https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.js?v=3.8.11-LAG-DB-SNAPSHOT
+// @require      https://github.com/JVScripts/WMaster/raw/refs/heads/main/open_cards.js?v=3.8.13-LAG-ROLLING-DB
 // ==/UserScript==

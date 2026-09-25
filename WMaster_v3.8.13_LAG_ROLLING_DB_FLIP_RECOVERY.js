@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.11-LAG-DB-SNAPSHOT';
+    const WM_VERSION = '3.8.13-LAG-ROLLING-DB';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -39,6 +39,7 @@
     const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 40;  // garde-fou seulement : on cherche normalement la frontière T>2m
     const HUNTER_HEADLESS_CYCLE_GAP_MS = 2_500;      // souffle après file entièrement traitée avant nouveau snapshot
     const HUNTER_HEADLESS_DRAIN_POLL_MS = 100;
+    const HUNTER_HEADLESS_ROLLING_RESCAN_MS = 20_000; // si la file dure, refusionne une fenêtre DB T<=2m toutes les 20 s
     const HUNTER_DB_SNAPSHOT_PAGE_SIZE = 1000;       // PostgREST : fenêtre T<=2m paginée seulement si nécessaire
     const HUNTER_DB_SNAPSHOT_MAX_ROWS = 5000;        // garde-fou extrême sur une seule fenêtre de 2 minutes
 
@@ -12329,8 +12330,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1217;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2978;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1271;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 1974;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14958,6 +14959,9 @@
     let hunterHeadlessActive = false;
     let hunterHeadlessTimeout = null;
     let hunterHeadlessScanInProgress = false;
+    let hunterHeadlessLastSnapshotStartedAt = 0;
+    let hunterHeadlessRollingRescanInProgress = false;
+    let hunterClockSyncLastAttemptAt = 0;
 
     // 3.7.0-beta7 : pipeline réellement séparé en deux étages.
     // 1) T<=1m30 : pré-analyse le Recent Market en parallèle borné (4), sans aucune mise.
@@ -15007,6 +15011,11 @@
         dbSnapshotPages: 0,
         dbSnapshotFallbacks: 0,
         dbSnapshotLastError: '',
+        snapshotsSession: 0,
+        rollingRescansSession: 0,
+        rollingRescanErrors: 0,
+        lastRollingRescanTs: 0,
+        queueHighWaterMark: 0,
         lastReportedTotal: null,
         lastTotalReliable: null,
         lastFirstPageFull: null,
@@ -15368,6 +15377,40 @@
                 return true;
             }
 
+            // Une file énorme ne doit jamais bloquer la découverte pendant >2 minutes.
+            // Toutes les 20 s entre deux débuts de snapshot, on relit la fenêtre DB exacte
+            // et on FUSIONNE seulement les nouveaux IDs grâce aux sets déjà existants.
+            const rollingDue =
+                hunterHeadlessLastSnapshotStartedAt > 0 &&
+                Date.now() - hunterHeadlessLastSnapshotStartedAt >=
+                HUNTER_HEADLESS_ROLLING_RESCAN_MS;
+
+            if (
+                rollingDue &&
+                !hunterHeadlessRollingRescanInProgress &&
+                hunterLagPostInFlight === 0
+            ) {
+                hunterHeadlessRollingRescanInProgress = true;
+                hunterHeadlessStats.rollingRescansSession++;
+                hunterHeadlessStats.lastRollingRescanTs = Date.now();
+
+                try {
+                    await checkHunterHeadlessMarketplace();
+                } catch (e) {
+                    hunterHeadlessStats.rollingRescanErrors++;
+                    hunterHeadlessStats.lastError =
+                        String(e?.message || e || 'erreur rolling rescan');
+                    console.warn(
+                        '[WikiMasters][hunter-headless] rolling DB rescan error:',
+                        e
+                    );
+                } finally {
+                    hunterHeadlessRollingRescanInProgress = false;
+                }
+
+                continue;
+            }
+
             await new Promise(r => setTimeout(r, HUNTER_HEADLESS_DRAIN_POLL_MS));
         }
 
@@ -15470,6 +15513,30 @@
         }
     }
 
+    async function ensureHunterServerClockSync() {
+        if (serverClockSynced) return true;
+
+        const now = Date.now();
+        if (now - hunterClockSyncLastAttemptAt < 60_000) {
+            return serverClockSynced;
+        }
+        hunterClockSyncLastAttemptAt = now;
+
+        try {
+            // Une seule micro-requête same-origin suffit à lire l'en-tête HTTP Date.
+            // On ne dépend donc pas de l'exposition CORS des headers Supabase.
+            const t0 = Date.now();
+            const res = await fetch(
+                `${MARKET_API_BASE}?page=1&limit=1&sort=ending_soon`,
+                { credentials: 'include' }
+            );
+            syncServerClockFromResponse(res, t0);
+            try { await res.body?.cancel?.(); } catch (e) { }
+        } catch (e) { }
+
+        return serverClockSynced;
+    }
+
     function seedTrackedAuctionsForHotLane(auctions) {
         if (!Array.isArray(auctions) || auctions.length === 0) return 0;
 
@@ -15501,9 +15568,18 @@
     async function checkHunterHeadlessMarketplace() {
         if (!hunterHeadlessWanted()) return;
 
+        hunterHeadlessLastSnapshotStartedAt = Date.now();
+        hunterHeadlessStats.snapshotsSession++;
+
         if (!navigator.onLine) {
             hunterHeadlessStats.lastError = 'hors ligne';
             return;
+        }
+
+        // Le timing T<=120/T<=90 dépend d'une horloge serveur correcte.
+        // Une seule tentative légère au démarrage ; ensuite l'offset est réutilisé.
+        if (!serverClockSynced) {
+            await ensureHunterServerClockSync().catch(() => false);
         }
 
         // Même réconciliation des achats gagnés que le Market Watcher.
@@ -15571,6 +15647,12 @@
 
         queueHunterPrewarmCandidates(toAnalyse);
         hunterHeadlessStats.lastSnapshotCandidates = snapshotCandidates.size;
+        hunterHeadlessStats.queueHighWaterMark = Math.max(
+            hunterHeadlessStats.queueHighWaterMark,
+            hunterHeadlessPrewarmPending +
+            hunterHeadlessPagePending +
+            hunterHeadlessDeferredPrepared.size
+        );
 
         apiHealth.lastMarketScanTs = Date.now();
 
@@ -15603,8 +15685,9 @@
             hunterHeadlessStats.pageCapStops++;
         }
 
-        // v3.8.9 : aucune génération suivante ne sera scannée avant que les files
-        // préanalyse/action de CE snapshot soient drainées par runHunterHeadlessLoop().
+        // v3.8.12 : si cette file met longtemps à se vider, waitHunterHeadlessPipelineDrained()
+        // refait périodiquement un snapshot DB exact et FUSIONNE les nouveaux IDs sans vider
+        // ni interrompre la file en cours. Aucun trou aveugle de >2 minutes.
 
         // Important pour le mode Fourbe et les enchères déjà engagées :
         // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
@@ -15639,7 +15722,8 @@
             hunterHeadlessStats.lastDiscoveryDurationMs =
                 Date.now() - discoveryStartedAt;
 
-            // Cœur v3.8.9 : snapshot -> file -> traitement COMPLET -> prochain snapshot.
+            // Cœur v3.8.12 : snapshot -> file prioritaire ; si le drain dure,
+            // resnapshots DB roulants toutes les 20 s fusionnent les nouvelles opportunités.
             await waitHunterHeadlessPipelineDrained();
 
             hunterHeadlessStats.scans++;
@@ -15687,7 +15771,7 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `cycle snapshot DB exact T≤2m → file → drain → rescan · fallback marketplace automatique · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `snapshot DB exact T≤2m + fusion roulante toutes les ${Math.round(HUNTER_HEADLESS_ROLLING_RESCAN_MS / 1000)}s si file active · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -15744,7 +15828,16 @@
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
             traitementPageParPage: false,
-            modeBoucle: 'snapshot DB T<=2m -> file -> drain -> rescan',
+            modeBoucle: 'snapshot DB T<=2m + fusion roulante -> file prioritaire',
+            resnapshotPendantFileMs: HUNTER_HEADLESS_ROLLING_RESCAN_MS,
+            resnapshotEnCours: hunterHeadlessRollingRescanInProgress,
+            snapshotsSession: hunterHeadlessStats.snapshotsSession,
+            resnapshotsPendantFileSession: hunterHeadlessStats.rollingRescansSession,
+            erreursResnapshotSession: hunterHeadlessStats.rollingRescanErrors,
+            dernierResnapshot:
+                hunterHeadlessStats.lastRollingRescanTs
+                    ? new Date(hunterHeadlessStats.lastRollingRescanTs).toLocaleTimeString('fr-FR')
+                    : null,
             sourceDecouverte: hunterHeadlessStats.discoverySource || null,
             lignesSnapshotDB: hunterHeadlessStats.dbSnapshotRows,
             pagesSnapshotDB: hunterHeadlessStats.dbSnapshotPages,
@@ -15761,6 +15854,7 @@
             idsAnalysePageEnFile: hunterHeadlessPageQueuedIds.size,
             workerAnalyseActif: hunterHeadlessPageWorkerRunning,
             preanalysesEnFile: hunterHeadlessPrewarmPending,
+            picFileSession: hunterHeadlessStats.queueHighWaterMark,
             workersPreanalyseActifs: hunterHeadlessPrewarmWorkersActive,
             workersPreanalyseMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
             preanalysesLancees: hunterHeadlessStats.prewarmQueued,
@@ -15785,6 +15879,7 @@
             serveurSynchronise: serverClockSynced,
             decalageServeurMs: Math.round(serverClockOffset),
             scanIntervalMs: null,
+            intervalleResnapshotSiFileMs: HUNTER_HEADLESS_ROLLING_RESCAN_MS,
             pauseEntreCyclesMs: HUNTER_HEADLESS_CYCLE_GAP_MS,
             fenetreDecouverteMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
             hotLaneTimerSyncMs: MARKET_TIMER_SYNC_INTERVAL_MS,
@@ -16759,29 +16854,41 @@
         const wanted = normalizeCollectionMatchText(title);
         if (!tile || !wanted) return false;
 
-        if (normalizeCollectionMatchText(tile.textContent) === wanted) {
+        const matchesExact = value =>
+            normalizeCollectionMatchText(value) === wanted;
+
+        if (matchesExact(tile.textContent)) {
             return true;
         }
 
+        // v3.8.13 : le titre React n'est pas toujours dans span/p/h*. Selon la vue,
+        // il peut être porté par <a>, <strong>, <figcaption>, <button>, un aria-label
+        // ou même l'alt de l'image. On accepte toutes ces représentations UNIQUEMENT
+        // si leur valeur normalisée est exactement égale au titre demandé.
+        //
+        // Important : aucune sous-chaîne ici. "Suède" ne matche donc jamais
+        // "Condition des femmes en Suède".
         const titleNodes = tile.querySelectorAll?.(
-            'span,p,h1,h2,h3,h4,h5,h6,[data-title],[title]'
+            'a,span,p,strong,b,em,figcaption,h1,h2,h3,h4,h5,h6,button,div,' +
+            '[data-title],[title],[aria-label],img[alt]'
         ) || [];
 
         for (const el of titleNodes) {
+            if (el !== tile && !collectionElementVisible(el)) continue;
+
+            if (matchesExact(el.textContent)) return true;
+            if (matchesExact(el.getAttribute?.('data-title') || '')) return true;
+            if (matchesExact(el.getAttribute?.('title') || '')) return true;
+            if (matchesExact(el.getAttribute?.('aria-label') || '')) return true;
+            if (matchesExact(el.getAttribute?.('alt') || '')) return true;
+        }
+
+        // Dernier repli sûr : certains composants fragmentent le titre en plusieurs
+        // éléments inline. On vérifie les feuilles textuelles, toujours en égalité exacte.
+        for (const el of tile.querySelectorAll?.('*') || []) {
+            if (el.children?.length) continue;
             if (!collectionElementVisible(el)) continue;
-
-            const visibleText = normalizeCollectionMatchText(el.textContent);
-            if (visibleText === wanted) return true;
-
-            const dataTitle = normalizeCollectionMatchText(
-                el.getAttribute?.('data-title') || ''
-            );
-            if (dataTitle === wanted) return true;
-
-            const attrTitle = normalizeCollectionMatchText(
-                el.getAttribute?.('title') || ''
-            );
-            if (attrTitle === wanted) return true;
+            if (matchesExact(el.textContent)) return true;
         }
 
         return false;
@@ -16819,14 +16926,20 @@
         }
 
         // Un user_card_id exact identifie l'exemplaire lui-même.
-        // Sinon, hors filtre natif de rareté confirmé, la tuile doit afficher la bonne rareté.
+        // Pour L/L+, le card_id peut être partagé : il faut donc toujours le filtre
+        // de variante, le user_card_id exact ou un badge rareté exploitable.
+        //
+        // Pour les autres raretés, un card_id exact est déjà une identité suffisante ;
+        // certaines vues React n'affichent pas la rareté dans textContent.
         if (
             rr &&
             !exactUser &&
             !variantFilterConfirmed &&
             !collectionTileRarityMatches(tile, rr)
         ) {
-            return false;
+            if (variantRequiresShinyMetadata(rr) || !exactCard) {
+                return false;
+            }
         }
 
         return true;
@@ -16872,7 +16985,7 @@
         if (!wanted) return [];
 
         const out = [];
-        for (const el of document.querySelectorAll('span,p,h1,h2,h3,h4,h5,h6,div')) {
+        for (const el of document.querySelectorAll('a,span,p,strong,b,em,figcaption,h1,h2,h3,h4,h5,h6,button,div')) {
             if (!collectionElementVisible(el)) continue;
             const own = normalizeCollectionMatchText(el.textContent);
             if (!own || own !== wanted) continue;
@@ -16981,6 +17094,31 @@
         candidates.sort((a, b) => b.score - a.score);
         return candidates.map(x => x.el);
     }
+
+    window.wmFlipDomMatchDiag = function (title, rarity = '', userCardId = null, cardId = null) {
+        const candidates = findCollectionCardCandidatesByTitleAndRarity(
+            title,
+            rarity,
+            userCardId,
+            false,
+            cardId
+        );
+
+        const result = {
+            version: WM_VERSION,
+            title,
+            rarity: normalizeRarityCode(rarity),
+            userCardId: userCardId || null,
+            cardId: cardId || null,
+            candidatsStricts: candidates.length,
+            premiersTextes: candidates.slice(0, 5).map(el =>
+                String(el?.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160)
+            )
+        };
+
+        console.log('[WMaster][Flip DOM match]', result);
+        return result;
+    };
 
     async function waitForButtonByText(text, timeoutMs = 8000) {
         const started = Date.now();
@@ -18054,7 +18192,13 @@
                     row.card?.id ||
                     null;
 
-                const serverRarity =
+                const expectedCardId =
+                    String(cardId || '').trim();
+
+                const expectedRarity =
+                    normalizeRarityCode(normalizedSellRarity || rarity);
+
+                const serverRawRarity =
                     normalizeRarityCode(
                         row.snapshot_rarity ||
                         row.card?.rarity ||
@@ -18062,20 +18206,33 @@
                         ''
                     );
 
-                const expectedCardId =
-                    String(cardId || '').trim();
+                const serverShiny =
+                    entityShinyFlag(row);
 
-                const expectedRarity =
-                    normalizeRarityCode(normalizedSellRarity || rarity);
+                const serverRarity =
+                    effectiveRarity(
+                        serverRawRarity,
+                        serverShiny
+                    );
 
                 const cardMismatch =
                     !!expectedCardId &&
                     !!serverCardId &&
                     String(serverCardId) !== expectedCardId;
 
+                // L/L+ partagent parfois snapshot_rarity='L'. Si la relecture serveur
+                // ne contient pas le flag shiny, la rareté effective n'est PAS prouvable.
+                // Dans ce cas on ne fait surtout pas un faux mismatch : le user_card_id
+                // précis est vérifié juste après et sert de source de vérité.
+                const serverVariantKnown =
+                    !variantRequiresShinyMetadata(expectedRarity) ||
+                    serverRawRarity === 'L+' ||
+                    serverShiny !== null;
+
                 const rarityMismatch =
                     !!expectedRarity &&
                     !!serverRarity &&
+                    serverVariantKnown &&
                     serverRarity !== expectedRarity;
 
                 if (cardMismatch || rarityMismatch) {
@@ -18137,28 +18294,40 @@
             }
         }
 
-        // Si l'auction créée n'a pas pu être relue, l'exemplaire précis sert de deuxième
-        // source de vérité. La bonne vente doit avoir retiré CE user_card_id de la collection.
-        if (!verifiedCreatedRow && userCardId) {
-            await new Promise(r => setTimeout(r, 1200));
+        // Source de vérité finale : lorsqu'on connaît le user_card_id acheté,
+        // la bonne mise en vente doit avoir consommé CET exemplaire précis.
+        //
+        // On le vérifie même si l'auction créée a été relue : cela protège à la fois
+        // contre le mauvais titre DOM et contre l'ambiguïté L/L+ du card_id partagé.
+        if (userCardId) {
+            await new Promise(r => setTimeout(r, 900));
             invalidateFlipOwnedCollectionSnapshot();
 
-            const stillOwned =
+            let stillOwned =
                 await verifyOwnedFlipUserCardId(userCardId).catch(() => null);
+
+            // Petite seconde chance pour la propagation collection après création.
+            if (stillOwned?.id) {
+                await new Promise(r => setTimeout(r, 1000));
+                invalidateFlipOwnedCollectionSnapshot();
+                stillOwned =
+                    await verifyOwnedFlipUserCardId(userCardId).catch(() => null);
+            }
 
             if (stillOwned?.id) {
                 if (createdAuctionId) {
                     await cancelSale(
                         createdAuctionId,
                         title,
-                        null
+                        verifiedCreatedRow?.end_at || null
                     ).catch(() => null);
                     invalidateFlipOwnedCollectionSnapshot();
                 }
 
                 wmLog(
-                    `🚨 Flip Seller : vente UI refusée pour <b>${title}</b> — ` +
-                    `l'exemplaire ciblé ${String(userCardId).slice(0, 8)}… est toujours possédé.`
+                    `🚨 Flip Seller : mauvaise instance détectée pour <b>${title}</b> — ` +
+                    `le user_card_id ciblé ${String(userCardId).slice(0, 8)}… est toujours possédé. ` +
+                    `Annonce annulée si possible.`
                 );
 
                 await ensureOnCollectionPage();
@@ -19678,6 +19847,7 @@
         const token = auth?.token || null;
         if (!token) return null; // sans JWT utilisateur la RLS ne renverra rien d'utile
         try {
+            const t0 = Date.now();
             const res = await fetchWithTimeout(`${SUPABASE_URL}/${path}`, {
                 credentials: 'omit',
                 headers: {
@@ -19686,6 +19856,9 @@
                     'Accept': 'application/json'
                 }
             });
+            // Gratuit si Supabase expose Date via CORS ; sinon ensureHunterServerClockSync()
+            // fait une micro-requête same-origin au démarrage.
+            syncServerClockFromResponse(res, t0);
             if (!res.ok) return null;
             return await res.json();
         } catch (e) { return null; }
