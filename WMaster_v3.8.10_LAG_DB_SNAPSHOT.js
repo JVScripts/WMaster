@@ -12327,8 +12327,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1217;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2987;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 4000;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 7000;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
