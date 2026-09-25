@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.15-LAG-ROLLING-DB';
+    const WM_VERSION = '3.8.17-LAG-PAGES';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -35,13 +35,10 @@
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
     const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // compat : 90 s d'action + 30 s = horizon découverte 2 min
     const HUNTER_DISCOVERY_MAX_REMAINING_MS = 120_000; // snapshot : T<=2m00, même si la mise reste interdite avant T<=1m30
-    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;      // GET marketplace parallèles, POST Hunter toujours sérialisés
-    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 40;  // garde-fou seulement : on cherche normalement la frontière T>2m
+    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 2;      // pages marketplace en parallèle, POST Hunter toujours sérialisés
+    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 60;  // garde-fou : jusqu'à 3000 lignes marketplace par cycle
     const HUNTER_HEADLESS_CYCLE_GAP_MS = 2_500;      // souffle après file entièrement traitée avant nouveau snapshot
     const HUNTER_HEADLESS_DRAIN_POLL_MS = 100;
-    const HUNTER_HEADLESS_ROLLING_RESCAN_MS = 20_000; // si la file dure, refusionne une fenêtre DB T<=2m toutes les 20 s
-    const HUNTER_DB_SNAPSHOT_PAGE_SIZE = 1000;       // PostgREST : fenêtre T<=2m paginée seulement si nécessaire
-    const HUNTER_DB_SNAPSHOT_MAX_ROWS = 5000;        // garde-fou extrême sur une seule fenêtre de 2 minutes
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -5658,9 +5655,9 @@
             regimeShift: `baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}% · hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}% · bascule pondérée par confiance des 5 dernières`,
             filtreExtremes: `15 ventes minimum · jusqu’à ${RECENT_MARKET_LIMIT} analysées · trim adaptatif 2/3 extrêmes par côté · extrêmes plafonnés dans la série temporelle`,
             recencyDecay: RECENT_RECENCY_DECAY,
-            recentHunterPct: '69% si réf H <1000 · 72% si 1000–3000 · 75% si >3000',
+            recentHunterPct: '67% si réf H <1000 · 69% si 1000–3000 · 71% si >3000',
             hunterPurchaseSafetyFloorPct: Math.round(HUNTER_PURCHASE_SAFETY_FLOOR * 100),
-            hunterPurchaseExitModel: `achat = réf H (Trend/consensus/rupture) × sortie prévue × sécurité structurelle adaptative × ratio dynamique 69/72/75% selon réf H`,
+            hunterPurchaseExitModel: `achat = réf H (Trend/consensus/rupture) × sortie prévue × sécurité structurelle adaptative × ratio dynamique 67/69/71% selon réf H`,
             hunterLiquidity: `dernière vente <= 48h · rythme effectif (silence actuel inclus) global >= ${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour · 5 dernières >= ${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour`,
             recentHunterMinimum: `${HUNTER_RECENT_MIN_SALES} ventes ET réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} ET structure H non chaotique ET liquidité effective · rupture baissière = garde H5`,
             hunterFallbackAchat: 'aucun',
@@ -8398,9 +8395,9 @@
     function hunterTrendDynamicRatioBand(marketReference) {
         const ref = Number(marketReference);
         if (!Number.isFinite(ref) || ref <= 0) return 'réf H invalide';
-        if (ref < HUNTER_DYNAMIC_RATIO_LOW_MAX) return '<1000 → 69%';
-        if (ref <= HUNTER_DYNAMIC_RATIO_MID_MAX) return '1000–3000 → 72%';
-        return '>3000 → 75%';
+        if (ref < HUNTER_DYNAMIC_RATIO_LOW_MAX) return '<1000 → 67%';
+        if (ref <= HUNTER_DYNAMIC_RATIO_MID_MAX) return '1000–3000 → 69%';
+        return '>3000 → 71%';
     }
 
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
@@ -8699,7 +8696,7 @@
 
     // Décide si une enchère doit déclencher un auto-snipe.
     // Mode dynamique v3.4.2 :
-    //   prix actuel <= ratio dynamique (69/72/75 selon réf H) × référence achat sécurisée,
+    //   prix actuel <= ratio dynamique (67/69/71 selon réf H) × référence achat sécurisée,
     //   avec 15 ventes minimum (jusqu’à 25 analysées), liquidité suffisante et référence marché Hunter STRICTEMENT > 790.
     // Sinon : AUCUNE mise dynamique.
     function shouldAutoSnipe(auction) {
@@ -10652,140 +10649,6 @@
     // On pagine donc jusqu'à rencontrer la vraie frontière T>2m00. Le plafond de pages
     // n'est plus une limite fonctionnelle à 8 pages mais uniquement un garde-fou extrême.
     // Les mises restent interdites avant T<=1m30 : 90-120 s sert à préparer l'historique.
-    async function fetchHunterActionWindowAuctionsFromDb(onProgress, onBatch) {
-        const snapshotNow = serverNow();
-        const snapshotEnd = snapshotNow + HUNTER_DISCOVERY_MAX_REMAINING_MS;
-        const fromIso = encodeURIComponent(new Date(snapshotNow).toISOString());
-        const toIso = encodeURIComponent(new Date(snapshotEnd).toISOString());
-
-        const seen = new Set();
-        const auctions = [];
-        let offset = 0;
-        let pages = 0;
-
-        // Version rapide de queryAuctions() : le Hunter n'a pas besoin de résoudre tous
-        // les pseudos pendant la découverte. Cela évite une requête profiles supplémentaire
-        // sur des centaines d'enchères. Les IDs bidder/seller restent présents.
-        async function readChunk(currentOffset) {
-            const baseFilter =
-                `end_at=gt.${fromIso}&end_at=lte.${toIso}` +
-                `&offset=${currentOffset}`;
-
-            const withShiny =
-                `&select=${AUCTION_COLS},is_shiny,cards(id,wikipedia_title,rarity,image_url,is_shiny)`;
-            const embed =
-                `&select=${AUCTION_COLS},cards(id,wikipedia_title,rarity,image_url)`;
-            const plain =
-                `&select=${AUCTION_COLS}`;
-            const tail =
-                `&order=end_at.asc&limit=${HUNTER_DB_SNAPSHOT_PAGE_SIZE}`;
-
-            let rows = await supabaseSelect(`auctions?${baseFilter}${withShiny}${tail}`);
-            if (!Array.isArray(rows)) {
-                rows = await supabaseSelect(`auctions?${baseFilter}${embed}${tail}`);
-            }
-            if (!Array.isArray(rows)) {
-                rows = await supabaseSelect(`auctions?${baseFilter}${plain}${tail}`);
-            }
-            if (!Array.isArray(rows)) return null;
-
-            return rows.map(row => adaptAuctionRow(row, null));
-        }
-
-        while (auctions.length < HUNTER_DB_SNAPSHOT_MAX_ROWS) {
-            const chunk = await readChunk(offset);
-            if (!Array.isArray(chunk)) {
-                throw new Error('lecture directe auctions indisponible');
-            }
-
-            pages++;
-
-            const useful = [];
-            for (const a of chunk) {
-                if (!a?.id || seen.has(a.id)) continue;
-
-                const remaining = automaticBidRemainingMs(a);
-                if (!Number.isFinite(remaining) ||
-                    remaining <= 0 ||
-                    remaining > HUNTER_DISCOVERY_MAX_REMAINING_MS) {
-                    continue;
-                }
-
-                // Même s'il existe des états transitoires en base, ne garde pas les lignes
-                // explicitement non actives lorsque le helper du site sait les reconnaître.
-                if (typeof isActiveSellingStatus === 'function' &&
-                    !isActiveSellingStatus(a.status)) {
-                    continue;
-                }
-
-                seen.add(a.id);
-                auctions.push(a);
-                useful.push(a);
-            }
-
-            if (onBatch && useful.length > 0) {
-                try {
-                    onBatch(useful, pages, null);
-                } catch (e) {
-                    console.warn('[WikiMasters][hunter-headless] DB snapshot callback error:', e);
-                }
-            }
-
-            if (onProgress) {
-                try {
-                    onProgress(pages, null, auctions.length);
-                } catch (e) { }
-            }
-
-            if (chunk.length < HUNTER_DB_SNAPSHOT_PAGE_SIZE) break;
-
-            offset += HUNTER_DB_SNAPSHOT_PAGE_SIZE;
-            if (offset >= HUNTER_DB_SNAPSHOT_MAX_ROWS) break;
-        }
-
-        return {
-            auctions,
-            total: auctions.length,
-            totalPages: pages,
-            pagesScanned: pages,
-            cutoffMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
-            maxPageThisScan: pages,
-            boundaryReached: true,
-            naturalEndReached: true,
-            pageCapReached: auctions.length >= HUNTER_DB_SNAPSHOT_MAX_ROWS,
-            duplicatePageReached: false,
-            totalLooksReliable: true,
-            firstPageFull: auctions.length >= HUNTER_DB_SNAPSHOT_PAGE_SIZE,
-            firstPageCount: Math.min(auctions.length, HUNTER_DB_SNAPSHOT_PAGE_SIZE),
-            source: 'supabase-end_at-window'
-        };
-    }
-
-    async function fetchHunterActionWindowAuctionsSmart(onProgress, onBatch) {
-        try {
-            const direct = await fetchHunterActionWindowAuctionsFromDb(onProgress, onBatch);
-            hunterHeadlessStats.discoverySource = direct?.source || 'supabase-end_at-window';
-            hunterHeadlessStats.dbSnapshotRows = Array.isArray(direct?.auctions)
-                ? direct.auctions.length
-                : 0;
-            hunterHeadlessStats.dbSnapshotPages = Number(direct?.pagesScanned || 0);
-            hunterHeadlessStats.dbSnapshotLastError = '';
-            return direct;
-        } catch (e) {
-            hunterHeadlessStats.dbSnapshotFallbacks++;
-            hunterHeadlessStats.dbSnapshotLastError =
-                String(e?.message || e || 'erreur DB snapshot');
-            hunterHeadlessStats.discoverySource = 'marketplace-fallback';
-
-            console.warn(
-                '[WikiMasters][hunter-headless] snapshot direct indisponible, fallback marketplace:',
-                e
-            );
-
-            return await fetchHunterActionWindowAuctions(onProgress, onBatch);
-        }
-    }
-
     async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
         const first = await fetchMarketPage(1);
         const firstRows = Array.isArray(first?.auctions)
@@ -10939,7 +10802,7 @@
             }
 
             if (!boundaryReached && !naturalEndReached) {
-                await new Promise(r => setTimeout(r, 25));
+                await new Promise(r => setTimeout(r, 120));
             }
         }
 
@@ -10958,6 +10821,7 @@
 
         return {
             auctions,
+            source: 'marketplace-pages',
             total: Number.isFinite(rawTotal) ? rawTotal : 0,
             totalPages: reportedTotalPages || null,
             pagesScanned,
@@ -11821,7 +11685,7 @@
                 (!marketWatcherActive && enabled)
                     ? ' · autonome'
                     : '';
-            return `⚡ Hunter Trend 69/72/75% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
+            return `⚡ Hunter Trend 67/69/71% · réf H >${HUNTER_RECENT_MIN_MARKET_REFERENCE} · ${hunterDynamicSourceLabel(true)} ${state}${engine}${suffix}`;
         }
         const price = getSetting('autoSnipePrice');
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
@@ -12331,7 +12195,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 1271;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2487;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2478;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14959,8 +14823,6 @@
     let hunterHeadlessActive = false;
     let hunterHeadlessTimeout = null;
     let hunterHeadlessScanInProgress = false;
-    let hunterHeadlessLastSnapshotStartedAt = 0;
-    let hunterHeadlessRollingRescanInProgress = false;
     let hunterClockSyncLastAttemptAt = 0;
 
     // 3.7.0-beta7 : pipeline réellement séparé en deux étages.
@@ -15007,14 +14869,7 @@
         lastDiscoveryDurationMs: 0,
         lastCycleDurationMs: 0,
         discoverySource: '',
-        dbSnapshotRows: 0,
-        dbSnapshotPages: 0,
-        dbSnapshotFallbacks: 0,
-        dbSnapshotLastError: '',
         snapshotsSession: 0,
-        rollingRescansSession: 0,
-        rollingRescanErrors: 0,
-        lastRollingRescanTs: 0,
         queueHighWaterMark: 0,
         lastReportedTotal: null,
         lastTotalReliable: null,
@@ -15377,40 +15232,6 @@
                 return true;
             }
 
-            // Une file énorme ne doit jamais bloquer la découverte pendant >2 minutes.
-            // Toutes les 20 s entre deux débuts de snapshot, on relit la fenêtre DB exacte
-            // et on FUSIONNE seulement les nouveaux IDs grâce aux sets déjà existants.
-            const rollingDue =
-                hunterHeadlessLastSnapshotStartedAt > 0 &&
-                Date.now() - hunterHeadlessLastSnapshotStartedAt >=
-                HUNTER_HEADLESS_ROLLING_RESCAN_MS;
-
-            if (
-                rollingDue &&
-                !hunterHeadlessRollingRescanInProgress &&
-                hunterLagPostInFlight === 0
-            ) {
-                hunterHeadlessRollingRescanInProgress = true;
-                hunterHeadlessStats.rollingRescansSession++;
-                hunterHeadlessStats.lastRollingRescanTs = Date.now();
-
-                try {
-                    await checkHunterHeadlessMarketplace();
-                } catch (e) {
-                    hunterHeadlessStats.rollingRescanErrors++;
-                    hunterHeadlessStats.lastError =
-                        String(e?.message || e || 'erreur rolling rescan');
-                    console.warn(
-                        '[WikiMasters][hunter-headless] rolling DB rescan error:',
-                        e
-                    );
-                } finally {
-                    hunterHeadlessRollingRescanInProgress = false;
-                }
-
-                continue;
-            }
-
             await new Promise(r => setTimeout(r, HUNTER_HEADLESS_DRAIN_POLL_MS));
         }
 
@@ -15568,7 +15389,6 @@
     async function checkHunterHeadlessMarketplace() {
         if (!hunterHeadlessWanted()) return;
 
-        hunterHeadlessLastSnapshotStartedAt = Date.now();
         hunterHeadlessStats.snapshotsSession++;
 
         if (!navigator.onLine) {
@@ -15615,7 +15435,7 @@
         };
 
         const result =
-            await fetchHunterActionWindowAuctionsSmart(
+            await fetchHunterActionWindowAuctions(
                 null,
                 processPageBatch
             );
@@ -15668,26 +15488,24 @@
             result?.totalLooksReliable === true;
         hunterHeadlessStats.lastFirstPageFull =
             result?.firstPageFull === true;
+        hunterHeadlessStats.discoverySource = 'marketplace-pages';
         hunterHeadlessStats.lastStopReason =
-            result?.source === 'supabase-end_at-window'
-                ? 'fenêtre DB exacte T<=2m'
-                : result?.boundaryReached
-                    ? 'frontière T-2m atteinte'
-                    : result?.duplicatePageReached
-                        ? 'pagination répétée détectée'
-                        : result?.pageCapReached
-                            ? `garde-fou ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages`
-                            : result?.naturalEndReached
-                                ? 'fin marketplace'
-                                : 'scan terminé';
+            result?.boundaryReached
+                ? 'frontière T-2m atteinte'
+                : result?.duplicatePageReached
+                    ? 'pagination répétée détectée'
+                    : result?.pageCapReached
+                        ? `garde-fou ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages`
+                        : result?.naturalEndReached
+                            ? 'fin marketplace'
+                            : 'scan terminé';
 
-        if (result?.pageCapReached && result?.source !== 'supabase-end_at-window') {
+        if (result?.pageCapReached) {
             hunterHeadlessStats.pageCapStops++;
         }
 
-        // v3.8.12 : si cette file met longtemps à se vider, waitHunterHeadlessPipelineDrained()
-        // refait périodiquement un snapshot DB exact et FUSIONNE les nouveaux IDs sans vider
-        // ni interrompre la file en cours. Aucun trou aveugle de >2 minutes.
+        // v3.8.17 : cycle volontairement simple et borné :
+        // pages marketplace -> file -> traitement complet -> nouveau scan.
 
         // Important pour le mode Fourbe et les enchères déjà engagées :
         // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
@@ -15722,8 +15540,8 @@
             hunterHeadlessStats.lastDiscoveryDurationMs =
                 Date.now() - discoveryStartedAt;
 
-            // Cœur v3.8.12 : snapshot -> file prioritaire ; si le drain dure,
-            // resnapshots DB roulants toutes les 20 s fusionnent les nouvelles opportunités.
+            // v3.8.17 : snapshot via pages marketplace -> traitement complet de la file
+            // -> nouveau snapshot. Aucun accès DB pour la découverte Hunter.
             await waitHunterHeadlessPipelineDrained();
 
             hunterHeadlessStats.scans++;
@@ -15771,7 +15589,7 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `snapshot DB exact T≤2m + fusion roulante toutes les ${Math.round(HUNTER_HEADLESS_ROLLING_RESCAN_MS / 1000)}s si file active · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `scan marketplace par pages jusqu'à T≤2m (max ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN}, concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY}) → file → drain → rescan · aucune découverte Hunter via DB · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -15827,27 +15645,15 @@
             marketWatcherOn: marketWatcherActive,
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
-            traitementPageParPage: false,
-            modeBoucle: 'snapshot DB T<=2m + fusion roulante -> file prioritaire',
-            resnapshotPendantFileMs: HUNTER_HEADLESS_ROLLING_RESCAN_MS,
-            resnapshotEnCours: hunterHeadlessRollingRescanInProgress,
+            traitementPageParPage: true,
+            modeBoucle: 'pages marketplace T<=2m -> file -> drain -> rescan',
             snapshotsSession: hunterHeadlessStats.snapshotsSession,
-            resnapshotsPendantFileSession: hunterHeadlessStats.rollingRescansSession,
-            erreursResnapshotSession: hunterHeadlessStats.rollingRescanErrors,
-            dernierResnapshot:
-                hunterHeadlessStats.lastRollingRescanTs
-                    ? new Date(hunterHeadlessStats.lastRollingRescanTs).toLocaleTimeString('fr-FR')
-                    : null,
-            sourceDecouverte: hunterHeadlessStats.discoverySource || null,
-            lignesSnapshotDB: hunterHeadlessStats.dbSnapshotRows,
-            pagesSnapshotDB: hunterHeadlessStats.dbSnapshotPages,
-            fallbacksMarketplaceSession: hunterHeadlessStats.dbSnapshotFallbacks,
-            derniereErreurSnapshotDB: hunterHeadlessStats.dbSnapshotLastError || null,
+            sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
+            accesDbHunter: false,
             horizonSnapshotMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
             fenetrePostMs: AUTOMATIC_BID_MAX_REMAINING_MS,
             maxPagesParScan: HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
-            taillePageSnapshotDB: HUNTER_DB_SNAPSHOT_PAGE_SIZE,
-            maxLignesSnapshotDB: HUNTER_DB_SNAPSHOT_MAX_ROWS,
+            concurrencePages: HUNTER_HEADLESS_PAGE_CONCURRENCY,
             arretsLimitePages: hunterHeadlessStats.pageCapStops,
             analysesPageEnFile: hunterHeadlessPagePending,
             candidatsDifférés90a120s: hunterHeadlessDeferredPrepared.size,
@@ -15879,7 +15685,6 @@
             serveurSynchronise: serverClockSynced,
             decalageServeurMs: Math.round(serverClockOffset),
             scanIntervalMs: null,
-            intervalleResnapshotSiFileMs: HUNTER_HEADLESS_ROLLING_RESCAN_MS,
             pauseEntreCyclesMs: HUNTER_HEADLESS_CYCLE_GAP_MS,
             fenetreDecouverteMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
             hotLaneTimerSyncMs: MARKET_TIMER_SYNC_INTERVAL_MS,
@@ -23449,7 +23254,7 @@
                     <label class="wm-toggle"><input type="radio" name="wm-set-snipe-mode" value="adaptive"><span>Dynamique Trend-Aware v4 (15 min · jusqu’à 25 ventes)</span></label>
                     <div class="wm-set-sub" style="margin-top:8px;">Seuil fixe : prix maximum (💰) pour mise initiale automatique</div>
                     <input id="wm-set-autosnipe-price" type="number" min="0" step="1" class="wm-input">
-                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part de la <b>sortie Flip prévue</b> (1er listing - urgence), applique la sécurité achat-only, puis un ratio Hunter <b>dynamique selon la réf H</b> : <b>69% jusqu’à 999</b>, <b>72% de 1000 à 3000</b>, <b>75% au-dessus de 3000</b>. Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
+                    <div class="wm-set-sub" style="margin-top:8px;">Trend-Aware v4 : <b>15 ventes minimum, jusqu’à 25 analysées</b>. La robuste utilise un trim adaptatif (2 extrêmes/côté avec 15-19 ventes, 3 avec 20-25) ; les ventes restent ordonnées pour la tendance. En changement de régime, la référence se rapproche des <b>5 ventes les plus récentes</b> seulement selon leur <b>confiance</b> (accord directionnel, dernière vente, dispersion) : baisse ${RECENT_REGIME_DOWN_START_PCT}%→${RECENT_REGIME_DOWN_FULL_PCT}%, hausse ${RECENT_REGIME_UP_START_PCT}%→${RECENT_REGIME_UP_FULL_PCT}%. Hunter uniquement si dernière vente ≤48h, rythme global ≥${HUNTER_LIQUIDITY_MIN_SALES_PER_DAY}/jour et rythme 5 dernières ≥${HUNTER_RECENT_BLOCK_MIN_SALES_PER_DAY}/jour. Son plafond part de la <b>sortie Flip prévue</b> (1er listing - urgence), applique la sécurité achat-only, puis un ratio Hunter <b>dynamique selon la réf H</b> : <b>67% jusqu’à 999</b>, <b>69% de 1000 à 3000</b>, <b>71% au-dessus de 3000</b>. Sous 15 ventes : <b>aucune mise et aucune vente</b>. Aucun fallback WM.</div>
                     <div class="wm-set-sub" style="margin-top:8px;">Hunter : solde minimum (💰) en-dessous duquel les mises automatiques sont suspendues</div>
                     <input id="wm-set-autosnipe-min-balance" type="number" min="0" step="100" class="wm-input">
                     <div class="wm-set-sub" style="margin-top:8px;">Délai humanisé avant une mise (ms). Plus bas = mises plus rapides mais moins « humaines ». <b>0 = instantané</b>. Ignoré quand l'enchère se termine bientôt (snipe toujours instantané).</div>
@@ -24246,7 +24051,7 @@
                     // Rafraîchit le label du bouton auto-snipe du market
                     paintHunterAggro(); // le libellé du bouton Hunter dépend du mode
                     wmLog(radio.value === 'adaptive'
-                        ? `🎯 Hunter en mode <b>Trend-Aware v4 dynamique</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} · 69% <1000 · 72% 1000–3000 · 75% >3000)`
+                        ? `🎯 Hunter en mode <b>Trend-Aware v4 dynamique</b> (réf H > ${HUNTER_RECENT_MIN_MARKET_REFERENCE} · 67% <1000 · 69% 1000–3000 · 71% >3000)`
                         : '🎯 Hunter en mode <b>seuil fixe</b>');
 
                     if (autoSnipeEnabled) {
