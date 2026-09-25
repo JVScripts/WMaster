@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.7-LAG-MAX2';
+    const WM_VERSION = '3.8.6-STABLE-PROD';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -34,8 +34,14 @@
     // v3.2.0 — Hunter autonome : quand le Market Watcher visuel est OFF, le Hunter
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
     const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // lit jusqu'à T-2m00 : fenêtre 1m30 + 30 s de marge de scan
-    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // 3 pages en parallèle, comme la base 3.6.23
-    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 8;    // scan court : au plus 8 pages ending_soon par cycle (~400 enchères)
+    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // assez rapide sans scanner inutilement tout le marché
+    // v3.7.1 stable — garde-fou scanner : même si la frontière T-2m00 est mal détectée
+    // (end_at manquant / réponse incohérente / tri serveur perturbé), le Hunter ne parcourt
+    // jamais tout le marché. 8 pages = jusqu'à 400 enchères ending_soon par cycle.
+    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 8;
+    // Quand une enchère déjà suivie entre dans sa zone chaude, on évite de lancer un nouveau
+    // gros scan réseau en parallèle. La Hot Lane garde ainsi la priorité sur les 20 dernières secondes.
+    const HUNTER_HEADLESS_HOTLANE_PRIORITY_MS = 20_000;
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -199,15 +205,6 @@
     // Si end_at remonte au-dessus de 1 min 30 après une extension serveur, les ripostes
     // auto-bid se remettent en pause jusqu'à repasser à <= 1 min 30.
     const AUTOMATIC_BID_MAX_REMAINING_MS = 90 * 1000;
-    // 3.7.0-beta7 — sépare la pré-analyse marché de la mise.
-    // Les historiques sont préparés en amont avec le même plafond de 4 lectures concurrentes
-    // que l'ancien preload Hunter ; les POST de mise restent, eux, strictement sérialisés.
-    // La marge minimale de 12 s et la Hot Lane restent inchangées.
-    const HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS = 18 * 1000;
-    const HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS = 20 * 1000;
-    const HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS = 60 * 1000;
-    const HUNTER_HEADLESS_ACTION_BATCH_SIZE = 1;
-    const HUNTER_HEADLESS_PREANALYSIS_WORKERS = 4;
 
     function automaticBidRemainingMs(auction) {
         if (!auction?.end_at) return NaN;
@@ -3997,6 +3994,10 @@
             }
         }
 
+        // v3.7.3 — avant d'ouvrir la Collection, recale une dernière fois l'exemplaire
+        // sur /api/my-collection. C'est particulièrement important pour les lignes ajoutées
+        // manuellement au Flip Seller ou récupérées après coup : leur card_id/user_card_id
+        // peut venir d'un ancien état de l'enchère.
         const authoritativeOwnedId = await resolveAuthoritativeFlipUserCardId(
             rec,
             rec.userCardId || null
@@ -10559,10 +10560,9 @@
     // autorisée avant T-1m30, il est inutile de télécharger les dizaines/centaines
     // de pages situées bien après cette fenêtre lorsque le Market Watcher est OFF.
     //
-    // On garde 30 s de marge pour la découverte, MAIS on ne parcourt plus des dizaines
-    // de pages : au plus 8 pages ending_soon par cycle. Comme le scan repart ~10 s plus
-    // tard, les enchères plus lointaines remonteront naturellement vers ces premières pages.
-    async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
+    // On garde 30 s de marge : un scan qui arrive légèrement avant T-1m30 aura déjà
+    // la carte au cycle suivant sans trou de découverte.
+    async function fetchHunterActionWindowAuctions(onProgress) {
         const first = await fetchMarketPage(1);
         const firstRows = Array.isArray(first?.auctions)
             ? first.auctions
@@ -10574,8 +10574,9 @@
                 ? Math.max(1, Math.ceil(rawTotal / MARKET_PAGE_LIMIT))
                 : null;
 
-        // Sur le serveur dégradé, `total` vaut parfois 0 ou simplement 50.
-        // Une page pleine ne prouve donc jamais qu'il n'existe qu'une seule page.
+        // v3.7.4 — sur certaines réponses marketplace, `total` vaut seulement la taille
+        // de la page courante (souvent exactement 50). Une page pleine + total <= taille
+        // de page est donc AMBIGUË : ne surtout pas conclure qu'il n'existe qu'une page.
         const totalLooksReliable =
             Number.isFinite(rawTotal) &&
             rawTotal > firstRows.length;
@@ -10595,16 +10596,20 @@
         let pagesScanned = 0;
         let boundaryReached = false;
         let naturalEndReached = false;
+        let lastPageRows = firstRows.length;
 
         const consumePage = (data, pageNo) => {
             const rows = Array.isArray(data?.auctions)
                 ? data.auctions
                 : [];
 
+            lastPageRows = rows.length;
             pagesScanned++;
-            if (rows.length === 0) naturalEndReached = true;
 
-            const pageUseful = [];
+            if (rows.length === 0) {
+                naturalEndReached = true;
+            }
+
             let furthestRemaining = -Infinity;
 
             for (const a of rows) {
@@ -10615,29 +10620,20 @@
                     serverNow();
 
                 if (!Number.isFinite(remaining)) continue;
-                furthestRemaining = Math.max(furthestRemaining, remaining);
 
-                // Nouvelle candidate = encore VIVANTE. La grâce négative reste réservée
-                // à la Hot Lane pour les enchères déjà suivies.
+                furthestRemaining = Math.max(
+                    furthestRemaining,
+                    remaining
+                );
+
+                // IMPORTANT : la grâce de 5 s n'a de sens que pour les enchères DÉJÀ
+                // suivies par la Hot Lane (extension de end_at possible).
+                // Une NOUVELLE candidate Hunter doit encore être vivante.
                 if (
                     remaining > 0 &&
                     remaining <= cutoff
                 ) {
                     collected.push(a);
-                    pageUseful.push(a);
-                }
-            }
-
-            // Streaming : la page part immédiatement en préanalyse pendant que le scan continue.
-            if (onBatch && pageUseful.length > 0) {
-                try {
-                    onBatch(
-                        pageUseful,
-                        pageNo,
-                        reportedTotalPages || maxPageThisScan
-                    );
-                } catch (e) {
-                    console.warn('[WikiMasters][hunter-headless] page callback error:', e);
                 }
             }
 
@@ -10649,6 +10645,8 @@
                 );
             }
 
+            // Marketplace triée ending_soon : dès qu'une page traverse T-2m00,
+            // les suivantes ne sont plus utiles au Hunter immédiat.
             if (
                 Number.isFinite(furthestRemaining) &&
                 furthestRemaining > cutoff
@@ -10656,6 +10654,7 @@
                 boundaryReached = true;
             }
 
+            // Page courte = fin naturelle fiable, même si `total` est mauvais.
             if (rows.length < MARKET_PAGE_LIMIT) {
                 naturalEndReached = true;
             }
@@ -10670,13 +10669,8 @@
             !naturalEndReached;
             startPage += HUNTER_HEADLESS_PAGE_CONCURRENCY
         ) {
-            // Priorité absolue au POST : ne pas lancer 3 nouvelles pages pendant qu'une
-            // mise critique attend déjà la réponse du serveur.
-            if (hunterLagPostInFlight > 0) {
-                await hunterLagWaitForPostLane();
-            }
-
             const pages = [];
+
             for (
                 let p = startPage;
                 p < startPage + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
@@ -10691,24 +10685,32 @@
                     try {
                         return await fetchMarketPage(p);
                     } catch (e) {
+                        // Une page en erreur ne prouve PAS la fin de pagination.
                         return null;
                     }
                 })
             );
 
             for (let i = 0; i < results.length; i++) {
-                if (!results[i]) continue;
-                consumePage(results[i], pages[i]);
-                if (boundaryReached || naturalEndReached) break;
+                const data = results[i];
+                if (!data) continue;
+
+                consumePage(data, pages[i]);
+
+                if (boundaryReached || naturalEndReached) {
+                    break;
+                }
             }
 
             if (!boundaryReached && !naturalEndReached) {
-                await new Promise(r => setTimeout(r, 25));
+                await new Promise(r => setTimeout(r, 50));
             }
         }
 
+        // Déduplication : le tri ending_soon bouge pendant la pagination.
         const seen = new Set();
         const auctions = [];
+
         for (const a of collected) {
             if (!a?.id || seen.has(a.id)) continue;
             seen.add(a.id);
@@ -10732,7 +10734,8 @@
             pageCapReached,
             totalLooksReliable,
             firstPageFull: firstRows.length >= MARKET_PAGE_LIMIT,
-            firstPageCount: firstRows.length
+            firstPageCount: firstRows.length,
+            lastPageRows
         };
     }
 
@@ -10849,98 +10852,6 @@
     try { autoBidSet = new Set(JSON.parse(localStorage.getItem(AUTOBID_SET_KEY) || '[]')); } catch (e) { }
     function saveAutoBidSet() {
         try { localStorage.setItem(AUTOBID_SET_KEY, JSON.stringify([...autoBidSet])); } catch (e) { }
-    }
-
-    // v3.7.0-beta4 — diagnostic de session pour les POST Hunter.
-    // Ces compteurs ne pilotent aucune décision : ils servent uniquement à distinguer
-    // une course de prix (mise trop basse), une enchère déjà terminée et un autre échec serveur.
-    const hunterBidDiagStats = {
-        sessionStartedAt: Date.now(),
-        postsAttempted: 0,
-        postsSucceeded: 0,
-        postsTooLow: 0,
-        postsEnded: 0,
-        postsOtherFailed: 0,
-        retriesAttempted: 0,
-        retriesTooLate: 0,
-        networkErrors: 0,
-        postElapsedSamples: [],
-        lastPost: null
-    };
-
-    // v3.8.0-LAG-MAX — voie réseau prioritaire aux POST Hunter.
-    // Le serveur dégradé peut prendre 7–10 s pour répondre : la marge n'est donc plus fixe.
-    let hunterLagPostInFlight = 0;
-    // 1 POST initial + 2 retries max, strictement sérialisés.
-    const HUNTER_MAX_POSTS_PER_CANDIDATE = 3;
-
-    function hunterLagRecordPostElapsed(ms) {
-        const n = Number(ms);
-        if (!Number.isFinite(n) || n <= 0) return;
-        hunterBidDiagStats.postElapsedSamples.push(Math.round(n));
-        if (hunterBidDiagStats.postElapsedSamples.length > 30) {
-            hunterBidDiagStats.postElapsedSamples.splice(
-                0,
-                hunterBidDiagStats.postElapsedSamples.length - 30
-            );
-        }
-    }
-
-    function hunterLagPostP95Ms() {
-        const values = hunterBidDiagStats.postElapsedSamples
-            .filter(Number.isFinite)
-            .slice()
-            .sort((a, b) => a - b);
-        if (values.length === 0) return null;
-        const idx = Math.max(0, Math.ceil(values.length * 0.95) - 1);
-        return values[idx];
-    }
-
-    // Mise initiale : on réserve assez de temps pour POST #1 + éventuel retry + marge.
-    function hunterLagInitialRunwayMs() {
-        const p95 = hunterLagPostP95Ms();
-        if (!Number.isFinite(p95)) return HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS;
-        return Math.max(
-            HUNTER_HEADLESS_MIN_ACTION_RUNWAY_MS,
-            Math.min(40_000, Math.round(2 * p95 + 4_000))
-        );
-    }
-
-    // Premier POST seul : une fois la carte prévalidée, on n'exige plus la marge
-    // POST + retry. On garde seulement de quoi faire relecture fraîche + 1 POST.
-    function hunterLagFirstPostRunwayMs() {
-        const p95 = hunterLagPostP95Ms();
-        if (!Number.isFinite(p95)) return 11_000;
-        return Math.max(11_000, Math.min(25_000, Math.round(p95 + 2_500)));
-    }
-
-    // Retry : un seul POST supplémentaire doit encore pouvoir rentrer.
-    function hunterLagRetryRunwayMs() {
-        const p95 = hunterLagPostP95Ms();
-        if (!Number.isFinite(p95)) return 10_000;
-        return Math.max(10_000, Math.min(25_000, Math.round(p95 + 3_000)));
-    }
-
-    async function hunterLagWaitForPostLane(maxWaitMs = 30_000) {
-        const started = Date.now();
-        while (
-            hunterLagPostInFlight > 0 &&
-            Date.now() - started < maxWaitMs
-        ) {
-            await new Promise(r => setTimeout(r, 100));
-        }
-    }
-
-    function hunterBidDiagRemainingLabel(ms) {
-        if (!Number.isFinite(ms)) return '?';
-        return `${Math.max(0, ms) / 1000 >= 10 ? (Math.max(0, ms) / 1000).toFixed(1) : (Math.max(0, ms) / 1000).toFixed(2)}s`;
-    }
-
-    function hunterBidDiagClassifyError(data) {
-        const text = String(data?.error || data?.message || 'erreur');
-        if (/mise\s+trop\s+basse/i.test(text)) return 'too_low';
-        if (/ench[eè]re\s+(?:est\s+)?termin[eé]e|auction\s+(?:is\s+)?(?:ended|finished|closed)/i.test(text)) return 'ended';
-        return 'other';
     }
 
     // Mode "Fourbe" (snipe) : Set<auctionId> — au lieu de riposter à chaque contre-offre
@@ -11590,11 +11501,92 @@
         return `⚡ Hunter ≤${price}💰 ${state}${suffix}`;
     }
 
+    // v3.7.2 — diagnostic Hunter uniquement. Aucune règle d'achat n'est modifiée.
+    const hunterDecisionStats = {
+        passes: 0,
+        candidatesSeen: 0,
+        candidatesUnique: new Set(),
+        rejected: {
+            targetedHunter: 0,
+            priorityKeyword: 0,
+            fourbe: 0,
+            alreadyAutoBid: 0,
+            timeWindow: 0,
+            selfState: 0,
+            ownedDuplicate: 0,
+            duplicateExposure: 0,
+            historyInsufficient: 0,
+            marketIntegrity: 0,
+            referenceTooLow: 0,
+            liquidity: 0,
+            referenceUnavailable: 0,
+            priceAboveCap: 0,
+            decisionOther: 0,
+            lowBalance: 0,
+            bidLocked: 0,
+            freshFetch: 0,
+            freshTimeWindow: 0,
+            freshSelfState: 0,
+            freshOwnedDuplicate: 0,
+            freshDuplicateExposure: 0,
+            freshReference: 0,
+            freshDecision: 0,
+            freshCap: 0,
+            cardLock: 0
+        },
+        snapshotEligible: 0,
+        postAttempts: 0,
+        postAccepted: 0,
+        postFailed: 0,
+        postRetriesTooLow: 0,
+        lastDecisionRejects: []
+    };
+
+    function hunterDiagRememberReject(seed, kind, reason = '') {
+        if (hunterDecisionStats.rejected[kind] !== undefined) {
+            hunterDecisionStats.rejected[kind]++;
+        }
+        const title = seed?.card?.wikipedia_title || '?';
+        const rarity = globalAuctionRarity(seed) || '';
+        const remaining = automaticBidRemainingMs(seed);
+        hunterDecisionStats.lastDecisionRejects.push({
+            title,
+            rarity,
+            kind,
+            reason: String(reason || ''),
+            bid: Number(seed?.current_bid ?? seed?.base_amount ?? 0),
+            remainingSec: Number.isFinite(remaining) ? Math.round(remaining / 1000) : null
+        });
+        if (hunterDecisionStats.lastDecisionRejects.length > 8) {
+            hunterDecisionStats.lastDecisionRejects.shift();
+        }
+    }
+
+    function hunterDiagDecisionRejectKind(reason) {
+        const r = String(reason || '');
+        if (/historique insuffisant/i.test(r)) return 'historyInsufficient';
+        if (/historique en attente/i.test(r)) return 'marketIntegrity';
+        if (/référence marché Hunter/i.test(r)) return 'referenceTooLow';
+        if (/liquidité insuffisante/i.test(r)) return 'liquidity';
+        if (/référence Recent Market indisponible/i.test(r)) return 'referenceUnavailable';
+        if (/^>\s*\d+%/i.test(r)) return 'priceAboveCap';
+        return 'decisionOther';
+    }
+
+    // 1 POST initial + 2 retries max, strictement sérialisés.
+    const HUNTER_MAX_POSTS_PER_CANDIDATE = 3;
+
     // Auto-bid Hunter (mise initiale selon le mode fixe/dynamique) sur une LISTE d'enchères.
     // Mutualisé entre le scan (nouvelles annonces) ET l'activation du Hunter (annonces déjà
     // présentes). bidLockSet garantit qu'une même enchère n'est pas mise deux fois en parallèle.
     async function runHunterAutoBidPass(list) {
         if (!autoSnipeEnabled || !Array.isArray(list)) return 0;
+
+        hunterDecisionStats.passes++;
+        hunterDecisionStats.candidatesSeen += list.length;
+        for (const a of list) {
+            if (a?.id) hunterDecisionStats.candidatesUnique.add(a.id);
+        }
 
         if (getSetting('autoSnipeMode') === 'adaptive') {
             await preloadRecentMarketForHunter(list).catch(() => { });
@@ -11618,15 +11610,28 @@
                 }
             } catch (e) {
                 // Si la lecture fraîche échoue, on ne prend PAS le risque de bidder sur l'état ancien.
+                hunterDiagRememberReject(seed, 'freshFetch', 'relecture enchère impossible');
                 return null;
             }
 
-            if (!automaticBidTimeAllowed(fresh)) return null;
-            if (iAmLeading(fresh) || autoBidBlockedByUncertainSelfState(fresh)) return null;
+            if (!automaticBidTimeAllowed(fresh)) {
+                hunterDiagRememberReject(fresh, 'freshTimeWindow', 'hors fenêtre T<=90s après relecture');
+                return null;
+            }
+            if (iAmLeading(fresh) || autoBidBlockedByUncertainSelfState(fresh)) {
+                hunterDiagRememberReject(fresh, 'freshSelfState', 'déjà leader / état utilisateur incertain');
+                return null;
+            }
 
             const listingRarity = globalAuctionRarity(fresh);
-            if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) return null;
-            if (hunterDuplicateExposureState(fresh).blocked) return null;
+            if (isOwnedDuplicate(fresh.card?.id ?? fresh.card_id, listingRarity)) {
+                hunterDiagRememberReject(fresh, 'freshOwnedDuplicate', 'doublon déjà possédé');
+                return null;
+            }
+            if (hunterDuplicateExposureState(fresh).blocked) {
+                hunterDiagRememberReject(fresh, 'freshDuplicateExposure', 'exposition carte+rareté déjà active');
+                return null;
+            }
 
             if (getSetting('autoSnipeMode') === 'adaptive' || isDynamicHunterAuction(fresh)) {
                 const freshRef = await ensureFreshHunterReference(
@@ -11634,11 +11639,17 @@
                     Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
                 );
                 // Fail-safe : impossible de vérifier la référence achat v3 fraîche => aucune mise.
-                if (!freshRef) return null;
+                if (!freshRef) {
+                    hunterDiagRememberReject(fresh, 'freshReference', 'référence Hunter fraîche indisponible');
+                    return null;
+                }
             }
 
             const decision = shouldAutoSnipe(fresh);
-            if (!decision.snipe) return null;
+            if (!decision.snipe) {
+                hunterDiagRememberReject(fresh, 'freshDecision', decision.reason || 'décision refusée après relecture');
+                return null;
+            }
 
             let amount = minNextBid(fresh);
             if (Number.isFinite(serverMinimum) && serverMinimum > amount) {
@@ -11651,111 +11662,27 @@
             const isDynamic = mode === 'adaptive' || isDynamicHunterAuction(fresh);
             if (isDynamic) {
                 const cap = Number(decision.cap);
-                if (!Number.isFinite(cap) || cap <= 0 || amount > cap) return null;
+                if (!Number.isFinite(cap) || cap <= 0 || amount > cap) {
+                    hunterDiagRememberReject(fresh, 'freshCap', `mise ${amount} > cap ${Number.isFinite(cap) ? cap : '—'}`);
+                    return null;
+                }
             }
 
             return { auction: fresh, decision, amount, isDynamic };
         }
 
-        async function postHunterBid(auction, amount, decision, attemptNo = 1) {
-            const auctionId = auction?.id;
-            const title = auction?.card?.wikipedia_title || '?';
-            const rar = globalAuctionRarity(auction) || '';
-            const remainingBeforeMs = automaticBidRemainingMs(auction);
-            const cap = Number(decision?.cap);
-            const capLabel = Number.isFinite(cap) ? `${Math.round(cap)} 💰` : '—';
-            const startedAt = performance.now();
-
-            hunterBidDiagStats.postsAttempted++;
-            if (attemptNo > 1) hunterBidDiagStats.retriesAttempted++;
-
-            wmLog(
-                `🧪 Hunter POST #${attemptNo} : <b>${htmlEsc(title)}</b> [${htmlEsc(rar)}] · ` +
-                `<b>${Math.round(amount)} 💰</b> · T-${hunterBidDiagRemainingLabel(remainingBeforeMs)} · plafond ${capLabel}`
-            );
-
-            try {
-                hunterLagPostInFlight++;
-                const res = await fetch(
-                    `${MARKET_API_BASE}/${auctionId}/bid`,
-                    {
-                        method: 'POST',
-                        credentials: 'include',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ amount })
-                    }
-                );
-                const data = await res.json().catch(() => ({}));
-                const elapsedMs = Math.round(performance.now() - startedAt);
-                hunterLagRecordPostElapsed(elapsedMs);
-                const remainingAfterMs = automaticBidRemainingMs(auction);
-                const errorText = String(data?.error || data?.message || 'erreur');
-                const errorClass = res.ok ? 'ok' : hunterBidDiagClassifyError(data);
-
-                hunterBidDiagStats.lastPost = {
-                    at: Date.now(),
-                    title,
-                    rarity: rar,
-                    attemptNo,
-                    amount: Math.round(amount),
-                    cap: Number.isFinite(cap) ? Math.round(cap) : null,
-                    ok: !!res.ok,
-                    status: res.status,
-                    elapsedMs,
-                    remainingBeforeMs: Number.isFinite(remainingBeforeMs) ? Math.round(remainingBeforeMs) : null,
-                    remainingAfterMs: Number.isFinite(remainingAfterMs) ? Math.round(remainingAfterMs) : null,
-                    error: res.ok ? null : errorText
-                };
-
-                if (res.ok) {
-                    hunterBidDiagStats.postsSucceeded++;
-                    wmLog(
-                        `✅ Hunter POST #${attemptNo} accepté : <b>${htmlEsc(title)}</b> · ` +
-                        `${Math.round(amount)} 💰 · ${elapsedMs} ms · reste ${hunterBidDiagRemainingLabel(remainingAfterMs)}`
-                    );
-                } else {
-                    if (errorClass === 'too_low') hunterBidDiagStats.postsTooLow++;
-                    else if (errorClass === 'ended') hunterBidDiagStats.postsEnded++;
-                    else hunterBidDiagStats.postsOtherFailed++;
-
-                    const min = minimumFromTooLowError(data);
-                    wmLog(
-                        `↪️ Hunter POST #${attemptNo} refusé : <b>${htmlEsc(title)}</b> · ` +
-                        `${htmlEsc(errorText)}` +
-                        `${Number.isFinite(min) ? ` · minimum serveur <b>${min} 💰</b>` : ''}` +
-                        ` · ${elapsedMs} ms · reste ${hunterBidDiagRemainingLabel(remainingAfterMs)}`
-                    );
+        async function postHunterBid(auctionId, amount) {
+            const res = await fetch(
+                `${MARKET_API_BASE}/${auctionId}/bid`,
+                {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ amount })
                 }
-
-                hunterLagPostInFlight = Math.max(0, hunterLagPostInFlight - 1);
-                return { res, data };
-            } catch (e) {
-                const elapsedMs = Math.round(performance.now() - startedAt);
-                hunterLagRecordPostElapsed(elapsedMs);
-                const remainingAfterMs = automaticBidRemainingMs(auction);
-                hunterBidDiagStats.networkErrors++;
-                hunterBidDiagStats.lastPost = {
-                    at: Date.now(),
-                    title,
-                    rarity: rar,
-                    attemptNo,
-                    amount: Math.round(amount),
-                    cap: Number.isFinite(cap) ? Math.round(cap) : null,
-                    ok: false,
-                    status: null,
-                    elapsedMs,
-                    remainingBeforeMs: Number.isFinite(remainingBeforeMs) ? Math.round(remainingBeforeMs) : null,
-                    remainingAfterMs: Number.isFinite(remainingAfterMs) ? Math.round(remainingAfterMs) : null,
-                    error: String(e?.message || e || 'erreur réseau')
-                };
-                wmLog(
-                    `⚠️ Hunter POST #${attemptNo} erreur réseau : <b>${htmlEsc(title)}</b> · ` +
-                    `${htmlEsc(String(e?.message || e || 'erreur'))} · ${elapsedMs} ms · ` +
-                    `reste ${hunterBidDiagRemainingLabel(remainingAfterMs)}`
-                );
-                hunterLagPostInFlight = Math.max(0, hunterLagPostInFlight - 1);
-                throw e;
-            }
+            );
+            const data = await res.json().catch(() => ({}));
+            return { res, data };
         }
 
         function minimumFromTooLowError(data) {
@@ -11769,22 +11696,56 @@
 
         for (const seed of list) {
             if (!seed || !seed.id) continue;
-            if (matchedHunterEntry(seed.card)) continue;
-            if (hasPriorityKeyword(seed.card)) continue;
-            if (snipeSet.has(seed.id) || hasFourbeKeyword(seed.card)) continue;
-            if (autoBidSet.has(seed.id)) continue;
+            if (matchedHunterEntry(seed.card)) {
+                hunterDiagRememberReject(seed, 'targetedHunter', 'géré par Chasseur ciblé');
+                continue;
+            }
+            if (hasPriorityKeyword(seed.card)) {
+                hunterDiagRememberReject(seed, 'priorityKeyword', 'géré par mot-clé prioritaire');
+                continue;
+            }
+            if (snipeSet.has(seed.id) || hasFourbeKeyword(seed.card)) {
+                hunterDiagRememberReject(seed, 'fourbe', 'déjà géré par Fourbe');
+                continue;
+            }
+            if (autoBidSet.has(seed.id)) {
+                hunterDiagRememberReject(seed, 'alreadyAutoBid', 'auto-bid déjà armé');
+                continue;
+            }
 
             // Filtres rapides sur le snapshot du scan : évitent une relecture serveur inutile.
-            if (!automaticBidTimeAllowed(seed)) continue;
-            if (iAmLeading(seed) || autoBidBlockedByUncertainSelfState(seed)) continue;
+            if (!automaticBidTimeAllowed(seed)) {
+                hunterDiagRememberReject(seed, 'timeWindow', 'hors fenêtre T<=90s');
+                continue;
+            }
+            if (iAmLeading(seed) || autoBidBlockedByUncertainSelfState(seed)) {
+                hunterDiagRememberReject(seed, 'selfState', 'déjà leader / état utilisateur incertain');
+                continue;
+            }
             const seedRarity = globalAuctionRarity(seed);
-            if (isOwnedDuplicate(seed.card?.id ?? seed.card_id, seedRarity)) continue;
-            if (hunterDuplicateExposureState(seed).blocked) continue;
+            if (isOwnedDuplicate(seed.card?.id ?? seed.card_id, seedRarity)) {
+                hunterDiagRememberReject(seed, 'ownedDuplicate', 'doublon déjà possédé');
+                continue;
+            }
+            if (hunterDuplicateExposureState(seed).blocked) {
+                hunterDiagRememberReject(seed, 'duplicateExposure', 'exposition carte+rareté déjà active');
+                continue;
+            }
             const seedDecision = shouldAutoSnipe(seed);
-            if (!seedDecision.snipe) continue;
-            if (wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) continue;
-            if (bidLockSet.has(seed.id)) continue;
+            if (!seedDecision.snipe) {
+                hunterDiagRememberReject(seed, hunterDiagDecisionRejectKind(seedDecision.reason), seedDecision.reason);
+                continue;
+            }
+            if (wikibidousBalance <= getSetting('minBalanceForAutoSnipe')) {
+                hunterDiagRememberReject(seed, 'lowBalance', `solde ${wikibidousBalance}`);
+                continue;
+            }
+            if (bidLockSet.has(seed.id)) {
+                hunterDiagRememberReject(seed, 'bidLocked', 'enchère déjà en traitement');
+                continue;
+            }
 
+            hunterDecisionStats.snapshotEligible++;
             bidLockSet.add(seed.id);
             let hunterCardLockKey = null;
 
@@ -11797,72 +11758,44 @@
 
                 let { auction, decision, amount, isDynamic } = prepared;
 
-                // beta5 : la file a pu attendre pendant la prélecture / analyse du batch.
-                // Recontrôle donc la marge sur l'état FRAIS juste avant le tout premier POST.
-                // Ne s'applique qu'à la mise initiale Hunter ; la logique Hot Lane / retry reste inchangée.
-                const initialRemainingMs = automaticBidRemainingMs(auction);
-                if (!Number.isFinite(initialRemainingMs) ||
-                    initialRemainingMs <= hunterLagFirstPostRunwayMs()) {
-                    hunterHeadlessStats.actionTooLate++;
-                    continue;
-                }
-
                 // Verrou carte+rareté pris au dernier moment : une autre passe Hunter ne peut
                 // pas acheter le même exemplaire logique pendant que ce POST est en vol.
                 hunterCardLockKey = acquireHunterCardRarityBidLock(auction);
-                if (!hunterCardLockKey) continue;
+                if (!hunterCardLockKey) {
+                    hunterDiagRememberReject(auction, 'cardLock', 'verrou carte+rareté déjà pris');
+                    continue;
+                }
 
                 let attemptNo = 1;
-                let attempt = await postHunterBid(auction, amount, decision, attemptNo);
+                hunterDecisionStats.postAttempts++;
+                let attempt = await postHunterBid(auction.id, amount);
 
                 // Jusqu'à 3 POST au total : initial + 2 retries.
-                // Chaque retry repasse par une relecture fraîche et recalcule le cap Hunter.
+                // Chaque retry repasse par la revalidation fraîche complète.
                 while (!attempt.res.ok && attemptNo < HUNTER_MAX_POSTS_PER_CANDIDATE) {
                     const serverMinimum = minimumFromTooLowError(attempt.data);
                     if (serverMinimum === null) break;
 
                     const previousAmount = amount;
                     const retryPrepared = await prepareFreshHunterBid(seed, serverMinimum);
-
-                    if (!retryPrepared || retryPrepared.amount === previousAmount) {
-                        const currentCap = Number(decision?.cap);
-                        const retryReason =
-                            Number.isFinite(currentCap) && serverMinimum > currentCap
-                                ? `minimum serveur ${serverMinimum} 💰 > plafond ${Math.round(currentCap)} 💰`
-                                : 'revalidation fraîche refusée ou montant inchangé';
-                        wmLog(
-                            `↪️ Hunter retry abandonné : <b>${htmlEsc(auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
-                            `${htmlEsc(retryReason)}`
-                        );
-                        break;
-                    }
-
-                    const retryRemainingMs = automaticBidRemainingMs(retryPrepared.auction);
-                    if (!Number.isFinite(retryRemainingMs) ||
-                        retryRemainingMs <= hunterLagRetryRunwayMs()) {
-                        hunterBidDiagStats.retriesTooLate++;
-                        wmLog(
-                            `↪️ Hunter retry #${attemptNo + 1} abandonné (trop tard) : ` +
-                            `<b>${htmlEsc(retryPrepared.auction?.card?.wikipedia_title || seed?.card?.wikipedia_title || '?')}</b> · ` +
-                            `reste ${hunterBidDiagRemainingLabel(retryRemainingMs)} · ` +
-                            `seuil ${Math.round(hunterLagRetryRunwayMs() / 1000)}s`
-                        );
-                        break;
-                    }
+                    if (!retryPrepared || retryPrepared.amount === previousAmount) break;
 
                     auction = retryPrepared.auction;
                     decision = retryPrepared.decision;
                     amount = retryPrepared.amount;
                     isDynamic = retryPrepared.isDynamic;
-                    attemptNo++;
 
-                    attempt = await postHunterBid(auction, amount, decision, attemptNo);
+                    attemptNo++;
+                    hunterDecisionStats.postRetriesTooLow++;
+                    hunterDecisionStats.postAttempts++;
+                    attempt = await postHunterBid(auction.id, amount);
                 }
 
                 const title = auction.card?.wikipedia_title || seed.card?.wikipedia_title || '?';
                 const rar = globalAuctionRarity(auction) || globalAuctionRarity(seed) || '';
 
                 if (attempt.res.ok) {
+                    hunterDecisionStats.postAccepted++;
                     if (isDynamic) {
                         setAutoBidMax(auction.id, decision.cap);
                         autoBidSet.add(auction.id);
@@ -11895,12 +11828,15 @@
                         sendToDiscord(`🤖 Auto-bid place : **${title}** a **${amount} coins**`, 5763719, 'market');
                     }
                 } else {
+                    hunterDecisionStats.postFailed++;
                     const error = attempt.data?.error || attempt.data?.message || 'erreur';
                     wmLog(`⚠️ Hunter échoué : <b>${title}</b> [${rar}] · ${error}`);
                     sendToDiscord(`⚠️ Auto-bid echoue : **${title}** - ${error}`, 15548997, 'market');
                 }
             } catch (e) {
                 // Aucun auto-bid n'est armé si la mise initiale n'a pas abouti.
+                hunterDecisionStats.postFailed++;
+                hunterDiagRememberReject(seed, 'decisionOther', `exception: ${e?.message || e || 'inconnue'}`);
             } finally {
                 releaseHunterCardRarityBidLock(hunterCardLockKey);
                 bidLockSet.delete(seed.id);
@@ -12093,8 +12029,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 300;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 700;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1880;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2954;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14722,22 +14658,6 @@
     let hunterHeadlessActive = false;
     let hunterHeadlessTimeout = null;
     let hunterHeadlessScanInProgress = false;
-
-    // 3.7.0-beta7 : pipeline réellement séparé en deux étages.
-    // 1) T<=1m30 : pré-analyse le Recent Market en parallèle borné (4), sans aucune mise.
-    //    Seules les cartes qui passent déjà la décision économique sont transmises à l'étage 2.
-    // 2) File d'action sérialisée : relecture fraîche puis POST, avec garde-fou adaptatif selon p95 POST.
-    // Cela évite que la file de mise passe son temps à télécharger 15-25 ventes au dernier moment.
-    let hunterHeadlessPageActionQueue = [];
-    let hunterHeadlessPageWorkerRunning = false;
-    const hunterHeadlessPageQueuedIds = new Set();
-    let hunterHeadlessPagePending = 0;
-
-    let hunterHeadlessPrewarmQueue = [];
-    let hunterHeadlessPrewarmWorkersActive = 0;
-    const hunterHeadlessPrewarmQueuedIds = new Set();
-    let hunterHeadlessPrewarmPending = 0;
-
     const hunterHeadlessStats = {
         scans: 0,
         lastScanTs: 0,
@@ -14745,20 +14665,14 @@
         lastPagesScanned: 0,
         lastAuctionsInWindow: 0,
         lastCandidates: 0,
-        lastError: '',
-        lastPageActionError: '',
         pageCapStops: 0,
-        prewarmQueued: 0,
-        prewarmDone: 0,
-        prewarmError: 0,
-        prevalidated: 0,
-        preanalysisRejected: 0,
-        preanalysisTooLate: 0,
-        actionTooLate: 0,
+        hotLanePrioritySkips: 0,
+        lastPageCapReached: false,
         lastReportedTotal: null,
         lastTotalReliable: null,
         lastFirstPageFull: null,
-        lastStopReason: ''
+        lastStopReason: '',
+        lastError: ''
     };
 
     function hunterHeadlessWanted() {
@@ -14775,347 +14689,6 @@
             autoBidSet.size > 0 ||
             snipeSet.size > 0
         );
-    }
-
-    function hunterRecentCacheReady(auction) {
-        if (!auction) return false;
-        const cardId = auction.card?.id ?? auction.card_id;
-        const rarity = globalAuctionRarity(auction);
-        if (!cardId || !rarity) return false;
-        return !!getCachedRecentMarket(
-            cardId,
-            rarity,
-            HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-        );
-    }
-
-    function hunterHeadlessFastCandidateAllowed(a) {
-        if (!a?.id) return false;
-        if (!automaticBidTimeAllowed(a)) return false;
-        if (matchedHunterEntry(a.card)) return false;
-        if (hasPriorityKeyword(a.card)) return false;
-        if (snipeSet.has(a.id) || hasFourbeKeyword(a.card)) return false;
-        if (autoBidSet.has(a.id)) return false;
-        if (iAmLeading(a) || autoBidBlockedByUncertainSelfState(a)) return false;
-
-        const rarity = globalAuctionRarity(a);
-        if (isOwnedDuplicate(a.card?.id ?? a.card_id, rarity)) return false;
-        if (hunterDuplicateExposureState(a).blocked) return false;
-        return true;
-    }
-
-    function hunterLagPriorityRank(remaining) {
-        const runway = hunterLagInitialRunwayMs();
-        if (!Number.isFinite(remaining)) return 5;
-
-        // Zone idéale : assez urgente pour ne pas attendre, mais assez large pour
-        // lecture Recent Market + POST + éventuel retry.
-        const coreMin = Math.max(HUNTER_HEADLESS_PRIORITY_CORE_MIN_MS, runway);
-        if (
-            remaining >= coreMin &&
-            remaining <= HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS
-        ) return 0;
-
-        // Ensuite les 60–90 s : parfaites à préchauffer si la zone 20–60 est vide.
-        if (
-            remaining > HUNTER_HEADLESS_PRIORITY_CORE_MAX_MS &&
-            remaining <= AUTOMATIC_BID_MAX_REMAINING_MS
-        ) return 1;
-
-        // Zone encore jouable entre le runway dynamique et le cœur.
-        if (remaining > runway && remaining < coreMin) return 2;
-
-        // >90 s = trop tôt ; <= runway = trop tard pour une mise initiale.
-        if (remaining > AUTOMATIC_BID_MAX_REMAINING_MS) return 3;
-        return 4;
-    }
-
-    function hunterPreanalysisPriority(a, b) {
-        const ar = automaticBidRemainingMs(a);
-        const br = automaticBidRemainingMs(b);
-
-        const aRank = hunterLagPriorityRank(ar);
-        const bRank = hunterLagPriorityRank(br);
-        if (aRank !== bRank) return aRank - bRank;
-
-        // Dans une même zone, la plus proche de la fin d'abord.
-        return ar - br;
-    }
-
-
-    function queueHunterPageCandidates(list) {
-        if (!hunterHeadlessWanted() || !Array.isArray(list) || list.length === 0) return 0;
-
-        const fresh = list.filter(a =>
-            a?.id &&
-            automaticBidTimeAllowed(a) &&
-            !hunterHeadlessPageQueuedIds.has(a.id)
-        );
-        if (fresh.length === 0) return 0;
-
-        for (const a of fresh) {
-            hunterHeadlessPageQueuedIds.add(a.id);
-            hunterHeadlessPageActionQueue.push(a);
-        }
-        hunterHeadlessPagePending += fresh.length;
-        runHunterPageActionQueue().catch(() => { });
-        return fresh.length;
-    }
-
-    function queuePreparedHunterAction(a) {
-        if (!hunterHeadlessWanted() || !a?.id) return false;
-        if (!hunterHeadlessFastCandidateAllowed(a)) return false;
-
-        const remaining = automaticBidRemainingMs(a);
-        if (!Number.isFinite(remaining) || remaining <= hunterLagFirstPostRunwayMs()) {
-            hunterHeadlessStats.preanalysisTooLate++;
-            return false;
-        }
-
-        // L'historique vient d'être préparé. La décision ici sert de pré-filtre économique ;
-        // runHunterAutoBidPass la revalidera encore sur l'état frais juste avant le POST.
-        const decision = shouldAutoSnipe(a);
-        if (!decision?.snipe) {
-            hunterHeadlessStats.preanalysisRejected++;
-            return false;
-        }
-
-        const queued = queueHunterPageCandidates([a]);
-        if (queued > 0) {
-            hunterHeadlessStats.prevalidated += queued;
-            return true;
-        }
-        return false;
-    }
-
-    async function runHunterPreanalysisWorker() {
-        hunterHeadlessPrewarmWorkersActive++;
-        try {
-            while (hunterHeadlessWanted() && hunterHeadlessPrewarmQueue.length > 0) {
-                hunterHeadlessPrewarmQueue.sort(hunterPreanalysisPriority);
-                const a = hunterHeadlessPrewarmQueue.shift();
-                if (!a?.id) continue;
-
-                try {
-                    const remaining = automaticBidRemainingMs(a);
-                    if (!Number.isFinite(remaining) ||
-                        remaining <= hunterLagInitialRunwayMs() ||
-                        remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
-                        if (Number.isFinite(remaining) && remaining <= hunterLagInitialRunwayMs()) {
-                            hunterHeadlessStats.preanalysisTooLate++;
-                        }
-                        continue;
-                    }
-
-                    if (!hunterHeadlessFastCandidateAllowed(a)) continue;
-
-                    const cardId = a.card?.id ?? a.card_id;
-                    const rarity = globalAuctionRarity(a);
-                    if (!cardId || !rarity) continue;
-
-                    // Si un snapshot <=60 s existe déjà et dit clairement "pas de mise",
-                    // inutile de refaire une requête lourde juste pour confirmer le même refus.
-                    const cachedDecisionMarket = getCachedRecentMarket(
-                        cardId,
-                        rarity,
-                        HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-                    );
-                    if (cachedDecisionMarket?.ok) {
-                        const cachedDecision = shouldAutoSnipe(a);
-                        if (!cachedDecision?.snipe) {
-                            hunterHeadlessStats.preanalysisRejected++;
-                            continue;
-                        }
-                    }
-
-                    // Pour une carte encore intéressante, rafraîchit à <=5 s AVANT de la
-                    // transmettre à la file de mise. C'est la partie lourde, faite ici en amont.
-                    const recent = await ensureFreshRecentMarket(
-                        cardId,
-                        rarity,
-                        Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
-                    );
-
-                    if (!recent?.ok) {
-                        hunterHeadlessStats.prewarmError++;
-                        continue;
-                    }
-
-                    hunterHeadlessStats.prewarmDone++;
-                    queuePreparedHunterAction(a);
-                } catch (e) {
-                    hunterHeadlessStats.prewarmError++;
-                    console.warn('[WikiMasters][hunter-headless] preanalysis error:', e);
-                } finally {
-                    hunterHeadlessPrewarmQueuedIds.delete(a.id);
-                    hunterHeadlessPrewarmPending = Math.max(0, hunterHeadlessPrewarmPending - 1);
-                }
-            }
-        } finally {
-            hunterHeadlessPrewarmWorkersActive = Math.max(0, hunterHeadlessPrewarmWorkersActive - 1);
-            pumpHunterPreanalysisWorkers();
-        }
-    }
-
-    function pumpHunterPreanalysisWorkers() {
-        if (!hunterHeadlessWanted()) return;
-        while (
-            hunterHeadlessPrewarmWorkersActive < HUNTER_HEADLESS_PREANALYSIS_WORKERS &&
-            hunterHeadlessPrewarmQueue.length > 0
-        ) {
-            runHunterPreanalysisWorker().catch(e => {
-                hunterHeadlessStats.prewarmError++;
-                console.warn('[WikiMasters][hunter-headless] preanalysis worker error:', e);
-            });
-        }
-    }
-
-    function queueHunterPrewarmCandidates(list) {
-        if (!hunterHeadlessWanted() || !Array.isArray(list) || list.length === 0) return 0;
-
-        let queued = 0;
-
-        for (const a of list) {
-            if (!a?.id) continue;
-            if (hunterHeadlessPrewarmQueuedIds.has(a.id) || hunterHeadlessPageQueuedIds.has(a.id)) continue;
-            if (!hunterHeadlessFastCandidateAllowed(a)) continue;
-
-            const remaining = automaticBidRemainingMs(a);
-            if (!Number.isFinite(remaining) ||
-                remaining <= hunterLagFirstPostRunwayMs() ||
-                remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
-                continue;
-            }
-
-            const cardId = a.card?.id ?? a.card_id;
-            const rarity = globalAuctionRarity(a);
-            if (!cardId || !rarity) continue;
-
-            // Si l'historique est déjà ultra-frais, on peut tenter un POST même dans la
-            // zone "single-shot" où il n'y a plus assez de marge pour garantir un retry.
-            const freshForBid = getCachedRecentMarket(
-                cardId,
-                rarity,
-                Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
-            );
-            if (freshForBid?.ok) {
-                queuePreparedHunterAction(a);
-                continue;
-            }
-
-            // Pas de cache ultra-frais : une NOUVELLE préanalyse réseau n'est lancée
-            // que s'il reste la marge complète POST + retry.
-            if (remaining <= hunterLagInitialRunwayMs()) {
-                continue;
-            }
-
-            // Un cache <=60 s permet au moins d'éliminer immédiatement les cartes dont
-            // la décision économique est déjà négative, sans refresh inutile.
-            const cachedDecisionMarket = getCachedRecentMarket(
-                cardId,
-                rarity,
-                HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-            );
-            if (cachedDecisionMarket?.ok && !shouldAutoSnipe(a)?.snipe) {
-                hunterHeadlessStats.preanalysisRejected++;
-                continue;
-            }
-
-            hunterHeadlessPrewarmQueuedIds.add(a.id);
-            hunterHeadlessPrewarmQueue.push(a);
-            hunterHeadlessPrewarmPending++;
-            hunterHeadlessStats.prewarmQueued++;
-            queued++;
-        }
-
-        pumpHunterPreanalysisWorkers();
-        return queued;
-    }
-
-    function hunterPageActionPriority(a, b) {
-        const ar = automaticBidRemainingMs(a);
-        const br = automaticBidRemainingMs(b);
-        const firstPost = hunterLagFirstPostRunwayMs();
-        const full = hunterLagInitialRunwayMs();
-
-        const rank = remaining => {
-            if (!Number.isFinite(remaining) || remaining <= firstPost) return 4;
-
-            // Une carte DÉJÀ prévalidée qui a perdu sa marge de retry passe devant :
-            // c'est maintenant ou jamais pour sauver le premier POST.
-            if (remaining <= full) return 0;
-
-            // Puis la zone idéale.
-            if (remaining <= 60_000) return 1;
-
-            // Puis le confortable 60-90 s.
-            if (remaining <= AUTOMATIC_BID_MAX_REMAINING_MS) return 2;
-
-            return 3;
-        };
-
-        const aRank = rank(ar);
-        const bRank = rank(br);
-        if (aRank !== bRank) return aRank - bRank;
-
-        // Dans la même zone : échéance la plus proche d'abord.
-        return ar - br;
-    }
-
-
-    async function runHunterPageActionQueue() {
-        if (hunterHeadlessPageWorkerRunning) return;
-        hunterHeadlessPageWorkerRunning = true;
-
-        try {
-            while (hunterHeadlessWanted() && hunterHeadlessPageActionQueue.length > 0) {
-                hunterHeadlessPageActionQueue.sort(hunterPageActionPriority);
-
-                const batch = [];
-                while (hunterHeadlessPageActionQueue.length > 0 && batch.length < HUNTER_HEADLESS_ACTION_BATCH_SIZE) {
-                    const a = hunterHeadlessPageActionQueue.shift();
-                    if (!a?.id) continue;
-
-                    const remaining = automaticBidRemainingMs(a);
-                    if (!Number.isFinite(remaining) || remaining <= 0 || remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
-                        hunterHeadlessPageQueuedIds.delete(a.id);
-                        hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - 1);
-                        continue;
-                    }
-
-                    // v3.8.1-LAG-MAX2 : une carte déjà prévalidée n'a besoin que de la
-                    // marge pour UN premier POST. La marge complète reste utilisée en amont
-                    // pour décider si ça vaut encore le coup de lancer une préanalyse lourde.
-                    if (remaining <= hunterLagFirstPostRunwayMs()) {
-                        hunterHeadlessStats.actionTooLate++;
-                        hunterHeadlessPageQueuedIds.delete(a.id);
-                        hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - 1);
-                        continue;
-                    }
-
-                    batch.push(a);
-                }
-
-                if (batch.length === 0) continue;
-
-                try {
-                    await runHunterAutoBidPass(batch);
-                } catch (e) {
-                    hunterHeadlessStats.lastPageActionError = String(e?.message || e || 'erreur');
-                    console.warn('[WikiMasters][hunter-headless] page action error:', e);
-                } finally {
-                    for (const a of batch) {
-                        if (a?.id) hunterHeadlessPageQueuedIds.delete(a.id);
-                    }
-                    hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - batch.length);
-                }
-            }
-        } finally {
-            hunterHeadlessPageWorkerRunning = false;
-            if (hunterHeadlessWanted() && hunterHeadlessPageActionQueue.length > 0) {
-                setTimeout(() => runHunterPageActionQueue().catch(() => { }), 0);
-            }
-        }
     }
 
     function seedTrackedAuctionsForHotLane(auctions) {
@@ -15146,6 +14719,42 @@
         return seeded;
     }
 
+    function hunterHeadlessCriticalHotLaneRemainingMs() {
+        if (!hotLaneActive || activeHitsMap.size === 0) return null;
+
+        let minRemaining = Infinity;
+        for (const [id, hit] of activeHitsMap.entries()) {
+            if (
+                !myBidsSet.has(id) &&
+                !autoBidSet.has(id) &&
+                !snipeSet.has(id)
+            ) {
+                continue;
+            }
+
+            const endAt =
+                hit?.auction?.end_at ||
+                hit?.endAt;
+            if (!endAt) continue;
+
+            const remaining =
+                new Date(endAt).getTime() -
+                serverNow();
+
+            if (
+                Number.isFinite(remaining) &&
+                remaining > -MARKET_TIMER_SYNC_GRACE_MS &&
+                remaining <= HUNTER_HEADLESS_HOTLANE_PRIORITY_MS
+            ) {
+                minRemaining = Math.min(minRemaining, remaining);
+            }
+        }
+
+        return Number.isFinite(minRemaining)
+            ? minRemaining
+            : null;
+    }
+
     async function checkHunterHeadlessMarketplace() {
         if (!hunterHeadlessWanted()) return;
 
@@ -15163,41 +14772,8 @@
         // Le solde conditionne les décisions de mise.
         await fetchBalance();
 
-        const seenCandidateIds = new Set();
-        let streamedCandidates = 0;
-
-        const processPageBatch = (batch) => {
-            if (!Array.isArray(batch) || batch.length === 0) return;
-
-            // Même protection self-bid, mais appliquée immédiatement sur la page reçue.
-            batch.forEach(a => {
-                if (iAmLeading(a)) {
-                    trackMyBid(a.id);
-                    rememberMyLeadingBid(
-                        a,
-                        a.current_bid ?? a.base_amount
-                    );
-                }
-            });
-
-            const candidates = getHunterDynamicCandidatePool(batch)
-                .filter(a => {
-                    if (!a?.id || seenCandidateIds.has(a.id)) return false;
-                    seenCandidateIds.add(a.id);
-                    return true;
-                });
-
-            streamedCandidates += candidates.length;
-            // beta7 : toute carte T<=1m30 passe d'abord par la pré-analyse Recent Market.
-            // Seules les candidates économiquement validées rejoignent ensuite la file de POST.
-            queueHunterPrewarmCandidates(candidates);
-        };
-
         const result =
-            await fetchHunterActionWindowAuctions(
-                null,
-                processPageBatch
-            );
+            await fetchHunterActionWindowAuctions();
 
         const auctions =
             Array.isArray(result?.auctions)
@@ -15210,12 +14786,28 @@
 
         apiHealth.lastMarketScanTs = Date.now();
 
+        // Sécurité anti auto-surenchère identique au scan complet.
+        auctions.forEach(a => {
+            if (iAmLeading(a)) {
+                trackMyBid(a.id);
+                rememberMyLeadingBid(
+                    a,
+                    a.current_bid ?? a.base_amount
+                );
+            }
+        });
+
+        const hunterCandidates =
+            getHunterDynamicCandidatePool(auctions);
+
         hunterHeadlessStats.lastPagesScanned =
             Number(result?.pagesScanned || 0);
         hunterHeadlessStats.lastAuctionsInWindow =
             auctions.length;
         hunterHeadlessStats.lastCandidates =
-            streamedCandidates;
+            hunterCandidates.length;
+        hunterHeadlessStats.lastPageCapReached =
+            result?.pageCapReached === true;
         hunterHeadlessStats.lastReportedTotal =
             Number.isFinite(Number(result?.total)) ? Number(result.total) : null;
         hunterHeadlessStats.lastTotalReliable =
@@ -15235,9 +14827,11 @@
             hunterHeadlessStats.pageCapStops++;
         }
 
-        // Important : on N'ATTEND PAS hunterHeadlessPageActionChain ici.
-        // Le scan se termine dès que la pagination se termine ; les candidats des premières
-        // pages ont déjà commencé leur analyse pendant que les pages suivantes arrivent.
+        if (hunterCandidates.length > 0) {
+            await runHunterAutoBidPass(
+                hunterCandidates
+            );
+        }
 
         // Important pour le mode Fourbe et les enchères déjà engagées :
         // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
@@ -15263,6 +14857,25 @@
         }
 
         hunterHeadlessActive = true;
+
+        // v3.7.1 stable : une enchère déjà engagée à <=20 s est plus importante qu'un
+        // nouveau scan de découverte. On reporte simplement le scan de 1,5 s ; la Hot Lane
+        // continue pendant ce temps avec sa synchro serveur rapide.
+        const criticalRemaining =
+            hunterHeadlessCriticalHotLaneRemainingMs();
+
+        if (criticalRemaining != null) {
+            hunterHeadlessStats.hotLanePrioritySkips++;
+            hunterHeadlessStats.lastStopReason =
+                `priorité Hot Lane T-${Math.max(0, criticalRemaining / 1000).toFixed(1)}s`;
+
+            hunterHeadlessTimeout = setTimeout(
+                runHunterHeadlessLoop,
+                MARKET_MIN_GAP_MS
+            );
+            return;
+        }
+
         hunterHeadlessScanInProgress = true;
         const startedAt = Date.now();
 
@@ -15315,8 +14928,10 @@
 
             if (!silent) {
                 wmLog(
-                    `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `scan streaming ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST prioritaire/sérialisé · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · marge p95 réseau · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `⚡ Hunter autonome v3.8.0 stable-prod démarré · ` +
+                    `scan court ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages ending_soon · ` +
+                    `fenêtre T-2m00 · mises autorisées à T-1m30 · Hot Lane prioritaire ≤20s · ` +
+                    `Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -15365,38 +14980,13 @@
     window.wmHunterEngineDiag = function () {
         const result = {
             version: WM_VERSION,
-            profil: 'lag-max2',
+            profil: 'stable-prod',
             hunterOn: autoSnipeEnabled,
             mode: getSetting('autoSnipeMode'),
             source: hunterDynamicSource,
             marketWatcherOn: marketWatcherActive,
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
-            traitementPageParPage: true,
-            maxPagesParScan: HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
-            arretsLimitePages: hunterHeadlessStats.pageCapStops,
-            analysesPageEnFile: hunterHeadlessPagePending,
-            idsAnalysePageEnFile: hunterHeadlessPageQueuedIds.size,
-            workerAnalyseActif: hunterHeadlessPageWorkerRunning,
-            preanalysesEnFile: hunterHeadlessPrewarmPending,
-            workersPreanalyseActifs: hunterHeadlessPrewarmWorkersActive,
-            workersPreanalyseMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
-            preanalysesLancees: hunterHeadlessStats.prewarmQueued,
-            preanalysesTerminees: hunterHeadlessStats.prewarmDone,
-            candidatsPrevalides: hunterHeadlessStats.prevalidated,
-            rejetsApresPreanalyse: hunterHeadlessStats.preanalysisRejected,
-            abandonsPendantPreanalyse: hunterHeadlessStats.preanalysisTooLate,
-            erreursPreanalyse: hunterHeadlessStats.prewarmError,
-            abandonsTropTardInitial: hunterHeadlessStats.actionTooLate,
-            seuilPreanalyseConfortMs: hunterLagInitialRunwayMs(),
-            seuilPremierPostHunterMs: hunterLagFirstPostRunwayMs(),
-            seuilRetryHunterMs: hunterLagRetryRunwayMs(),
-            postHunterP95Ms: hunterLagPostP95Ms(),
-            postsHunterEnVol: hunterLagPostInFlight,
-            maxPostsHunterParCandidat: HUNTER_MAX_POSTS_PER_CANDIDATE,
-            prioritePreanalyse: '20-60s > 60-90s > runway-20s',
-            prioriteHunter: '20-60s > 60-90s > runway-20s',
-            erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,
             hotLaneOn: hotLaneActive,
             serveurSynchronise: serverClockSynced,
             decalageServeurMs: Math.round(serverClockOffset),
@@ -15415,31 +15005,47 @@
                 hunterHeadlessStats.lastDurationMs,
             pagesDernierScan:
                 hunterHeadlessStats.lastPagesScanned,
+            maxPagesParScan:
+                HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
+            arretsLimitePages:
+                hunterHeadlessStats.pageCapStops,
+            dernierArretLimitePages:
+                hunterHeadlessStats.lastPageCapReached,
             totalMarketplaceDernierScan:
-                hunterHeadlessStats.lastReportedTotal,
+                hunterHeadlessStats.lastReportedTotal ?? null,
             totalMarketplaceFiable:
-                hunterHeadlessStats.lastTotalReliable,
+                hunterHeadlessStats.lastTotalReliable ?? null,
             premierePagePleine:
-                hunterHeadlessStats.lastFirstPageFull,
+                hunterHeadlessStats.lastFirstPageFull ?? null,
+            skipsPrioriteHotLane:
+                hunterHeadlessStats.hotLanePrioritySkips,
             raisonArretDernierScan:
                 hunterHeadlessStats.lastStopReason || null,
             annoncesFenetre:
                 hunterHeadlessStats.lastAuctionsInWindow,
             candidatesHunter:
                 hunterHeadlessStats.lastCandidates,
-            sessionMiseDepuis:
-                new Date(hunterBidDiagStats.sessionStartedAt).toLocaleTimeString('fr-FR'),
-            postsHunterSession: hunterBidDiagStats.postsAttempted,
-            postsHunterReussisSession: hunterBidDiagStats.postsSucceeded,
-            postsHunterTropBasSession: hunterBidDiagStats.postsTooLow,
-            postsHunterTerminesSession: hunterBidDiagStats.postsEnded,
-            postsHunterAutresEchecsSession: hunterBidDiagStats.postsOtherFailed,
-            retriesHunterSession: hunterBidDiagStats.retriesAttempted,
-            retriesAbandonnesTropTard: hunterBidDiagStats.retriesTooLate,
-            erreursReseauHunterSession: hunterBidDiagStats.networkErrors,
-            dernierPostHunter: hunterBidDiagStats.lastPost
-                ? { ...hunterBidDiagStats.lastPost }
-                : null,
+            hunterPassesSession:
+                hunterDecisionStats.passes,
+            candidatsVusSession:
+                hunterDecisionStats.candidatesSeen,
+            candidatsUniquesSession:
+                hunterDecisionStats.candidatesUnique.size,
+            eligiblesSnapshotSession:
+                hunterDecisionStats.snapshotEligible,
+            postsHunterSession:
+                hunterDecisionStats.postAttempts,
+            postsHunterAcceptesSession:
+                hunterDecisionStats.postAccepted,
+            postsHunterEchouesSession:
+                hunterDecisionStats.postFailed,
+            retriesMiseTropBasseSession:
+                hunterDecisionStats.postRetriesTooLow,
+            rejetsHunterSession: {
+                ...hunterDecisionStats.rejected
+            },
+            derniersRejetsHunter:
+                hunterDecisionStats.lastDecisionRejects.slice(),
             mesMises: myBidsSet.size,
             autoBidArmes: autoBidSet.size,
             fourbesArmes: snipeSet.size,
@@ -17262,6 +16868,8 @@
         }
 
         if (!tile) {
+            // Diagnostic ciblé : distingue "la carte n'est vraiment pas possédée" de
+            // "l'API la voit mais le DOM Collection la masque / la rend autrement".
             let apiMatch = null;
             try {
                 const owned = await fetchFlipOwnedCollectionSnapshot(true);
