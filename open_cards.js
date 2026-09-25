@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.10-LAG-DB-SNAPSHOT';
+    const WM_VERSION = '3.8.11-LAG-DB-SNAPSHOT';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -4172,6 +4172,8 @@
                 no_search_input: 'barre de recherche collection introuvable',
                 no_sell_button: 'bouton "Mettre aux enchères" introuvable',
                 card_click_did_not_open: 'carte visible mais fiche Collection non ouverte après clic',
+                ui_listing_card_mismatch: 'vente UI annulée : le serveur a créé une annonce pour une autre carte/rareté',
+                ui_listing_wrong_instance: 'vente UI annulée : l’exemplaire Flip ciblé est encore dans la collection',
                 no_launch_button: 'bouton "Lancer l’enchère" introuvable',
                 no_auction_modal_controls: 'formulaire de mise en vente non chargé',
                 price_not_applied: 'prix calculé non appliqué au formulaire — vente annulée',
@@ -12328,7 +12330,7 @@
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
     const AUTOBID_RESPONSE_DELAY_MIN_MS = 1217;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2987;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2978;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -16753,6 +16755,83 @@
         return token.test(String(tile?.textContent || '').toUpperCase());
     }
 
+    function collectionTileHasExactTitle(tile, title) {
+        const wanted = normalizeCollectionMatchText(title);
+        if (!tile || !wanted) return false;
+
+        if (normalizeCollectionMatchText(tile.textContent) === wanted) {
+            return true;
+        }
+
+        const titleNodes = tile.querySelectorAll?.(
+            'span,p,h1,h2,h3,h4,h5,h6,[data-title],[title]'
+        ) || [];
+
+        for (const el of titleNodes) {
+            if (!collectionElementVisible(el)) continue;
+
+            const visibleText = normalizeCollectionMatchText(el.textContent);
+            if (visibleText === wanted) return true;
+
+            const dataTitle = normalizeCollectionMatchText(
+                el.getAttribute?.('data-title') || ''
+            );
+            if (dataTitle === wanted) return true;
+
+            const attrTitle = normalizeCollectionMatchText(
+                el.getAttribute?.('title') || ''
+            );
+            if (attrTitle === wanted) return true;
+        }
+
+        return false;
+    }
+
+    function collectionTileStrictMatch(
+        tile,
+        title,
+        rarity,
+        userCardId = null,
+        variantFilterConfirmed = false,
+        cardId = null
+    ) {
+        if (!tile || !collectionPlausibleCardBox(tile)) return false;
+
+        const wantedUserCardId = String(userCardId || '').trim();
+        const wantedCardId = String(cardId || '').trim();
+        const rr = normalizeRarityCode(rarity);
+
+        const exactUser =
+            !!wantedUserCardId &&
+            collectionTileHasExactId(tile, wantedUserCardId, 'user');
+
+        const exactCard =
+            !!wantedCardId &&
+            collectionTileHasExactId(tile, wantedCardId, 'card');
+
+        const exactTitle =
+            collectionTileHasExactTitle(tile, title);
+
+        // Jamais de substring du type "Suède" -> "Condition des femmes en Suède".
+        // Sans identité serveur exacte, le titre affiché doit être EXACT.
+        if (!exactUser && !exactCard && !exactTitle) {
+            return false;
+        }
+
+        // Un user_card_id exact identifie l'exemplaire lui-même.
+        // Sinon, hors filtre natif de rareté confirmé, la tuile doit afficher la bonne rareté.
+        if (
+            rr &&
+            !exactUser &&
+            !variantFilterConfirmed &&
+            !collectionTileRarityMatches(tile, rr)
+        ) {
+            return false;
+        }
+
+        return true;
+    }
+
     function collectionElementVisible(el) {
         if (!el || !el.isConnected) return false;
         const rect = el.getBoundingClientRect?.();
@@ -16796,12 +16875,12 @@
         for (const el of document.querySelectorAll('span,p,h1,h2,h3,h4,h5,h6,div')) {
             if (!collectionElementVisible(el)) continue;
             const own = normalizeCollectionMatchText(el.textContent);
-            if (!own || !own.includes(wanted)) continue;
+            if (!own || own !== wanted) continue;
 
-            // Préfère les nœuds dont un enfant direct ne contient pas déjà tout le titre :
-            // ça évite de partir du wrapper géant de la grille.
+            // Ici le titre doit être EXACT : une recherche "Suède" ne doit jamais
+            // sélectionner "Condition des femmes en Suède".
             const childContains = [...el.children].some(ch =>
-                normalizeCollectionMatchText(ch.textContent).includes(wanted)
+                normalizeCollectionMatchText(ch.textContent) === wanted
             );
             if (!childContains || el.children.length === 0) out.push(el);
         }
@@ -16824,11 +16903,21 @@
 
         const add = (el, baseScore = 0) => {
             if (!el || seen.has(el) || !collectionPlausibleCardBox(el)) return;
-            const txt = normalizeCollectionMatchText(el.textContent);
-            if (!txt || !txt.includes(wantedTitleNorm)) return;
+
+            if (!collectionTileStrictMatch(
+                el,
+                title,
+                rr,
+                wantedUserCardId,
+                variantFilterConfirmed,
+                wantedCardId
+            )) {
+                return;
+            }
 
             let score = baseScore;
             if (collectionElementHasCardMedia(el)) score += 150;
+            if (collectionTileHasExactTitle(el, title)) score += 500;
             if (collectionTileRarityMatches(el, rr)) score += 80;
             if (/\bVENTE\b/i.test(String(el.textContent || ''))) score += 45;
 
@@ -16929,6 +17018,17 @@
             const tile = ordered[i];
             if (!collectionElementVisible(tile)) continue;
 
+            if (!collectionTileStrictMatch(
+                tile,
+                title,
+                rarity,
+                userCardId,
+                variantFilterConfirmed,
+                cardId
+            )) {
+                continue;
+            }
+
             // Clic sur le texte du titre en priorité : le click bubble vers le composant React
             // sans risquer de toucher l'étoile/favori de la carte.
             const wanted = normalizeCollectionMatchText(title);
@@ -16994,6 +17094,10 @@
                 ? candidates.find(el => collectionTileHasExactId(el, wantedUser, 'user'))
                 : null;
             if (exact) return exact;
+
+            // Commentaire historique enfin respecté : sans exemplaire exact ni filtre
+            // L/L+ confirmé, plusieurs tuiles = choix ambigu => aucun clic.
+            return null;
         }
 
         return candidates[0];
@@ -17937,11 +18041,71 @@
         let actualPrice = requestedPrice;
         let actualDurationMin = requestedDuration;
         let anomaly = null;
+        let verifiedCreatedRow = null;
 
         // Contrôle serveur après création quand l'auction_id est disponible.
         if (createdAuctionId) {
             const row = await fetchCreatedAuctionForVerification(createdAuctionId);
+            verifiedCreatedRow = row || null;
+
             if (row) {
+                const serverCardId =
+                    row.card_id ||
+                    row.card?.id ||
+                    null;
+
+                const serverRarity =
+                    normalizeRarityCode(
+                        row.snapshot_rarity ||
+                        row.card?.rarity ||
+                        row.rarity ||
+                        ''
+                    );
+
+                const expectedCardId =
+                    String(cardId || '').trim();
+
+                const expectedRarity =
+                    normalizeRarityCode(normalizedSellRarity || rarity);
+
+                const cardMismatch =
+                    !!expectedCardId &&
+                    !!serverCardId &&
+                    String(serverCardId) !== expectedCardId;
+
+                const rarityMismatch =
+                    !!expectedRarity &&
+                    !!serverRarity &&
+                    serverRarity !== expectedRarity;
+
+                if (cardMismatch || rarityMismatch) {
+                    wmLog(
+                        `🚨 Flip Seller : MAUVAISE CARTE créée pour <b>${title}</b> [${expectedRarity || '?'}] · ` +
+                        `serveur=${row.card?.wikipedia_title || '?'} [${serverRarity || '?'}] · ` +
+                        `annulation immédiate de ${String(createdAuctionId).slice(0, 8)}…`
+                    );
+
+                    await cancelSale(
+                        createdAuctionId,
+                        row.card?.wikipedia_title || title,
+                        row.end_at || null
+                    ).catch(() => null);
+
+                    invalidateFlipOwnedCollectionSnapshot();
+
+                    await ensureOnCollectionPage();
+
+                    return {
+                        ok: false,
+                        reason: 'ui_listing_card_mismatch',
+                        auctionId: createdAuctionId,
+                        expectedCardId: expectedCardId || null,
+                        actualCardId: serverCardId || null,
+                        expectedRarity: expectedRarity || null,
+                        actualRarity: serverRarity || null
+                    };
+                }
+
                 const serverPrice = Number(
                     row.listing_base_amount ?? row.base_amount
                 );
@@ -17973,6 +18137,40 @@
             }
         }
 
+        // Si l'auction créée n'a pas pu être relue, l'exemplaire précis sert de deuxième
+        // source de vérité. La bonne vente doit avoir retiré CE user_card_id de la collection.
+        if (!verifiedCreatedRow && userCardId) {
+            await new Promise(r => setTimeout(r, 1200));
+            invalidateFlipOwnedCollectionSnapshot();
+
+            const stillOwned =
+                await verifyOwnedFlipUserCardId(userCardId).catch(() => null);
+
+            if (stillOwned?.id) {
+                if (createdAuctionId) {
+                    await cancelSale(
+                        createdAuctionId,
+                        title,
+                        null
+                    ).catch(() => null);
+                    invalidateFlipOwnedCollectionSnapshot();
+                }
+
+                wmLog(
+                    `🚨 Flip Seller : vente UI refusée pour <b>${title}</b> — ` +
+                    `l'exemplaire ciblé ${String(userCardId).slice(0, 8)}… est toujours possédé.`
+                );
+
+                await ensureOnCollectionPage();
+
+                return {
+                    ok: false,
+                    reason: 'ui_listing_wrong_instance',
+                    auctionId: createdAuctionId || null
+                };
+            }
+        }
+
         await ensureOnCollectionPage();
 
         const nextSearchInput = document.querySelector(
@@ -17987,7 +18185,8 @@
             actualDurationMin,
             anomaly,
             requestedPrice,
-            requestedDuration
+            requestedDuration,
+            via: 'ui_strict_verified'
         };
     }
 
