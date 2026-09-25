@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.8-LAG-MAX2';
+    const WM_VERSION = '3.8.9-LAG-QUEUE';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -33,9 +33,12 @@
     const MARKET_COUNTDOWN_TICK_MS = 100;          // affichage uniquement ; aucun impact sur le moteur
     // v3.2.0 — Hunter autonome : quand le Market Watcher visuel est OFF, le Hunter
     // Trend-Aware garde son propre scan léger de la zone où une mise est réellement autorisée.
-    const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // lit jusqu'à T-2m00 : fenêtre 1m30 + 30 s de marge de scan
-    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;     // 3 pages en parallèle, comme la base 3.6.23
-    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 8;    // scan court : au plus 8 pages ending_soon par cycle (~400 enchères)
+    const HUNTER_HEADLESS_MARGIN_MS = 30_000;       // compat : 90 s d'action + 30 s = horizon découverte 2 min
+    const HUNTER_DISCOVERY_MAX_REMAINING_MS = 120_000; // snapshot : T<=2m00, même si la mise reste interdite avant T<=1m30
+    const HUNTER_HEADLESS_PAGE_CONCURRENCY = 3;      // GET marketplace parallèles, POST Hunter toujours sérialisés
+    const HUNTER_HEADLESS_MAX_PAGES_PER_SCAN = 40;  // garde-fou seulement : on cherche normalement la frontière T>2m
+    const HUNTER_HEADLESS_CYCLE_GAP_MS = 2_500;      // souffle après file entièrement traitée avant nouveau snapshot
+    const HUNTER_HEADLESS_DRAIN_POLL_MS = 100;
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -10639,13 +10642,11 @@
 
     // Fetch léger du Hunter autonome.
     //
-    // La marketplace est triée "ending_soon". Comme AUCUNE mise automatique n'est
-    // autorisée avant T-1m30, il est inutile de télécharger les dizaines/centaines
-    // de pages situées bien après cette fenêtre lorsque le Market Watcher est OFF.
-    //
-    // On garde 30 s de marge pour la découverte, MAIS on ne parcourt plus des dizaines
-    // de pages : au plus 8 pages ending_soon par cycle. Comme le scan repart ~10 s plus
-    // tard, les enchères plus lointaines remonteront naturellement vers ces premières pages.
+    // La marketplace est triée "ending_soon".
+    // v3.8.9 : un cycle doit construire un SNAPSHOT COMPLET de la zone T<=2m00.
+    // On pagine donc jusqu'à rencontrer la vraie frontière T>2m00. Le plafond de pages
+    // n'est plus une limite fonctionnelle à 8 pages mais uniquement un garde-fou extrême.
+    // Les mises restent interdites avant T<=1m30 : 90-120 s sert à préparer l'historique.
     async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
         const first = await fetchMarketPage(1);
         const firstRows = Array.isArray(first?.auctions)
@@ -10671,14 +10672,14 @@
             )
             : HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
 
-        const cutoff =
-            AUTOMATIC_BID_MAX_REMAINING_MS +
-            HUNTER_HEADLESS_MARGIN_MS;
+        const cutoff = HUNTER_DISCOVERY_MAX_REMAINING_MS;
 
         const collected = [];
         let pagesScanned = 0;
         let boundaryReached = false;
         let naturalEndReached = false;
+        let duplicatePageReached = false;
+        const seenPageFingerprints = new Set();
 
         const consumePage = (data, pageNo) => {
             const rows = Array.isArray(data?.auctions)
@@ -10687,6 +10688,18 @@
 
             pagesScanned++;
             if (rows.length === 0) naturalEndReached = true;
+
+            if (rows.length > 0) {
+                const firstId = rows[0]?.id || '';
+                const lastId = rows[rows.length - 1]?.id || '';
+                const fingerprint = `${rows.length}|${firstId}|${lastId}`;
+                if (seenPageFingerprints.has(fingerprint)) {
+                    duplicatePageReached = true;
+                    naturalEndReached = true;
+                    return;
+                }
+                seenPageFingerprints.add(fingerprint);
+            }
 
             const pageUseful = [];
             let furthestRemaining = -Infinity;
@@ -10814,6 +10827,7 @@
             boundaryReached,
             naturalEndReached,
             pageCapReached,
+            duplicatePageReached,
             totalLooksReliable,
             firstPageFull: firstRows.length >= MARKET_PAGE_LIMIT,
             firstPageCount: firstRows.length
@@ -12177,8 +12191,8 @@
     // une attente de 4 à 7 secondes avant toute contre-offre, y compris via la hot lane.
     // Ce délai est volontairement séparé de bidDelayMs() : les mises initiales / Fourbe
     // conservent leur timing existant.
-    const AUTOBID_RESPONSE_DELAY_MIN_MS = 300;
-    const AUTOBID_RESPONSE_DELAY_MAX_MS = 700;
+    const AUTOBID_RESPONSE_DELAY_MIN_MS = 1214;
+    const AUTOBID_RESPONSE_DELAY_MAX_MS = 2978;
     function autoBidResponseDelayMs() {
         return AUTOBID_RESPONSE_DELAY_MIN_MS
             + Math.random() * (AUTOBID_RESPONSE_DELAY_MAX_MS - AUTOBID_RESPONSE_DELAY_MIN_MS);
@@ -14822,6 +14836,10 @@
     const hunterHeadlessPrewarmQueuedIds = new Set();
     let hunterHeadlessPrewarmPending = 0;
 
+    // Candidats économiquement prévalidés alors qu'ils sont encore entre T-120s et T-90s.
+    // Ils ne sont pas remisés trop tôt : on les conserve jusqu'à l'ouverture de la fenêtre POST.
+    const hunterHeadlessDeferredPrepared = new Map();
+
     const hunterHeadlessStats = {
         scans: 0,
         lastScanTs: 0,
@@ -14839,6 +14857,13 @@
         preanalysisRejected: 0,
         preanalysisTooLate: 0,
         actionTooLate: 0,
+        deferredPrepared: 0,
+        deferredPromoted: 0,
+        cyclesCompleted: 0,
+        lastSnapshotCandidates: 0,
+        lastQueueDrainMs: 0,
+        lastDiscoveryDurationMs: 0,
+        lastCycleDurationMs: 0,
         lastReportedTotal: null,
         lastTotalReliable: null,
         lastFirstPageFull: null,
@@ -14873,9 +14898,8 @@
         );
     }
 
-    function hunterHeadlessFastCandidateAllowed(a) {
+    function hunterHeadlessCandidateGuardsAllowed(a) {
         if (!a?.id) return false;
-        if (!automaticBidTimeAllowed(a)) return false;
         if (matchedHunterEntry(a.card)) return false;
         if (hasPriorityKeyword(a.card)) return false;
         if (snipeSet.has(a.id) || hasFourbeKeyword(a.card)) return false;
@@ -14886,6 +14910,19 @@
         if (isOwnedDuplicate(a.card?.id ?? a.card_id, rarity)) return false;
         if (hunterDuplicateExposureState(a).blocked) return false;
         return true;
+    }
+
+    function hunterHeadlessDiscoveryCandidateAllowed(a) {
+        if (!hunterHeadlessCandidateGuardsAllowed(a)) return false;
+        const remaining = automaticBidRemainingMs(a);
+        return Number.isFinite(remaining)
+            && remaining > 0
+            && remaining <= HUNTER_DISCOVERY_MAX_REMAINING_MS;
+    }
+
+    function hunterHeadlessFastCandidateAllowed(a) {
+        return hunterHeadlessDiscoveryCandidateAllowed(a)
+            && automaticBidTimeAllowed(a);
     }
 
     function hunterLagPriorityRank(remaining) {
@@ -14948,7 +14985,7 @@
 
     function queuePreparedHunterAction(a) {
         if (!hunterHeadlessWanted() || !a?.id) return false;
-        if (!hunterHeadlessFastCandidateAllowed(a)) return false;
+        if (!hunterHeadlessDiscoveryCandidateAllowed(a)) return false;
 
         const remaining = automaticBidRemainingMs(a);
         if (!Number.isFinite(remaining) || remaining <= hunterLagFirstPostRunwayMs()) {
@@ -14964,12 +15001,19 @@
             return false;
         }
 
-        const queued = queueHunterPageCandidates([a]);
-        if (queued > 0) {
-            hunterHeadlessStats.prevalidated += queued;
+        hunterHeadlessStats.prevalidated++;
+
+        // Entre T-120 et T-90 : opportunité validée, mais aucune mise prématurée.
+        // On la garde prête et on la promouvra automatiquement dès qu'elle entre à T<=90.
+        if (remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
+            const wasNew = !hunterHeadlessDeferredPrepared.has(a.id);
+            hunterHeadlessDeferredPrepared.set(a.id, a);
+            if (wasNew) hunterHeadlessStats.deferredPrepared++;
             return true;
         }
-        return false;
+
+        hunterHeadlessDeferredPrepared.delete(a.id);
+        return queueHunterPageCandidates([a]) > 0;
     }
 
     async function runHunterPreanalysisWorker() {
@@ -14984,14 +15028,14 @@
                     const remaining = automaticBidRemainingMs(a);
                     if (!Number.isFinite(remaining) ||
                         remaining <= hunterLagInitialRunwayMs() ||
-                        remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
+                        remaining > HUNTER_DISCOVERY_MAX_REMAINING_MS) {
                         if (Number.isFinite(remaining) && remaining <= hunterLagInitialRunwayMs()) {
                             hunterHeadlessStats.preanalysisTooLate++;
                         }
                         continue;
                     }
 
-                    if (!hunterHeadlessFastCandidateAllowed(a)) continue;
+                    if (!hunterHeadlessDiscoveryCandidateAllowed(a)) continue;
 
                     const cardId = a.card?.id ?? a.card_id;
                     const rarity = globalAuctionRarity(a);
@@ -15062,12 +15106,17 @@
         for (const a of list) {
             if (!a?.id) continue;
             if (hunterHeadlessPrewarmQueuedIds.has(a.id) || hunterHeadlessPageQueuedIds.has(a.id)) continue;
-            if (!hunterHeadlessFastCandidateAllowed(a)) continue;
+            if (hunterHeadlessDeferredPrepared.has(a.id)) {
+                // Rafraîchit l'objet/end_at avec le snapshot courant sans refaire l'historique.
+                hunterHeadlessDeferredPrepared.set(a.id, a);
+                continue;
+            }
+            if (!hunterHeadlessDiscoveryCandidateAllowed(a)) continue;
 
             const remaining = automaticBidRemainingMs(a);
             if (!Number.isFinite(remaining) ||
                 remaining <= hunterLagFirstPostRunwayMs() ||
-                remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
+                remaining > HUNTER_DISCOVERY_MAX_REMAINING_MS) {
                 continue;
             }
 
@@ -15116,6 +15165,73 @@
         return queued;
     }
 
+    function promoteDeferredPreparedHunterActions() {
+        if (hunterHeadlessDeferredPrepared.size === 0) return 0;
+
+        let promoted = 0;
+        for (const [id, a] of [...hunterHeadlessDeferredPrepared.entries()]) {
+            const remaining = automaticBidRemainingMs(a);
+
+            if (!Number.isFinite(remaining) || remaining <= 0) {
+                hunterHeadlessDeferredPrepared.delete(id);
+                continue;
+            }
+
+            // Extension serveur au-delà de 2 minutes : on rend la carte au prochain snapshot.
+            if (remaining > HUNTER_DISCOVERY_MAX_REMAINING_MS) {
+                hunterHeadlessDeferredPrepared.delete(id);
+                continue;
+            }
+
+            if (remaining > AUTOMATIC_BID_MAX_REMAINING_MS) continue;
+
+            hunterHeadlessDeferredPrepared.delete(id);
+
+            if (remaining <= hunterLagFirstPostRunwayMs()) {
+                hunterHeadlessStats.actionTooLate++;
+                continue;
+            }
+
+            if (!hunterHeadlessFastCandidateAllowed(a)) continue;
+
+            if (queueHunterPageCandidates([a]) > 0) {
+                hunterHeadlessStats.deferredPromoted++;
+                promoted++;
+            }
+        }
+        return promoted;
+    }
+
+    function hunterHeadlessPipelineBusy() {
+        return !!(
+            hunterHeadlessPrewarmPending > 0 ||
+            hunterHeadlessPrewarmQueue.length > 0 ||
+            hunterHeadlessPrewarmWorkersActive > 0 ||
+            hunterHeadlessPagePending > 0 ||
+            hunterHeadlessPageActionQueue.length > 0 ||
+            hunterHeadlessPageWorkerRunning ||
+            hunterLagPostInFlight > 0
+        );
+    }
+
+    async function waitHunterHeadlessPipelineDrained() {
+        const startedAt = Date.now();
+
+        while (hunterHeadlessWanted()) {
+            promoteDeferredPreparedHunterActions();
+
+            if (!hunterHeadlessPipelineBusy()) {
+                hunterHeadlessStats.lastQueueDrainMs = Date.now() - startedAt;
+                return true;
+            }
+
+            await new Promise(r => setTimeout(r, HUNTER_HEADLESS_DRAIN_POLL_MS));
+        }
+
+        hunterHeadlessStats.lastQueueDrainMs = Date.now() - startedAt;
+        return false;
+    }
+
     function hunterPageActionPriority(a, b) {
         const ar = automaticBidRemainingMs(a);
         const br = automaticBidRemainingMs(b);
@@ -15161,9 +15277,18 @@
                     if (!a?.id) continue;
 
                     const remaining = automaticBidRemainingMs(a);
-                    if (!Number.isFinite(remaining) || remaining <= 0 || remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
+                    if (!Number.isFinite(remaining) || remaining <= 0) {
                         hunterHeadlessPageQueuedIds.delete(a.id);
                         hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - 1);
+                        continue;
+                    }
+
+                    if (remaining > AUTOMATIC_BID_MAX_REMAINING_MS) {
+                        hunterHeadlessPageQueuedIds.delete(a.id);
+                        hunterHeadlessPagePending = Math.max(0, hunterHeadlessPagePending - 1);
+                        if (remaining <= HUNTER_DISCOVERY_MAX_REMAINING_MS) {
+                            hunterHeadlessDeferredPrepared.set(a.id, a);
+                        }
                         continue;
                     }
 
@@ -15247,13 +15372,12 @@
         // Le solde conditionne les décisions de mise.
         await fetchBalance();
 
-        const seenCandidateIds = new Set();
-        let streamedCandidates = 0;
+        const snapshotCandidates = new Map();
 
         const processPageBatch = (batch) => {
             if (!Array.isArray(batch) || batch.length === 0) return;
 
-            // Même protection self-bid, mais appliquée immédiatement sur la page reçue.
+            // Protection self-bid dès la lecture, mais AUCUNE préanalyse avant la fin du snapshot.
             batch.forEach(a => {
                 if (iAmLeading(a)) {
                     trackMyBid(a.id);
@@ -15264,17 +15388,11 @@
                 }
             });
 
-            const candidates = getHunterDynamicCandidatePool(batch)
-                .filter(a => {
-                    if (!a?.id || seenCandidateIds.has(a.id)) return false;
-                    seenCandidateIds.add(a.id);
-                    return true;
-                });
-
-            streamedCandidates += candidates.length;
-            // beta7 : toute carte T<=1m30 passe d'abord par la pré-analyse Recent Market.
-            // Seules les candidates économiquement validées rejoignent ensuite la file de POST.
-            queueHunterPrewarmCandidates(candidates);
+            const candidates = getHunterDynamicCandidatePool(batch);
+            for (const a of candidates) {
+                if (!a?.id) continue;
+                snapshotCandidates.set(a.id, a);
+            }
         };
 
         const result =
@@ -15292,6 +15410,25 @@
         // uniquement la fenêtre utile à l'action automatique.
         lastAllMarketAuctions = auctions;
 
+        // Snapshot terminé : seulement MAINTENANT on construit/traite la file.
+        // Les entrées déjà prévalidées à T>90 sont simplement rafraîchies avec leur nouvel end_at.
+        for (const [id, a] of snapshotCandidates.entries()) {
+            if (hunterHeadlessDeferredPrepared.has(id)) {
+                hunterHeadlessDeferredPrepared.set(id, a);
+            }
+        }
+
+        promoteDeferredPreparedHunterActions();
+
+        const toAnalyse = [...snapshotCandidates.values()].filter(a =>
+            !hunterHeadlessDeferredPrepared.has(a.id) &&
+            !hunterHeadlessPrewarmQueuedIds.has(a.id) &&
+            !hunterHeadlessPageQueuedIds.has(a.id)
+        );
+
+        queueHunterPrewarmCandidates(toAnalyse);
+        hunterHeadlessStats.lastSnapshotCandidates = snapshotCandidates.size;
+
         apiHealth.lastMarketScanTs = Date.now();
 
         hunterHeadlessStats.lastPagesScanned =
@@ -15299,7 +15436,7 @@
         hunterHeadlessStats.lastAuctionsInWindow =
             auctions.length;
         hunterHeadlessStats.lastCandidates =
-            streamedCandidates;
+            snapshotCandidates.size;
         hunterHeadlessStats.lastReportedTotal =
             Number.isFinite(Number(result?.total)) ? Number(result.total) : null;
         hunterHeadlessStats.lastTotalReliable =
@@ -15309,19 +15446,20 @@
         hunterHeadlessStats.lastStopReason =
             result?.boundaryReached
                 ? 'frontière T-2m atteinte'
-                : result?.pageCapReached
-                    ? `limite ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages`
-                    : result?.naturalEndReached
-                        ? 'fin marketplace'
-                        : 'scan terminé';
+                : result?.duplicatePageReached
+                    ? 'pagination répétée détectée'
+                    : result?.pageCapReached
+                        ? `garde-fou ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages`
+                        : result?.naturalEndReached
+                            ? 'fin marketplace'
+                            : 'scan terminé';
 
         if (result?.pageCapReached) {
             hunterHeadlessStats.pageCapStops++;
         }
 
-        // Important : on N'ATTEND PAS hunterHeadlessPageActionChain ici.
-        // Le scan se termine dès que la pagination se termine ; les candidats des premières
-        // pages ont déjà commencé leur analyse pendant que les pages suivantes arrivent.
+        // v3.8.9 : aucune génération suivante ne sera scannée avant que les files
+        // préanalyse/action de CE snapshot soient drainées par runHunterHeadlessLoop().
 
         // Important pour le mode Fourbe et les enchères déjà engagées :
         // activeHitsMap doit contenir leur vrai end_at afin que computeHotLaneInterval()
@@ -15348,23 +15486,33 @@
 
         hunterHeadlessActive = true;
         hunterHeadlessScanInProgress = true;
-        const startedAt = Date.now();
+        const cycleStartedAt = Date.now();
 
         try {
+            const discoveryStartedAt = Date.now();
             await checkHunterHeadlessMarketplace();
+            hunterHeadlessStats.lastDiscoveryDurationMs =
+                Date.now() - discoveryStartedAt;
+
+            // Cœur v3.8.9 : snapshot -> file -> traitement COMPLET -> prochain snapshot.
+            await waitHunterHeadlessPipelineDrained();
+
             hunterHeadlessStats.scans++;
+            hunterHeadlessStats.cyclesCompleted++;
             hunterHeadlessStats.lastScanTs = Date.now();
             hunterHeadlessStats.lastError = '';
         } catch (e) {
             hunterHeadlessStats.lastError =
                 String(e?.message || e || 'erreur');
             console.warn(
-                '[WikiMasters][hunter-headless] scan error:',
+                '[WikiMasters][hunter-headless] cycle error:',
                 e
             );
         } finally {
+            hunterHeadlessStats.lastCycleDurationMs =
+                Date.now() - cycleStartedAt;
             hunterHeadlessStats.lastDurationMs =
-                Date.now() - startedAt;
+                hunterHeadlessStats.lastCycleDurationMs;
             hunterHeadlessScanInProgress = false;
         }
 
@@ -15373,15 +15521,9 @@
             return;
         }
 
-        const wait = Math.max(
-            MARKET_MIN_GAP_MS,
-            MARKET_REFRESH_MS -
-            hunterHeadlessStats.lastDurationMs
-        );
-
         hunterHeadlessTimeout = setTimeout(
             runHunterHeadlessLoop,
-            wait
+            Math.max(MARKET_MIN_GAP_MS, HUNTER_HEADLESS_CYCLE_GAP_MS)
         );
     }
 
@@ -15400,7 +15542,7 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `scan streaming ≤${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST prioritaire/sérialisé · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · marge p95 réseau · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    `cycle snapshot complet T≤2m → file → drain → rescan · garde-fou ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} pages · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -15456,10 +15598,14 @@
             marketWatcherOn: marketWatcherActive,
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
-            traitementPageParPage: true,
+            traitementPageParPage: false,
+            modeBoucle: 'snapshot T<=2m -> file -> drain -> rescan',
+            horizonSnapshotMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
+            fenetrePostMs: AUTOMATIC_BID_MAX_REMAINING_MS,
             maxPagesParScan: HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
             arretsLimitePages: hunterHeadlessStats.pageCapStops,
             analysesPageEnFile: hunterHeadlessPagePending,
+            candidatsDifférés90a120s: hunterHeadlessDeferredPrepared.size,
             idsAnalysePageEnFile: hunterHeadlessPageQueuedIds.size,
             workerAnalyseActif: hunterHeadlessPageWorkerRunning,
             preanalysesEnFile: hunterHeadlessPrewarmPending,
@@ -15478,16 +15624,17 @@
             postHunterP95Ms: hunterLagPostP95Ms(),
             postsHunterEnVol: hunterLagPostInFlight,
             maxPostsHunterParCandidat: HUNTER_MAX_POSTS_PER_CANDIDATE,
-            prioritePreanalyse: '20-60s > 60-90s > runway-20s',
-            prioriteHunter: '20-60s > 60-90s > runway-20s',
+            prévalidésDifférésSession: hunterHeadlessStats.deferredPrepared,
+            différésPromusSession: hunterHeadlessStats.deferredPromoted,
+            prioritePreanalyse: '20-60s > 60-90s > 90-120s > runway-20s',
+            prioriteHunter: 'runway-20s > 20-60s > 60-90s',
             erreurAnalysePage: hunterHeadlessStats.lastPageActionError || null,
             hotLaneOn: hotLaneActive,
             serveurSynchronise: serverClockSynced,
             decalageServeurMs: Math.round(serverClockOffset),
-            scanIntervalMs: MARKET_REFRESH_MS,
-            fenetreDecouverteMs:
-                AUTOMATIC_BID_MAX_REMAINING_MS +
-                HUNTER_HEADLESS_MARGIN_MS,
+            scanIntervalMs: null,
+            pauseEntreCyclesMs: HUNTER_HEADLESS_CYCLE_GAP_MS,
+            fenetreDecouverteMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
             hotLaneTimerSyncMs: MARKET_TIMER_SYNC_INTERVAL_MS,
             scansHeadless: hunterHeadlessStats.scans,
             dernierScan:
@@ -15496,7 +15643,15 @@
                         .toLocaleTimeString('fr-FR')
                     : null,
             dureeDernierScanMs:
-                hunterHeadlessStats.lastDurationMs,
+                hunterHeadlessStats.lastDiscoveryDurationMs,
+            dureeTraitementFileMs:
+                hunterHeadlessStats.lastQueueDrainMs,
+            dureeDernierCycleMs:
+                hunterHeadlessStats.lastCycleDurationMs,
+            cyclesComplets:
+                hunterHeadlessStats.cyclesCompleted,
+            candidatsSnapshot:
+                hunterHeadlessStats.lastSnapshotCandidates,
             pagesDernierScan:
                 hunterHeadlessStats.lastPagesScanned,
             totalMarketplaceDernierScan:
