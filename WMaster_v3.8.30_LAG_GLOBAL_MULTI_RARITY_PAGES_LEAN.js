@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.28-LAG-PAGES-CLASSIC-FLIP-LEAN-INCREMENTAL-COVERAGE';
+    const WM_VERSION = '3.8.30-LAG-GLOBAL-MULTI-RARITY-PAGES-LEAN';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -10576,9 +10576,20 @@
 
     /* ===================== MARKET API ===================== */
 
-    // Fetch une page de la marketplace
-    async function fetchMarketPage(page) {
-        const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}&sort=ending_soon`;
+    // Fetch une page de la marketplace.
+    // v3.8.30 : `rarity` peut être une valeur OU un tableau.
+    // Plusieurs raretés utilisent le format natif :
+    // ...&rarity=L&rarity=UR
+    async function fetchMarketPage(page, rarity = null) {
+        const rarityList = Array.isArray(rarity)
+            ? rarity
+            : (rarity ? [rarity] : []);
+        const rarityParam = rarityList
+            .map(r => String(r || '').trim())
+            .filter(Boolean)
+            .map(r => `&rarity=${encodeURIComponent(r)}`)
+            .join('');
+        const url = `${MARKET_API_BASE}?page=${page}&limit=${MARKET_PAGE_LIMIT}&sort=ending_soon${rarityParam}`;
         const t0 = Date.now();
         const res = await fetch(url, { credentials: "include" });
         syncServerClockFromResponse(res, t0);
@@ -11288,7 +11299,266 @@
         };
     }
 
+
+    // v3.8.30 — source Hunter "global" :
+    // une seule pagination marketplace filtrée par TOUTES les raretés sélectionnées.
+    // Exemple : ?page=1&limit=50&sort=ending_soon&rarity=L&rarity=UR
+    //
+    // C'est plus fidèle au comportement de la marketplace et beaucoup plus léger que
+    // de scanner chaque rareté séparément. L+ partage toujours le filtre API L ;
+    // la distinction shiny/non-shiny reste faite ensuite par globalSearchMatchesAuction().
+    function hunterGlobalSelectedRarities() {
+        return [...GLOBAL_SEARCH_RARITIES]
+            .map(r => String(r || '').trim().toUpperCase())
+            .filter(r => GLOBAL_SEARCH_RARITY_CODES.includes(r));
+    }
+
+    function hunterGlobalApiRarities() {
+        const out = [];
+        const seen = new Set();
+        for (const r of hunterGlobalSelectedRarities()) {
+            const apiRarity = r === 'L+' ? 'L' : r;
+            if (!apiRarity || seen.has(apiRarity)) continue;
+            seen.add(apiRarity);
+            out.push(apiRarity);
+        }
+        return out;
+    }
+
+    function hunterGlobalRarityQueryLabel() {
+        return hunterGlobalApiRarities()
+            .map(r => `rarity=${r}`)
+            .join('&');
+    }
+
+    async function fetchHunterActionWindowAuctionsGlobalRarityPages(onProgress, onBatch) {
+        const cutoff = HUNTER_DISCOVERY_MAX_REMAINING_MS;
+        const selectedRarities = hunterGlobalSelectedRarities();
+        const apiRarities = hunterGlobalApiRarities();
+
+        if (apiRarities.length === 0) {
+            return {
+                auctions: [],
+                source: 'marketplace-pages-rarity-multi-filtered',
+                scanMode: 'global-multi-rarity-pages',
+                total: 0,
+                totalPages: null,
+                pagesScanned: 0,
+                cutoffMs: cutoff,
+                boundaryReached: true,
+                boundaryPage: null,
+                naturalEndReached: true,
+                pageCapReached: false,
+                duplicatePageReached: false,
+                totalLooksReliable: false,
+                firstPageFull: false,
+                firstPageCount: 0,
+                pagesSavedApprox: 0,
+                selectedRarities,
+                apiRarities,
+                rarityQuery: '',
+                combinedFilteredPages: 0,
+                cacheSize: 0
+            };
+        }
+
+        const collected = [];
+        const collectedIds = new Set();
+        const seenPageFingerprints = new Set();
+
+        let pagesScanned = 0;
+        let lastConsumedPageNo = 0;
+        let boundaryReached = false;
+        let naturalEndReached = false;
+        let duplicatePageReached = false;
+        let firstPageCount = null;
+        let firstPageFull = null;
+        let rawTotal = null;
+        let reportedTotalPages = null;
+        let totalLooksReliable = false;
+
+        const consumePage = (data, pageNo) => {
+            const rows = Array.isArray(data?.auctions) ? data.auctions : [];
+
+            pagesScanned++;
+            lastConsumedPageNo = Math.max(lastConsumedPageNo, Number(pageNo) || 0);
+
+            if (pageNo === 1) {
+                firstPageCount = rows.length;
+                firstPageFull = rows.length >= MARKET_PAGE_LIMIT;
+
+                rawTotal = Number(data?.total);
+                totalLooksReliable =
+                    Number.isFinite(rawTotal) &&
+                    rawTotal > rows.length;
+                reportedTotalPages =
+                    totalLooksReliable
+                        ? Math.max(1, Math.ceil(rawTotal / MARKET_PAGE_LIMIT))
+                        : null;
+            }
+
+            if (rows.length > 0) {
+                const fingerprint = `${rows.length}|${rows[0]?.id || ''}|${rows[rows.length - 1]?.id || ''}`;
+                if (seenPageFingerprints.has(fingerprint)) {
+                    duplicatePageReached = true;
+                    naturalEndReached = true;
+                    return;
+                }
+                seenPageFingerprints.add(fingerprint);
+            }
+
+            const pageUseful = [];
+            let furthestRemaining = -Infinity;
+
+            for (const a of rows) {
+                if (!a?.id || !a?.end_at) continue;
+
+                const remaining = hunterRemainingMs(a);
+                if (!Number.isFinite(remaining)) continue;
+                furthestRemaining = Math.max(furthestRemaining, remaining);
+
+                if (remaining > 0 && remaining <= cutoff) {
+                    const id = String(a.id);
+                    if (!collectedIds.has(id)) {
+                        collectedIds.add(id);
+                        collected.push(a);
+                        pageUseful.push(a);
+                    }
+                }
+            }
+
+            if (onBatch && pageUseful.length > 0) {
+                try {
+                    onBatch(
+                        pageUseful,
+                        pageNo,
+                        reportedTotalPages || HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
+                    );
+                } catch (e) {
+                    console.warn('[WikiMasters][hunter-headless] multi-rarity page callback error:', e);
+                }
+            }
+
+            if (onProgress) {
+                try {
+                    onProgress(
+                        pageNo,
+                        reportedTotalPages || HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
+                        collected.length
+                    );
+                } catch (e) { }
+            }
+
+            // Avec ending_soon sur le flux déjà filtré par raretés, le premier T>2m
+            // matérialise la frontière utile de l'ensemble sélectionné.
+            if (Number.isFinite(furthestRemaining) && furthestRemaining > cutoff) {
+                boundaryReached = true;
+            }
+
+            if (
+                data?.hasMore === false ||
+                rows.length === 0 ||
+                rows.length < MARKET_PAGE_LIMIT
+            ) {
+                naturalEndReached = true;
+            }
+        };
+
+        for (
+            let startPage = 1;
+            startPage <= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN &&
+            !boundaryReached &&
+            !naturalEndReached;
+            startPage += HUNTER_HEADLESS_PAGE_CONCURRENCY
+        ) {
+            if (hunterLagPostInFlight > 0) {
+                await hunterLagWaitForPostLane();
+            }
+
+            const pages = [];
+            for (
+                let p = startPage;
+                p < startPage + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
+                p <= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
+                p++
+            ) {
+                pages.push(p);
+            }
+
+            const results = await Promise.all(
+                pages.map(async p => {
+                    try {
+                        return await fetchMarketPage(p, apiRarities);
+                    } catch (e) {
+                        return null;
+                    }
+                })
+            );
+
+            for (let i = 0; i < results.length; i++) {
+                if (!results[i]) continue;
+                consumePage(results[i], pages[i]);
+
+                if (boundaryReached || naturalEndReached) break;
+            }
+
+            if (!boundaryReached && !naturalEndReached) {
+                await new Promise(r => setTimeout(r, 120));
+            }
+        }
+
+        const pageCapReached =
+            !boundaryReached &&
+            !naturalEndReached &&
+            pagesScanned >= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
+
+        const auctions = collected.sort((a, b) => {
+            const ea = new Date(a?.end_at || 0).getTime();
+            const eb = new Date(b?.end_at || 0).getTime();
+            return ea - eb;
+        });
+
+        return {
+            auctions,
+            source: 'marketplace-pages-rarity-multi-filtered',
+            scanMode: 'global-multi-rarity-pages',
+            total: Number.isFinite(rawTotal) ? rawTotal : 0,
+            totalPages: reportedTotalPages,
+            pagesScanned,
+            cutoffMs: cutoff,
+            boundaryReached,
+            boundaryPage: boundaryReached ? lastConsumedPageNo : null,
+            naturalEndReached,
+            pageCapReached,
+            duplicatePageReached,
+            totalLooksReliable,
+            firstPageFull: firstPageFull === true,
+            firstPageCount: Number(firstPageCount || 0),
+            pagesSavedApprox: 0,
+            selectedRarities,
+            apiRarities,
+            rarityQuery: hunterGlobalRarityQueryLabel(),
+            combinedFilteredPages: pagesScanned,
+            cacheSize: auctions.length
+        };
+    }
+
+
     async function fetchHunterActionWindowAuctions(onProgress, onBatch) {
+        if (hunterDynamicSource === 'global') {
+            // Le cache incrémental all-market n'a aucune utilité en mode Global filtré.
+            // Le vider garantit aussi qu'un futur retour vers Standards/Both repartira par un full.
+            hunterIncrementalSnapshot.clear();
+            hunterIncrementalBoundaryPage = null;
+            hunterIncrementalLastFullScanAt = 0;
+            hunterIncrementalLastFullSnapshotSize = 0;
+
+            return await fetchHunterActionWindowAuctionsGlobalRarityPages(
+                onProgress,
+                onBatch
+            );
+        }
+
         const now = Date.now();
         const fullDue =
             hunterIncrementalSnapshot.size === 0 ||
@@ -15404,6 +15674,10 @@
         lastReplenishmentTarget: 0,
         lastCoverageTarget: 0,
         lastPredictedSnapshotSize: 0,
+        lastGlobalSelectedRarities: [],
+        lastGlobalApiRarities: [],
+        lastGlobalRarityQuery: '',
+        lastGlobalCombinedFilteredPages: 0,
         lastCacheSize: 0,
         lastFallbackReason: ''
     };
@@ -15981,7 +16255,6 @@
             result?.totalLooksReliable === true;
         hunterHeadlessStats.lastFirstPageFull =
             result?.firstPageFull === true;
-        hunterHeadlessStats.discoverySource = 'marketplace-pages';
         hunterHeadlessStats.lastScanMode = result?.scanMode || 'full';
         hunterHeadlessStats.lastBoundaryPage = Number(result?.boundaryPage) || null;
         hunterHeadlessStats.lastPagesSavedApprox = Number(result?.pagesSavedApprox || 0);
@@ -15992,10 +16265,25 @@
         hunterHeadlessStats.lastReplenishmentTarget = Number(result?.replenishmentTarget || 0);
         hunterHeadlessStats.lastCoverageTarget = Number(result?.coverageTarget || 0);
         hunterHeadlessStats.lastPredictedSnapshotSize = Number(result?.predictedSnapshotSize || 0);
+        hunterHeadlessStats.lastGlobalSelectedRarities = Array.isArray(result?.selectedRarities)
+            ? [...result.selectedRarities]
+            : [];
+        hunterHeadlessStats.lastGlobalApiRarities = Array.isArray(result?.apiRarities)
+            ? [...result.apiRarities]
+            : [];
+        hunterHeadlessStats.lastGlobalRarityQuery = String(result?.rarityQuery || '');
+        hunterHeadlessStats.lastGlobalCombinedFilteredPages = Number(result?.combinedFilteredPages || 0);
         hunterHeadlessStats.lastCacheSize = Number(result?.cacheSize || auctions.length || 0);
         hunterHeadlessStats.lastFallbackReason = result?.fallbackReason || '';
+        hunterHeadlessStats.discoverySource = result?.source || 'marketplace-pages';
         hunterHeadlessStats.lastStopReason =
-            result?.scanMode === 'incremental'
+            result?.scanMode === 'global-multi-rarity-pages'
+                ? (
+                    `global multi-raretés [${(result?.apiRarities || []).join(',') || 'aucune'}] · ` +
+                    `${Number(result?.pagesScanned || 0)} page(s)` +
+                    `${result?.pageCapReached ? ` · plafond ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} atteint` : ''}`
+                )
+                : result?.scanMode === 'incremental'
                 ? `incrémental couverture · frontière p${Number(result?.boundaryPage) || '?'} · backfill ${Number(result?.backfillPages || 0)}p · ~${Number(result?.pagesSavedApprox || 0)} GET évités`
                 : result?.scanMode === 'full-fallback'
                     ? `scan complet de sécurité · ${result?.fallbackReason || 'fallback incrémental'}`
@@ -16076,8 +16364,12 @@
         }
 
         const baseGap = Math.max(MARKET_MIN_GAP_MS, HUNTER_HEADLESS_CYCLE_GAP_MS);
+        const pacedScanMode =
+            hunterHeadlessStats.lastScanMode === 'incremental' ||
+            hunterHeadlessStats.lastScanMode === 'global-multi-rarity-pages';
+
         const incrementalGap =
-            hunterHeadlessStats.lastScanMode === 'incremental'
+            pacedScanMode
                 ? Math.max(
                     baseGap,
                     HUNTER_INCREMENTAL_MIN_CYCLE_MS - Number(hunterHeadlessStats.lastCycleDurationMs || 0)
@@ -16105,7 +16397,12 @@
             if (!silent) {
                 wmLog(
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
-                    `marketplace pages : scan complet T≤2m puis incrémental front+frontière (full sécurité ~${Math.round(HUNTER_INCREMENTAL_FULL_RESCAN_MS / 60000)} min, concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY}) → file → drain · aucune découverte Hunter via DB · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
+                    (
+                        hunterDynamicSource === 'global'
+                            ? `marketplace pages filtrées en une seule requête multi-raretés [${hunterGlobalRarityQueryLabel() || 'aucune'}] jusqu'à T≤2m (concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY}, cycle mini ${Math.round(HUNTER_INCREMENTAL_MIN_CYCLE_MS / 1000)}s)`
+                            : `marketplace pages : scan complet T≤2m puis incrémental couverture (full sécurité ~${Math.round(HUNTER_INCREMENTAL_FULL_RESCAN_MS / 60000)} min, concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY})`
+                    ) +
+                    ` → file → drain · aucune découverte Hunter via DB · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
                 );
             }
         }
@@ -16155,7 +16452,12 @@
         const result = {
             version: WM_VERSION,
             profil: 'lag-max2-lean',
-            hunterDiscovery: 'marketplace-pages-incremental',
+            hunterDiscovery:
+                hunterDynamicSource === 'global'
+                    ? 'marketplace-pages-rarity-multi-filtered'
+                    : 'marketplace-pages-incremental',
+            globalSelectedRarities: hunterGlobalSelectedRarities(),
+            globalApiRarities: hunterGlobalApiRarities(),
             recentMarketDb: true,
             incrementalFullRescanMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
             incrementalMinCycleMs: HUNTER_INCREMENTAL_MIN_CYCLE_MS,
@@ -16190,7 +16492,10 @@
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
             traitementPageParPage: true,
-            modeBoucle: 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
+            modeBoucle:
+                hunterDynamicSource === 'global'
+                    ? 'pages marketplace filtrées par raretés sélectionnées dans une requête combinée jusqu’à T<=2m -> file -> drain'
+                    : 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
             sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
             accesDbHunter: false,
             horizonSnapshotMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
@@ -16210,6 +16515,10 @@
             referenceDernierFull: hunterIncrementalLastFullSnapshotSize,
             cacheSnapshotIncremental: hunterHeadlessStats.lastCacheSize,
             raisonFallbackIncremental: hunterHeadlessStats.lastFallbackReason || null,
+            globalRaritesSelectionnees: hunterHeadlessStats.lastGlobalSelectedRarities,
+            globalRaritesApi: hunterHeadlessStats.lastGlobalApiRarities,
+            globalFiltreApi: hunterHeadlessStats.lastGlobalRarityQuery || null,
+            pagesGlobalFiltreesDernierScan: hunterHeadlessStats.lastGlobalCombinedFilteredPages,
             scanCompletToutesMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
             pagesFrontalesIncremental: HUNTER_INCREMENTAL_FRONT_PAGES,
             rayonFrontiereIncremental: HUNTER_INCREMENTAL_BOUNDARY_RADIUS,
