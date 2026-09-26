@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.27-LAG-PAGES-CLASSIC-FLIP-LEAN-INCREMENTAL-ADAPTIVE-RESPONSE';
+    const WM_VERSION = '3.8.28-LAG-PAGES-CLASSIC-FLIP-LEAN-INCREMENTAL-COVERAGE';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -48,8 +48,17 @@
     const HUNTER_INCREMENTAL_FULL_RESCAN_MS = 180_000; // filet de sécurité : rescan complet ~3 min
     const HUNTER_INCREMENTAL_MIN_CYCLE_MS = 30_000;    // évite que le scan allégé ne boucle beaucoup plus vite que l'ancien full scan
     const HUNTER_INCREMENTAL_FRONT_PAGES = 2;          // attrape les annonces arrivant très près de la fin
-    const HUNTER_INCREMENTAL_BOUNDARY_RADIUS = 2;      // pages de marge autour de la frontière estimée
-    const HUNTER_INCREMENTAL_MAX_PROBE_PAGES = 12;     // sinon fallback immédiat vers un scan complet
+    const HUNTER_INCREMENTAL_BOUNDARY_RADIUS = 2;      // marge minimale autour de la frontière estimée
+    const HUNTER_INCREMENTAL_MAX_PROBE_PAGES = 12;     // dérive de frontière : sinon fallback full
+    // v3.8.28 — couverture conservatrice :
+    // après la bande minimale, on remonte dynamiquement vers l'intérieur de la fenêtre
+    // pour remplacer les IDs expirés depuis le cycle précédent. On plafonne ce backfill ;
+    // si la couverture reste insuffisante, mieux vaut un full de sécurité qu'un snapshot aminci.
+    const HUNTER_INCREMENTAL_MAX_BACKFILL_PAGES = 16;  // en plus des pages frontales/frontière
+    const HUNTER_INCREMENTAL_REPLENISH_FACTOR = 1.15;  // récupère ~15 % de nouveaux IDs de marge
+    const HUNTER_INCREMENTAL_MIN_PREV_COVERAGE_RATIO = 0.85;
+    const HUNTER_INCREMENTAL_MIN_FULL_COVERAGE_RATIO = 0.70;
+    const HUNTER_INCREMENTAL_MIN_REPLENISH_ACCEPT_RATIO = 0.70;
 
     // Discord webhook — configuré par chaque utilisateur via la section Paramètres
     function getDiscordWebhook() { return getSetting('discordWebhook').trim(); }
@@ -10833,6 +10842,7 @@
     let hunterIncrementalScans = 0;
     let hunterIncrementalFallbackFullScans = 0;
     let hunterIncrementalPagesSavedSession = 0;
+    let hunterIncrementalLastFullSnapshotSize = 0;
 
     function hunterRemainingMs(auction) {
         if (!auction?.end_at) return NaN;
@@ -10918,8 +10928,19 @@
         const fetchedPages = new Map();
         let pagesScanned = 0;
         let probePages = 0;
+        let backfillPages = 0;
         let duplicatePageReached = false;
         const seenPageFingerprints = new Set();
+
+        // Mesure la "consommation" réelle du snapshot depuis le cycle précédent.
+        // C'est cette perte qu'on cherche à remplacer, au lieu de supposer qu'une bande
+        // fixe de 5 pages suffit quel que soit le débit du marché.
+        const snapshotSizeBeforePurge = hunterIncrementalSnapshot.size;
+        purgeHunterIncrementalSnapshot();
+        const snapshotSizeAfterPurge = hunterIncrementalSnapshot.size;
+        const expiredSinceLast = Math.max(0, snapshotSizeBeforePurge - snapshotSizeAfterPurge);
+        const existingIdsAtStart = new Set(hunterIncrementalSnapshot.keys());
+        const newlySeenInsideIds = new Set();
 
         const fetchPageOnce = async (pageNo, countsAsProbe = false) => {
             const p = Number(pageNo);
@@ -10947,6 +10968,20 @@
                 const fingerprint = `${rows.length}|${rows[0]?.id || ''}|${rows[rows.length - 1]?.id || ''}`;
                 if (seenPageFingerprints.has(fingerprint)) duplicatePageReached = true;
                 seenPageFingerprints.add(fingerprint);
+
+                for (const a of rows) {
+                    if (!a?.id) continue;
+                    const remaining = hunterRemainingMs(a);
+                    const id = String(a.id);
+                    if (
+                        Number.isFinite(remaining) &&
+                        remaining > 0 &&
+                        remaining <= cutoff &&
+                        !existingIdsAtStart.has(id)
+                    ) {
+                        newlySeenInsideIds.add(id);
+                    }
+                }
             }
             return data;
         };
@@ -11100,6 +11135,104 @@
             }
         }
 
+        // Estimation non destructive de la taille qu'aurait le snapshot après fusion
+        // des pages déjà relues.
+        const estimateSnapshotSizeWithFetchedPages = () => {
+            const ids = new Set(hunterIncrementalSnapshot.keys());
+            for (const data of fetchedPages.values()) {
+                const rows = Array.isArray(data?.auctions) ? data.auctions : [];
+                for (const a of rows) {
+                    if (!a?.id) continue;
+                    const id = String(a.id);
+                    const remaining = hunterRemainingMs(a);
+                    if (Number.isFinite(remaining) && remaining > 0 && remaining <= cutoff) {
+                        ids.add(id);
+                    } else {
+                        ids.delete(id);
+                    }
+                }
+            }
+            return ids.size;
+        };
+
+        const replenishmentTarget =
+            expiredSinceLast > 0
+                ? Math.ceil(expiredSinceLast * HUNTER_INCREMENTAL_REPLENISH_FACTOR)
+                : 0;
+
+        const coverageTarget = Math.max(
+            Math.ceil(snapshotSizeBeforePurge * HUNTER_INCREMENTAL_MIN_PREV_COVERAGE_RATIO),
+            Math.ceil(hunterIncrementalLastFullSnapshotSize * HUNTER_INCREMENTAL_MIN_FULL_COVERAGE_RATIO)
+        );
+
+        let predictedSnapshotSize = estimateSnapshotSizeWithFetchedPages();
+
+        // Si la bande ±2 ne remplace pas les enchères sorties depuis le dernier cycle,
+        // on remonte depuis la frontière vers les pages plus urgentes. Le débit réel
+        // du marché décide donc du nombre de GET, avec un plafond explicite.
+        let nextBackfillPage = bandStart - 1;
+        while (
+            nextBackfillPage > HUNTER_INCREMENTAL_FRONT_PAGES &&
+            backfillPages < HUNTER_INCREMENTAL_MAX_BACKFILL_PAGES &&
+            (
+                newlySeenInsideIds.size < replenishmentTarget ||
+                predictedSnapshotSize < coverageTarget
+            )
+        ) {
+            const batch = [];
+            while (
+                nextBackfillPage > HUNTER_INCREMENTAL_FRONT_PAGES &&
+                batch.length < HUNTER_HEADLESS_PAGE_CONCURRENCY &&
+                backfillPages + batch.length < HUNTER_INCREMENTAL_MAX_BACKFILL_PAGES
+            ) {
+                if (!fetchedPages.has(nextBackfillPage)) {
+                    batch.push(nextBackfillPage);
+                }
+                nextBackfillPage--;
+            }
+
+            if (batch.length === 0) break;
+
+            await Promise.all(batch.map(p => fetchPageOnce(p, false)));
+            backfillPages += batch.length;
+            predictedSnapshotSize = estimateSnapshotSizeWithFetchedPages();
+
+            if (
+                nextBackfillPage > HUNTER_INCREMENTAL_FRONT_PAGES &&
+                backfillPages < HUNTER_INCREMENTAL_MAX_BACKFILL_PAGES
+            ) {
+                await new Promise(r => setTimeout(r, 120));
+            }
+        }
+
+        const replenishmentAcceptTarget =
+            replenishmentTarget > 0
+                ? Math.ceil(replenishmentTarget * HUNTER_INCREMENTAL_MIN_REPLENISH_ACCEPT_RATIO)
+                : 0;
+
+        // Couverture insuffisante après le backfill : ne jamais accepter silencieusement
+        // un snapshot qui s'amincit cycle après cycle. Le full remet immédiatement une
+        // référence complète et recalibre le débit du marché.
+        if (
+            (
+                coverageTarget > 0 &&
+                predictedSnapshotSize < coverageTarget
+            ) ||
+            (
+                replenishmentAcceptTarget >= 25 &&
+                newlySeenInsideIds.size < replenishmentAcceptTarget
+            )
+        ) {
+            return {
+                forceFull: true,
+                fallbackReason:
+                    `couverture incrémentale insuffisante ` +
+                    `(snapshot ${predictedSnapshotSize}/${coverageTarget || '-'}, ` +
+                    `nouveaux ${newlySeenInsideIds.size}/${replenishmentTarget || 0}, ` +
+                    `backfill ${backfillPages}p)`
+            };
+        }
+
         // Le cache n'est modifié qu'une fois la frontière retrouvée : en cas de fallback,
         // le scan complet repart d'un snapshot propre.
         for (const data of fetchedPages.values()) {
@@ -11143,7 +11276,15 @@
             firstPageFull: firstRows.length >= MARKET_PAGE_LIMIT,
             firstPageCount: firstRows.length,
             pagesSavedApprox,
-            probePages
+            probePages,
+            backfillPages,
+            snapshotSizeBeforePurge,
+            snapshotSizeAfterPurge,
+            expiredSinceLast,
+            newInsideIds: newlySeenInsideIds.size,
+            replenishmentTarget,
+            coverageTarget,
+            predictedSnapshotSize
         };
     }
 
@@ -11157,6 +11298,7 @@
         if (fullDue) {
             const result = await fetchHunterActionWindowAuctionsFull(onProgress, onBatch);
             rebuildHunterIncrementalSnapshot(result?.auctions || []);
+            hunterIncrementalLastFullSnapshotSize = hunterIncrementalSnapshot.size;
             hunterIncrementalBoundaryPage =
                 Number(result?.boundaryPage) || Number(result?.pagesScanned) || 1;
             hunterIncrementalLastFullScanAt = Date.now();
@@ -11174,6 +11316,7 @@
             hunterIncrementalFallbackFullScans++;
             const result = await fetchHunterActionWindowAuctionsFull(onProgress, onBatch);
             rebuildHunterIncrementalSnapshot(result?.auctions || []);
+            hunterIncrementalLastFullSnapshotSize = hunterIncrementalSnapshot.size;
             hunterIncrementalBoundaryPage =
                 Number(result?.boundaryPage) || Number(result?.pagesScanned) || 1;
             hunterIncrementalLastFullScanAt = Date.now();
@@ -15255,6 +15398,12 @@
         lastBoundaryPage: null,
         lastPagesSavedApprox: 0,
         lastProbePages: 0,
+        lastBackfillPages: 0,
+        lastExpiredSinceLast: 0,
+        lastNewInsideIds: 0,
+        lastReplenishmentTarget: 0,
+        lastCoverageTarget: 0,
+        lastPredictedSnapshotSize: 0,
         lastCacheSize: 0,
         lastFallbackReason: ''
     };
@@ -15837,11 +15986,17 @@
         hunterHeadlessStats.lastBoundaryPage = Number(result?.boundaryPage) || null;
         hunterHeadlessStats.lastPagesSavedApprox = Number(result?.pagesSavedApprox || 0);
         hunterHeadlessStats.lastProbePages = Number(result?.probePages || 0);
+        hunterHeadlessStats.lastBackfillPages = Number(result?.backfillPages || 0);
+        hunterHeadlessStats.lastExpiredSinceLast = Number(result?.expiredSinceLast || 0);
+        hunterHeadlessStats.lastNewInsideIds = Number(result?.newInsideIds || 0);
+        hunterHeadlessStats.lastReplenishmentTarget = Number(result?.replenishmentTarget || 0);
+        hunterHeadlessStats.lastCoverageTarget = Number(result?.coverageTarget || 0);
+        hunterHeadlessStats.lastPredictedSnapshotSize = Number(result?.predictedSnapshotSize || 0);
         hunterHeadlessStats.lastCacheSize = Number(result?.cacheSize || auctions.length || 0);
         hunterHeadlessStats.lastFallbackReason = result?.fallbackReason || '';
         hunterHeadlessStats.lastStopReason =
             result?.scanMode === 'incremental'
-                ? `incrémental · frontière p${Number(result?.boundaryPage) || '?'} · ~${Number(result?.pagesSavedApprox || 0)} GET évités`
+                ? `incrémental couverture · frontière p${Number(result?.boundaryPage) || '?'} · backfill ${Number(result?.backfillPages || 0)}p · ~${Number(result?.pagesSavedApprox || 0)} GET évités`
                 : result?.scanMode === 'full-fallback'
                     ? `scan complet de sécurité · ${result?.fallbackReason || 'fallback incrémental'}`
                     : result?.boundaryReached
@@ -16006,6 +16161,10 @@
             incrementalMinCycleMs: HUNTER_INCREMENTAL_MIN_CYCLE_MS,
             incrementalFrontPages: HUNTER_INCREMENTAL_FRONT_PAGES,
             incrementalBoundaryRadius: HUNTER_INCREMENTAL_BOUNDARY_RADIUS,
+            incrementalMaxBackfillPages: HUNTER_INCREMENTAL_MAX_BACKFILL_PAGES,
+            incrementalReplenishFactor: HUNTER_INCREMENTAL_REPLENISH_FACTOR,
+            incrementalMinPrevCoverageRatio: HUNTER_INCREMENTAL_MIN_PREV_COVERAGE_RATIO,
+            incrementalMinFullCoverageRatio: HUNTER_INCREMENTAL_MIN_FULL_COVERAGE_RATIO,
             hotLane: 'inchangée',
             hunterPostSerialise: true,
             profileTableProbe: false,
@@ -16031,7 +16190,7 @@
             headlessOn: hunterHeadlessActive,
             scanEnCours: hunterHeadlessScanInProgress,
             traitementPageParPage: true,
-            modeBoucle: 'scan complet périodique + incrémental front/frontière T<=2m -> file -> drain',
+            modeBoucle: 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
             sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
             accesDbHunter: false,
             horizonSnapshotMs: HUNTER_DISCOVERY_MAX_REMAINING_MS,
@@ -16042,6 +16201,13 @@
             frontierePageDernierScan: hunterHeadlessStats.lastBoundaryPage,
             getEconomisesDernierScanApprox: hunterHeadlessStats.lastPagesSavedApprox,
             pagesSondeFrontiereDernierScan: hunterHeadlessStats.lastProbePages,
+            pagesBackfillDernierScan: hunterHeadlessStats.lastBackfillPages,
+            expiresDepuisCyclePrecedent: hunterHeadlessStats.lastExpiredSinceLast,
+            nouveauxIdsRecuperes: hunterHeadlessStats.lastNewInsideIds,
+            cibleRemplacementIds: hunterHeadlessStats.lastReplenishmentTarget,
+            cibleCouvertureSnapshot: hunterHeadlessStats.lastCoverageTarget,
+            snapshotPrevuAvantFusion: hunterHeadlessStats.lastPredictedSnapshotSize,
+            referenceDernierFull: hunterIncrementalLastFullSnapshotSize,
             cacheSnapshotIncremental: hunterHeadlessStats.lastCacheSize,
             raisonFallbackIncremental: hunterHeadlessStats.lastFallbackReason || null,
             scanCompletToutesMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
