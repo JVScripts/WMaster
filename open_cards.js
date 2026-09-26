@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.32-LAG-GLOBAL-FRONTIER-EARLY-PROBE';
+    const WM_VERSION = '3.8.33-LAG-GLOBAL-FRONTIER-SHORTPAGE-FIX';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11350,7 +11350,9 @@
         }
 
         const previousBoundaryHint =
-            Number.isFinite(Number(hunterGlobalLastBoundaryPage))
+            hunterGlobalLastBoundaryPage !== null &&
+                hunterGlobalLastBoundaryPage !== undefined &&
+                Number.isFinite(Number(hunterGlobalLastBoundaryPage))
                 ? Math.max(
                     1,
                     Math.min(
@@ -11487,10 +11489,15 @@
                 } catch (e) { }
             }
 
+            // v3.8.33 — sur le flux marketplace filtré multi-raretés, une page
+            // incomplète n'est PAS une preuve de fin. On a observé des p1 < 50 alors
+            // que des pages profondes (p17/p18) existaient encore.
+            //
+            // On ne s'arrête donc que sur le signal explicite de l'API.
+            // Si `hasMore` est absent/incohérent, la frontière T>2m ou le plafond
+            // de 60 pages restent les garde-fous.
             const naturalEnd =
-                data?.hasMore === false ||
-                rows.length === 0 ||
-                rows.length < MARKET_PAGE_LIMIT;
+                data?.hasMore === false;
 
             return { rows, hasBeyond, naturalEnd };
         };
@@ -16673,6 +16680,7 @@
             globalStreamingWorkersMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
             globalFrontierEarlyProbe: true,
             globalFrontierPersistentState: 'last-boundary-only',
+            globalFilteredNaturalEndRule: 'hasMore===false only',
             recentMarketDb: true,
             incrementalFullRescanMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
             incrementalMinCycleMs: HUNTER_INCREMENTAL_MIN_CYCLE_MS,
@@ -16709,7 +16717,7 @@
             traitementPageParPage: true,
             modeBoucle:
                 hunterDynamicSource === 'global'
-                    ? 'sonde front+ancienne frontière -> scan complet multi-raretés p1→T<=2m + préanalyse streaming -> drain'
+                    ? 'sonde front+ancienne frontière -> scan complet multi-raretés p1→T<=2m (page courte ≠ fin) + préanalyse streaming -> drain'
                     : 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
             sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
             accesDbHunter: false,
