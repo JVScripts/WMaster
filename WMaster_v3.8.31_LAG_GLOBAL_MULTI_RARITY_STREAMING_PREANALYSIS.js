@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.30-LAG-GLOBAL-MULTI-RARITY-PAGES-LEAN';
+    const WM_VERSION = '3.8.31-LAG-GLOBAL-MULTI-RARITY-STREAMING-PREANALYSIS';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -15678,6 +15678,9 @@
         lastGlobalApiRarities: [],
         lastGlobalRarityQuery: '',
         lastGlobalCombinedFilteredPages: 0,
+        lastStreamingCandidates: 0,
+        lastStreamingQueued: 0,
+        lastPostScanQueued: 0,
         lastCacheSize: 0,
         lastFallbackReason: ''
     };
@@ -16186,10 +16189,19 @@
 
         const snapshotCandidates = new Map();
 
+        // v3.8.31 — en source Global, les candidats d'une page partent en préanalyse
+        // dès que cette page est disponible, pendant que les pages suivantes continuent
+        // d'être découvertes. On conserve exactement les mêmes 4 workers maximum et
+        // les POST restent strictement sérialisés.
+        const streamingPreanalysis =
+            hunterDynamicSource === 'global';
+        const streamedCandidateIds = new Set();
+        let streamingQueuedThisScan = 0;
+
         const processPageBatch = (batch) => {
             if (!Array.isArray(batch) || batch.length === 0) return;
 
-            // Protection self-bid dès la lecture, mais AUCUNE préanalyse avant la fin du snapshot.
+            // Protection self-bid immédiatement à la lecture.
             batch.forEach(a => {
                 if (iAmLeading(a)) {
                     trackMyBid(a.id);
@@ -16201,9 +16213,29 @@
             });
 
             const candidates = getHunterDynamicCandidatePool(batch);
+            const streamingBatch = [];
+
             for (const a of candidates) {
                 if (!a?.id) continue;
                 snapshotCandidates.set(a.id, a);
+
+                if (
+                    streamingPreanalysis &&
+                    !streamedCandidateIds.has(a.id)
+                ) {
+                    streamedCandidateIds.add(a.id);
+                    streamingBatch.push(a);
+                }
+            }
+
+            if (streamingBatch.length > 0) {
+                streamingQueuedThisScan +=
+                    queueHunterPrewarmCandidates(streamingBatch);
+
+                // Une préanalyse lancée sur une page précédente peut déjà avoir validé
+                // un candidat T>90. À chaque nouveau lot, on lui permet d'entrer dans
+                // la file d'action dès qu'il passe sous T<=90, sans attendre la fin du scan.
+                promoteDeferredPreparedHunterActions();
             }
         };
 
@@ -16222,8 +16254,9 @@
         // uniquement la fenêtre utile à l'action automatique.
         lastAllMarketAuctions = auctions;
 
-        // Snapshot terminé : seulement MAINTENANT on construit/traite la file.
-        // Les entrées déjà prévalidées à T>90 sont simplement rafraîchies avec leur nouvel end_at.
+        // Snapshot terminé : les candidats Global ont déjà été envoyés aux workers
+        // page par page. On rafraîchit les objets différés puis on ne met en file ici
+        // que les candidats qui n'ont PAS déjà été pris en charge pendant le scan.
         for (const [id, a] of snapshotCandidates.entries()) {
             if (hunterHeadlessDeferredPrepared.has(id)) {
                 hunterHeadlessDeferredPrepared.set(id, a);
@@ -16233,12 +16266,21 @@
         promoteDeferredPreparedHunterActions();
 
         const toAnalyse = [...snapshotCandidates.values()].filter(a =>
+            !streamedCandidateIds.has(a.id) &&
             !hunterHeadlessDeferredPrepared.has(a.id) &&
             !hunterHeadlessPrewarmQueuedIds.has(a.id) &&
             !hunterHeadlessPageQueuedIds.has(a.id)
         );
 
-        queueHunterPrewarmCandidates(toAnalyse);
+        const postScanQueued =
+            queueHunterPrewarmCandidates(toAnalyse);
+
+        hunterHeadlessStats.lastStreamingCandidates =
+            streamedCandidateIds.size;
+        hunterHeadlessStats.lastStreamingQueued =
+            streamingQueuedThisScan;
+        hunterHeadlessStats.lastPostScanQueued =
+            postScanQueued;
         hunterHeadlessStats.lastSnapshotCandidates = snapshotCandidates.size;
 
         apiHealth.lastMarketScanTs = Date.now();
@@ -16399,7 +16441,7 @@
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
                     (
                         hunterDynamicSource === 'global'
-                            ? `marketplace pages filtrées en une seule requête multi-raretés [${hunterGlobalRarityQueryLabel() || 'aucune'}] jusqu'à T≤2m (concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY}, cycle mini ${Math.round(HUNTER_INCREMENTAL_MIN_CYCLE_MS / 1000)}s)`
+                            ? `marketplace pages multi-raretés [${hunterGlobalRarityQueryLabel() || 'aucune'}] jusqu'à T≤2m + préanalyse streaming ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers pendant la découverte (concurrence pages ${HUNTER_HEADLESS_PAGE_CONCURRENCY}, cycle mini ${Math.round(HUNTER_INCREMENTAL_MIN_CYCLE_MS / 1000)}s)`
                             : `marketplace pages : scan complet T≤2m puis incrémental couverture (full sécurité ~${Math.round(HUNTER_INCREMENTAL_FULL_RESCAN_MS / 60000)} min, concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY})`
                     ) +
                     ` → file → drain · aucune découverte Hunter via DB · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
@@ -16458,6 +16500,8 @@
                     : 'marketplace-pages-incremental',
             globalSelectedRarities: hunterGlobalSelectedRarities(),
             globalApiRarities: hunterGlobalApiRarities(),
+            globalStreamingPreanalysis: true,
+            globalStreamingWorkersMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
             recentMarketDb: true,
             incrementalFullRescanMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
             incrementalMinCycleMs: HUNTER_INCREMENTAL_MIN_CYCLE_MS,
@@ -16494,7 +16538,7 @@
             traitementPageParPage: true,
             modeBoucle:
                 hunterDynamicSource === 'global'
-                    ? 'pages marketplace filtrées par raretés sélectionnées dans une requête combinée jusqu’à T<=2m -> file -> drain'
+                    ? 'pages marketplace multi-raretés T<=2m + préanalyse streaming pendant découverte -> drain'
                     : 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
             sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
             accesDbHunter: false,
@@ -16519,6 +16563,10 @@
             globalRaritesApi: hunterHeadlessStats.lastGlobalApiRarities,
             globalFiltreApi: hunterHeadlessStats.lastGlobalRarityQuery || null,
             pagesGlobalFiltreesDernierScan: hunterHeadlessStats.lastGlobalCombinedFilteredPages,
+            preanalyseStreamingOn: hunterDynamicSource === 'global',
+            candidatsEnvoyesStreamingDernierScan: hunterHeadlessStats.lastStreamingCandidates,
+            preanalysesEnqueueesStreamingDernierScan: hunterHeadlessStats.lastStreamingQueued,
+            preanalysesEnqueueesApresScanDernierScan: hunterHeadlessStats.lastPostScanQueued,
             scanCompletToutesMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
             pagesFrontalesIncremental: HUNTER_INCREMENTAL_FRONT_PAGES,
             rayonFrontiereIncremental: HUNTER_INCREMENTAL_BOUNDARY_RADIUS,
@@ -16557,7 +16605,10 @@
             decalageServeurMs: Math.round(serverClockOffset),
             scanIntervalMs: null,
             pauseEntreCyclesMs:
-                hunterHeadlessStats.lastScanMode === 'incremental'
+                (
+                    hunterHeadlessStats.lastScanMode === 'incremental' ||
+                    hunterHeadlessStats.lastScanMode === 'global-multi-rarity-pages'
+                )
                     ? Math.max(
                         Math.max(MARKET_MIN_GAP_MS, HUNTER_HEADLESS_CYCLE_GAP_MS),
                         HUNTER_INCREMENTAL_MIN_CYCLE_MS - Number(hunterHeadlessStats.lastCycleDurationMs || 0)
