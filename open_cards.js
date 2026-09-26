@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.31-LAG-GLOBAL-MULTI-RARITY-STREAMING-PREANALYSIS';
+    const WM_VERSION = '3.8.32-LAG-GLOBAL-FRONTIER-EARLY-PROBE';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -11331,12 +11331,37 @@
             .join('&');
     }
 
+    // v3.8.32 — état volontairement MINIMAL entre deux loops Global :
+    // uniquement la dernière frontière réellement mesurée et la signature des raretés.
+    // Aucun cache de pages/candidats n'est conservé d'un cycle au suivant.
+    let hunterGlobalLastBoundaryPage = null;
+    let hunterGlobalLastRaritySignature = '';
+
     async function fetchHunterActionWindowAuctionsGlobalRarityPages(onProgress, onBatch) {
         const cutoff = HUNTER_DISCOVERY_MAX_REMAINING_MS;
         const selectedRarities = hunterGlobalSelectedRarities();
         const apiRarities = hunterGlobalApiRarities();
+        const raritySignature = apiRarities.join('|');
+
+        // Un changement de raretés invalide immédiatement le hint du cycle précédent.
+        if (raritySignature !== hunterGlobalLastRaritySignature) {
+            hunterGlobalLastRaritySignature = raritySignature;
+            hunterGlobalLastBoundaryPage = null;
+        }
+
+        const previousBoundaryHint =
+            Number.isFinite(Number(hunterGlobalLastBoundaryPage))
+                ? Math.max(
+                    1,
+                    Math.min(
+                        HUNTER_HEADLESS_MAX_PAGES_PER_SCAN,
+                        Math.round(Number(hunterGlobalLastBoundaryPage))
+                    )
+                )
+                : null;
 
         if (apiRarities.length === 0) {
+            hunterGlobalLastBoundaryPage = null;
             return {
                 auctions: [],
                 source: 'marketplace-pages-rarity-multi-filtered',
@@ -11358,15 +11383,19 @@
                 apiRarities,
                 rarityQuery: '',
                 combinedFilteredPages: 0,
+                frontierHintAtStart: null,
+                frontierEarlyProbePages: [],
+                frontierExtraGets: 0,
                 cacheSize: 0
             };
         }
 
         const collected = [];
         const collectedIds = new Set();
-        const seenPageFingerprints = new Set();
+        const seenAuthoritativeFingerprints = new Set();
 
-        let pagesScanned = 0;
+        let pagesScanned = 0;          // nombre réel de GET pages réussis, probes compris
+        let sequentialPagesConsumed = 0;
         let lastConsumedPageNo = 0;
         let boundaryReached = false;
         let naturalEndReached = false;
@@ -11377,13 +11406,21 @@
         let reportedTotalPages = null;
         let totalLooksReliable = false;
 
-        const consumePage = (data, pageNo) => {
+        const frontierEarlyProbePages = [];
+        let frontierExtraGets = 0;
+
+        // P1/P2 lues au tout début peuvent être réutilisées par le scan séquentiel.
+        // Les pages de frontière sont volontairement RE-fetchées lorsqu'on les atteint
+        // plus tard dans le scan complet : leur probe initial sert à voir tôt les entrants,
+        // leur lecture finale sert à recalibrer la vraie frontière avec un état frais.
+        const reusableFrontData = new Map();
+
+        const harvestPage = (data, pageNo, { authoritative = false } = {}) => {
+            if (!data) return { rows: [], hasBeyond: false, naturalEnd: false };
+
             const rows = Array.isArray(data?.auctions) ? data.auctions : [];
 
-            pagesScanned++;
-            lastConsumedPageNo = Math.max(lastConsumedPageNo, Number(pageNo) || 0);
-
-            if (pageNo === 1) {
+            if (pageNo === 1 && firstPageCount === null) {
                 firstPageCount = rows.length;
                 firstPageFull = rows.length >= MARKET_PAGE_LIMIT;
 
@@ -11397,25 +11434,26 @@
                         : null;
             }
 
-            if (rows.length > 0) {
+            if (authoritative && rows.length > 0) {
                 const fingerprint = `${rows.length}|${rows[0]?.id || ''}|${rows[rows.length - 1]?.id || ''}`;
-                if (seenPageFingerprints.has(fingerprint)) {
+                if (seenAuthoritativeFingerprints.has(fingerprint)) {
                     duplicatePageReached = true;
-                    naturalEndReached = true;
-                    return;
                 }
-                seenPageFingerprints.add(fingerprint);
+                seenAuthoritativeFingerprints.add(fingerprint);
             }
 
             const pageUseful = [];
-            let furthestRemaining = -Infinity;
+            let hasBeyond = false;
 
             for (const a of rows) {
                 if (!a?.id || !a?.end_at) continue;
 
                 const remaining = hunterRemainingMs(a);
                 if (!Number.isFinite(remaining)) continue;
-                furthestRemaining = Math.max(furthestRemaining, remaining);
+
+                if (remaining > cutoff) {
+                    hasBeyond = true;
+                }
 
                 if (remaining > 0 && remaining <= cutoff) {
                     const id = String(a.id);
@@ -11439,7 +11477,7 @@
                 }
             }
 
-            if (onProgress) {
+            if (onProgress && authoritative) {
                 try {
                     onProgress(
                         pageNo,
@@ -11449,60 +11487,152 @@
                 } catch (e) { }
             }
 
-            // Avec ending_soon sur le flux déjà filtré par raretés, le premier T>2m
-            // matérialise la frontière utile de l'ensemble sélectionné.
-            if (Number.isFinite(furthestRemaining) && furthestRemaining > cutoff) {
-                boundaryReached = true;
-            }
-
-            if (
+            const naturalEnd =
                 data?.hasMore === false ||
                 rows.length === 0 ||
-                rows.length < MARKET_PAGE_LIMIT
-            ) {
-                naturalEndReached = true;
-            }
+                rows.length < MARKET_PAGE_LIMIT;
+
+            return { rows, hasBeyond, naturalEnd };
         };
 
-        for (
-            let startPage = 1;
-            startPage <= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN &&
-            !boundaryReached &&
-            !naturalEndReached;
-            startPage += HUNTER_HEADLESS_PAGE_CONCURRENCY
-        ) {
+        const fetchOne = async (pageNo) => {
+            if (
+                !Number.isFinite(Number(pageNo)) ||
+                pageNo < 1 ||
+                pageNo > HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
+            ) {
+                return null;
+            }
+
             if (hunterLagPostInFlight > 0) {
                 await hunterLagWaitForPostLane();
             }
 
+            try {
+                const data = await fetchMarketPage(pageNo, apiRarities);
+                pagesScanned++;
+                return data;
+            } catch (e) {
+                return null;
+            }
+        };
+
+        // ---- Phase 1 : sonde précoce, uniquement à partir du DEUXIÈME cycle fiable ----
+        //
+        // Exemple dernière frontière p21 :
+        //   lot 1 = p1 + p20
+        //   lot 2 = p2 + p21
+        //
+        // p20/p21 servent à capturer immédiatement les nouvelles cartes qui viennent
+        // d'entrer sous T-2m. Elles ne deviennent jamais une "vérité" pour ce cycle :
+        // le scan séquentiel complet recalculera ensuite la frontière réelle.
+        if (previousBoundaryHint && previousBoundaryHint >= 3) {
+            const nearBoundary = Math.max(3, previousBoundaryHint - 1);
+            const probePairs = [
+                [1, nearBoundary],
+                [2, previousBoundaryHint]
+            ];
+
+            for (const rawPair of probePairs) {
+                const pair = [...new Set(rawPair)]
+                    .filter(p =>
+                        p >= 1 &&
+                        p <= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN
+                    );
+
+                if (pair.length === 0) continue;
+
+                const results = await Promise.all(
+                    pair.map(p => fetchOne(p))
+                );
+
+                for (let i = 0; i < pair.length; i++) {
+                    const p = pair[i];
+                    const data = results[i];
+                    if (!data) continue;
+
+                    if (p <= 2) {
+                        // P1/P2 seront réutilisées quelques millisecondes plus tard
+                        // par la passe séquentielle : aucun GET doublé pour le front.
+                        reusableFrontData.set(p, data);
+                    } else {
+                        frontierEarlyProbePages.push(p);
+                        frontierExtraGets++;
+                    }
+
+                    // Probe = récolte/streaming OUI, arrêt de frontière NON.
+                    harvestPage(data, p, { authoritative: false });
+                }
+
+                await new Promise(r => setTimeout(r, 120));
+            }
+        }
+
+        // ---- Phase 2 : scan COMPLET autoritaire depuis p1 ----
+        //
+        // À chaque loop on refait réellement p1 -> frontière T-2m.
+        // Le hint précédent ne change QUE l'ordre des deux premières sondes.
+        // Aucun Set de pages, aucune frontière ancienne, aucun candidat ne survit au cycle.
+        let nextPage = 1;
+
+        while (
+            nextPage <= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN &&
+            !boundaryReached &&
+            !naturalEndReached &&
+            !duplicatePageReached
+        ) {
             const pages = [];
             for (
-                let p = startPage;
-                p < startPage + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
+                let p = nextPage;
+                p < nextPage + HUNTER_HEADLESS_PAGE_CONCURRENCY &&
                 p <= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
                 p++
             ) {
                 pages.push(p);
             }
+            nextPage += pages.length;
 
             const results = await Promise.all(
                 pages.map(async p => {
-                    try {
-                        return await fetchMarketPage(p, apiRarities);
-                    } catch (e) {
-                        return null;
+                    if (reusableFrontData.has(p)) {
+                        return reusableFrontData.get(p);
                     }
+                    return await fetchOne(p);
                 })
             );
 
-            for (let i = 0; i < results.length; i++) {
-                if (!results[i]) continue;
-                consumePage(results[i], pages[i]);
+            for (let i = 0; i < pages.length; i++) {
+                const p = pages[i];
+                const data = results[i];
+                if (!data) continue;
 
-                if (boundaryReached || naturalEndReached) break;
+                sequentialPagesConsumed++;
+                lastConsumedPageNo = p;
+
+                const meta =
+                    harvestPage(data, p, { authoritative: true });
+
+                if (duplicatePageReached) {
+                    naturalEndReached = true;
+                    break;
+                }
+
+                if (meta.hasBeyond) {
+                    boundaryReached = true;
+                    break;
+                }
+
+                if (meta.naturalEnd) {
+                    naturalEndReached = true;
+                    break;
+                }
             }
 
-            if (!boundaryReached && !naturalEndReached) {
+            if (
+                !boundaryReached &&
+                !naturalEndReached &&
+                !duplicatePageReached
+            ) {
                 await new Promise(r => setTimeout(r, 120));
             }
         }
@@ -11510,7 +11640,23 @@
         const pageCapReached =
             !boundaryReached &&
             !naturalEndReached &&
-            pagesScanned >= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
+            !duplicatePageReached &&
+            lastConsumedPageNo >= HUNTER_HEADLESS_MAX_PAGES_PER_SCAN;
+
+        const measuredBoundary =
+            (boundaryReached || naturalEndReached) &&
+                Number.isFinite(Number(lastConsumedPageNo)) &&
+                lastConsumedPageNo > 0
+                ? lastConsumedPageNo
+                : null;
+
+        // Uniquement la mesure du cycle courant remplace le hint précédent.
+        // Si le cycle n'a pas obtenu de frontière fiable, on efface le hint plutôt
+        // que de propager une valeur potentiellement obsolète.
+        hunterGlobalLastBoundaryPage =
+            measuredBoundary !== null
+                ? measuredBoundary
+                : null;
 
         const auctions = collected.sort((a, b) => {
             const ea = new Date(a?.end_at || 0).getTime();
@@ -11527,7 +11673,7 @@
             pagesScanned,
             cutoffMs: cutoff,
             boundaryReached,
-            boundaryPage: boundaryReached ? lastConsumedPageNo : null,
+            boundaryPage: measuredBoundary,
             naturalEndReached,
             pageCapReached,
             duplicatePageReached,
@@ -11539,6 +11685,10 @@
             apiRarities,
             rarityQuery: hunterGlobalRarityQueryLabel(),
             combinedFilteredPages: pagesScanned,
+            frontierHintAtStart: previousBoundaryHint,
+            frontierEarlyProbePages,
+            frontierExtraGets,
+            sequentialPagesConsumed,
             cacheSize: auctions.length
         };
     }
@@ -15678,6 +15828,10 @@
         lastGlobalApiRarities: [],
         lastGlobalRarityQuery: '',
         lastGlobalCombinedFilteredPages: 0,
+        lastGlobalFrontierHintAtStart: null,
+        lastGlobalFrontierEarlyProbePages: [],
+        lastGlobalFrontierExtraGets: 0,
+        lastGlobalSequentialPagesConsumed: 0,
         lastStreamingCandidates: 0,
         lastStreamingQueued: 0,
         lastPostScanQueued: 0,
@@ -16315,6 +16469,18 @@
             : [];
         hunterHeadlessStats.lastGlobalRarityQuery = String(result?.rarityQuery || '');
         hunterHeadlessStats.lastGlobalCombinedFilteredPages = Number(result?.combinedFilteredPages || 0);
+        hunterHeadlessStats.lastGlobalFrontierHintAtStart =
+            Number.isFinite(Number(result?.frontierHintAtStart))
+                ? Number(result.frontierHintAtStart)
+                : null;
+        hunterHeadlessStats.lastGlobalFrontierEarlyProbePages =
+            Array.isArray(result?.frontierEarlyProbePages)
+                ? [...result.frontierEarlyProbePages]
+                : [];
+        hunterHeadlessStats.lastGlobalFrontierExtraGets =
+            Number(result?.frontierExtraGets || 0);
+        hunterHeadlessStats.lastGlobalSequentialPagesConsumed =
+            Number(result?.sequentialPagesConsumed || 0);
         hunterHeadlessStats.lastCacheSize = Number(result?.cacheSize || auctions.length || 0);
         hunterHeadlessStats.lastFallbackReason = result?.fallbackReason || '';
         hunterHeadlessStats.discoverySource = result?.source || 'marketplace-pages';
@@ -16322,7 +16488,10 @@
             result?.scanMode === 'global-multi-rarity-pages'
                 ? (
                     `global multi-raretés [${(result?.apiRarities || []).join(',') || 'aucune'}] · ` +
-                    `${Number(result?.pagesScanned || 0)} page(s)` +
+                    `${Number(result?.pagesScanned || 0)} GET page(s)` +
+                    `${Array.isArray(result?.frontierEarlyProbePages) && result.frontierEarlyProbePages.length
+                        ? ` · sonde frontière p${result.frontierEarlyProbePages.join('/p')}`
+                        : ''}` +
                     `${result?.pageCapReached ? ` · plafond ${HUNTER_HEADLESS_MAX_PAGES_PER_SCAN} atteint` : ''}`
                 )
                 : result?.scanMode === 'incremental'
@@ -16441,7 +16610,7 @@
                     `⚡ Hunter autonome ${WM_VERSION} démarré · ` +
                     (
                         hunterDynamicSource === 'global'
-                            ? `marketplace pages multi-raretés [${hunterGlobalRarityQueryLabel() || 'aucune'}] jusqu'à T≤2m + préanalyse streaming ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers pendant la découverte (concurrence pages ${HUNTER_HEADLESS_PAGE_CONCURRENCY}, cycle mini ${Math.round(HUNTER_INCREMENTAL_MIN_CYCLE_MS / 1000)}s)`
+                            ? `marketplace multi-raretés [${hunterGlobalRarityQueryLabel() || 'aucune'}] : sonde front+dernière frontière puis scan complet p1→T≤2m + préanalyse streaming ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers (concurrence pages ${HUNTER_HEADLESS_PAGE_CONCURRENCY}, cycle mini ${Math.round(HUNTER_INCREMENTAL_MIN_CYCLE_MS / 1000)}s)`
                             : `marketplace pages : scan complet T≤2m puis incrémental couverture (full sécurité ~${Math.round(HUNTER_INCREMENTAL_FULL_RESCAN_MS / 60000)} min, concurrence ${HUNTER_HEADLESS_PAGE_CONCURRENCY})`
                     ) +
                     ` → file → drain · aucune découverte Hunter via DB · pré-analyse parallèle ${HUNTER_HEADLESS_PREANALYSIS_WORKERS} workers · POST sérialisé · mise seulement T≤90s · préanalyse confort T>${Math.round(hunterLagInitialRunwayMs() / 1000)}s · premier POST T>${Math.round(hunterLagFirstPostRunwayMs() / 1000)}s · Hot Lane synchronisée sur <b>end_at serveur</b>.`
@@ -16502,6 +16671,8 @@
             globalApiRarities: hunterGlobalApiRarities(),
             globalStreamingPreanalysis: true,
             globalStreamingWorkersMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
+            globalFrontierEarlyProbe: true,
+            globalFrontierPersistentState: 'last-boundary-only',
             recentMarketDb: true,
             incrementalFullRescanMs: HUNTER_INCREMENTAL_FULL_RESCAN_MS,
             incrementalMinCycleMs: HUNTER_INCREMENTAL_MIN_CYCLE_MS,
@@ -16538,7 +16709,7 @@
             traitementPageParPage: true,
             modeBoucle:
                 hunterDynamicSource === 'global'
-                    ? 'pages marketplace multi-raretés T<=2m + préanalyse streaming pendant découverte -> drain'
+                    ? 'sonde front+ancienne frontière -> scan complet multi-raretés p1→T<=2m + préanalyse streaming -> drain'
                     : 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
             sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
             accesDbHunter: false,
@@ -16563,6 +16734,11 @@
             globalRaritesApi: hunterHeadlessStats.lastGlobalApiRarities,
             globalFiltreApi: hunterHeadlessStats.lastGlobalRarityQuery || null,
             pagesGlobalFiltreesDernierScan: hunterHeadlessStats.lastGlobalCombinedFilteredPages,
+            frontiereHintDebutScan: hunterHeadlessStats.lastGlobalFrontierHintAtStart,
+            pagesSondeFrontiereTot: hunterHeadlessStats.lastGlobalFrontierEarlyProbePages,
+            getSupplementairesSondeFrontiere: hunterHeadlessStats.lastGlobalFrontierExtraGets,
+            pagesSequentiellesConsommees: hunterHeadlessStats.lastGlobalSequentialPagesConsumed,
+            frontiereMemoriseeProchainLoop: hunterGlobalLastBoundaryPage,
             preanalyseStreamingOn: hunterDynamicSource === 'global',
             candidatsEnvoyesStreamingDernierScan: hunterHeadlessStats.lastStreamingCandidates,
             preanalysesEnqueueesStreamingDernierScan: hunterHeadlessStats.lastStreamingQueued,
