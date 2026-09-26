@@ -1,7 +1,7 @@
 (function () {
 
     /* Numéro de version du bot — affiché en bas du panneau Paramètres. */
-    const WM_VERSION = '3.8.33-LAG-GLOBAL-FRONTIER-SHORTPAGE-FIX';
+    const WM_VERSION = '3.8.34-LAG-GLOBAL-PREANALYSIS-CACHE60';
 
     console.log('[WikiMasters] script loaded v' + WM_VERSION + ' - building UI...');
 
@@ -8419,6 +8419,9 @@
     }
 
     const HUNTER_RECENT_REFERENCE_MAX_AGE_MS = 60 * 1000;
+    // v3.8.34 — préanalyse : une référence <=60 s suffit pour trier économiquement.
+    // La fraîcheur <=5 s reste exigée JUSTE AVANT le POST dans prepareFreshHunterBid().
+    const HUNTER_PREANALYSIS_REFERENCE_MAX_AGE_MS = HUNTER_RECENT_REFERENCE_MAX_AGE_MS;
     const HUNTER_RECENT_PRE_BID_MAX_AGE_MS = 5 * 1000;
 
     function hunterRecentSalesAllowed(recentOrCount) {
@@ -15805,6 +15808,8 @@
         prewarmQueued: 0,
         prewarmDone: 0,
         prewarmError: 0,
+        preanalysisCacheHits: 0,
+        preanalysisNetworkRefreshes: 0,
         prevalidated: 0,
         preanalysisRejected: 0,
         preanalysisTooLate: 0,
@@ -16017,27 +16022,36 @@
                     const rarity = globalAuctionRarity(a);
                     if (!cardId || !rarity) continue;
 
-                    // Si un snapshot <=60 s existe déjà et dit clairement "pas de mise",
-                    // inutile de refaire une requête lourde juste pour confirmer le même refus.
+                    // v3.8.34 — la préanalyse économique n'a pas besoin d'un historique
+                    // vieux de <=5 s : <=60 s suffit ici. Le contrôle <=5 s reste obligatoire
+                    // dans prepareFreshHunterBid(), juste avant le vrai POST.
                     const cachedDecisionMarket = getCachedRecentMarket(
                         cardId,
                         rarity,
-                        HUNTER_RECENT_REFERENCE_MAX_AGE_MS
+                        HUNTER_PREANALYSIS_REFERENCE_MAX_AGE_MS
                     );
                     if (cachedDecisionMarket?.ok) {
+                        hunterHeadlessStats.preanalysisCacheHits++;
                         const cachedDecision = shouldAutoSnipe(a);
                         if (!cachedDecision?.snipe) {
                             hunterHeadlessStats.preanalysisRejected++;
                             continue;
                         }
+
+                        // Cache <=60 s positif : aucune requête Recent Market supplémentaire
+                        // en préanalyse. La référence sera revalidée <=5 s avant le POST.
+                        hunterHeadlessStats.prewarmDone++;
+                        queuePreparedHunterAction(a);
+                        continue;
                     }
 
-                    // Pour une carte encore intéressante, rafraîchit à <=5 s AVANT de la
-                    // transmettre à la file de mise. C'est la partie lourde, faite ici en amont.
+                    // Cache absent ou >60 s : une seule actualisation réseau suffit pour
+                    // préanalyser. Elle alimentera ensuite le cache partagé.
+                    hunterHeadlessStats.preanalysisNetworkRefreshes++;
                     const recent = await ensureFreshRecentMarket(
                         cardId,
                         rarity,
-                        Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                        HUNTER_PREANALYSIS_REFERENCE_MAX_AGE_MS
                     );
 
                     if (!recent?.ok) {
@@ -16100,33 +16114,29 @@
             const rarity = globalAuctionRarity(a);
             if (!cardId || !rarity) continue;
 
-            // Si l'historique est déjà ultra-frais, on peut tenter un POST même dans la
-            // zone "single-shot" où il n'y a plus assez de marge pour garantir un retry.
-            const freshForBid = getCachedRecentMarket(
+            // v3.8.34 — toute référence Recent Market <=60 s suffit pour la PRÉANALYSE.
+            // Si elle permet déjà de décider, on évite complètement le worker réseau.
+            // La fraîcheur <=5 s sera de toute façon imposée juste avant le POST.
+            const cachedDecisionMarket = getCachedRecentMarket(
                 cardId,
                 rarity,
-                Math.min(HUNTER_RECENT_PRE_BID_MAX_AGE_MS, RECENT_MARKET_PRE_ACTION_MAX_AGE_MS)
+                HUNTER_PREANALYSIS_REFERENCE_MAX_AGE_MS
             );
-            if (freshForBid?.ok) {
+            if (cachedDecisionMarket?.ok) {
+                hunterHeadlessStats.preanalysisCacheHits++;
+
+                if (!shouldAutoSnipe(a)?.snipe) {
+                    hunterHeadlessStats.preanalysisRejected++;
+                    continue;
+                }
+
                 queuePreparedHunterAction(a);
                 continue;
             }
 
-            // Pas de cache ultra-frais : une NOUVELLE préanalyse réseau n'est lancée
-            // que s'il reste la marge complète POST + retry.
+            // Sans cache <=60 s, une NOUVELLE préanalyse réseau n'est lancée que
+            // s'il reste la marge complète POST + retry.
             if (remaining <= hunterLagInitialRunwayMs()) {
-                continue;
-            }
-
-            // Un cache <=60 s permet au moins d'éliminer immédiatement les cartes dont
-            // la décision économique est déjà négative, sans refresh inutile.
-            const cachedDecisionMarket = getCachedRecentMarket(
-                cardId,
-                rarity,
-                HUNTER_RECENT_REFERENCE_MAX_AGE_MS
-            );
-            if (cachedDecisionMarket?.ok && !shouldAutoSnipe(a)?.snipe) {
-                hunterHeadlessStats.preanalysisRejected++;
                 continue;
             }
 
@@ -16678,6 +16688,11 @@
             globalApiRarities: hunterGlobalApiRarities(),
             globalStreamingPreanalysis: true,
             globalStreamingWorkersMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
+            preanalysisRecentMarketMaxAgeMs: HUNTER_PREANALYSIS_REFERENCE_MAX_AGE_MS,
+            preBidRecentMarketMaxAgeMs: Math.min(
+                HUNTER_RECENT_PRE_BID_MAX_AGE_MS,
+                RECENT_MARKET_PRE_ACTION_MAX_AGE_MS
+            ),
             globalFrontierEarlyProbe: true,
             globalFrontierPersistentState: 'last-boundary-only',
             globalFilteredNaturalEndRule: 'hasMore===false only',
@@ -16717,7 +16732,7 @@
             traitementPageParPage: true,
             modeBoucle:
                 hunterDynamicSource === 'global'
-                    ? 'sonde front+ancienne frontière -> scan complet multi-raretés p1→T<=2m (page courte ≠ fin) + préanalyse streaming -> drain'
+                    ? 'sonde frontière -> scan complet multi-raretés p1→T<=2m + préanalyse streaming cache≤60s -> refresh≤5s avant POST -> drain'
                     : 'scan complet périodique + incrémental couverture dynamique T<=2m -> file -> drain',
             sourceDecouverte: hunterHeadlessStats.discoverySource || 'marketplace-pages',
             accesDbHunter: false,
@@ -16768,6 +16783,13 @@
             workersPreanalyseMax: HUNTER_HEADLESS_PREANALYSIS_WORKERS,
             preanalysesLancees: hunterHeadlessStats.prewarmQueued,
             preanalysesTerminees: hunterHeadlessStats.prewarmDone,
+            decisionsPreanalyseDepuisCache60s: hunterHeadlessStats.preanalysisCacheHits,
+            refreshReseauPreanalyse: hunterHeadlessStats.preanalysisNetworkRefreshes,
+            ageMaxCachePreanalyseMs: HUNTER_PREANALYSIS_REFERENCE_MAX_AGE_MS,
+            ageMaxCacheAvantPostMs: Math.min(
+                HUNTER_RECENT_PRE_BID_MAX_AGE_MS,
+                RECENT_MARKET_PRE_ACTION_MAX_AGE_MS
+            ),
             candidatsPrevalides: hunterHeadlessStats.prevalidated,
             rejetsApresPreanalyse: hunterHeadlessStats.preanalysisRejected,
             abandonsPendantPreanalyse: hunterHeadlessStats.preanalysisTooLate,
